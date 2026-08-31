@@ -1,0 +1,990 @@
+"""The SM120 CUTLASS SVDQuant backend, kept beside upstream's CuTeDSL one.
+
+FlashInfer already reaches SM120 through ``backend="cute-dsl"`` (PR #4420),
+which fuses the rank-r LoRA-up correction into the b12x CuTe DSL kernel. This
+module is a second, independent SM120 implementation: a CUTLASS C++ fused
+kernel (``csrc/nvfp4_svdquant_gemm_cutlass_sm120.cu``) with a tactic space the
+autotuner selects over, plus a CuTeDSL prefix that fuses smooth-quantization
+with the rank-32 LoRA-down projection into one launch -- the half upstream
+still spends a ``torch.mm`` on.
+
+It is reached only through the explicit ``backend="cutlass-sm120"``; ``"auto"``
+does not offer it. That is deliberate. The two implementations have never been
+measured against each other, and until they are, changing what ``"auto"``
+selects on SM120 would be a guess. The 71-shape matrix this backend was tuned
+against compares it to tuned CUTLASS and cuBLASLt, not to ``"cute-dsl"``.
+
+Once the comparison exists, one of the two backends should go.
+"""
+
+import functools
+import weakref
+from collections import OrderedDict
+from typing import Final, List, Optional
+
+import torch
+
+from ..autotuner import (
+    AutoTuner,
+    ConstraintSpec,
+    DynamicTensorSpec,
+    OptimizationProfile,
+    TunableRunner,
+    TuningConfig,
+)
+from ..jit.gemm.svdquant_sm120 import gen_gemm_sm120_module_cutlass_nvfp4_svdquant
+from ..utils import (
+    _get_cache_buf,
+    device_support_pdl,
+    get_compute_capability,
+)
+from . import svdquant_sm120_routes as _sm120_routes
+from .gemm_svdquant import (
+    DEFAULT_WORKSPACE_SIZE,
+    _NVFP4_SVDQUANT_GEMM_TUNING_CONFIG,
+    SVDQUANT_LORA_RANK_GRANULARITY,
+    _swizzled_sf_size,
+    get_nvfp4_svdquant_module,
+)
+
+
+_SM120_FUSED_LINEAR_MK = _sm120_routes.SM120_FUSED_LINEAR_MK
+
+
+_SM120_LINEAR_ROUTE_ABI_VERSION = _sm120_routes.SM120_LINEAR_ROUTE_ABI_VERSION
+
+
+_SM120_LINEAR_ROUTE_V6_MKR = _sm120_routes.SM120_LINEAR_ROUTE_V6_MKR
+
+
+_SM120_LINEAR_ROUTE_V7_MKR = _sm120_routes.SM120_LINEAR_ROUTE_V7_MKR
+
+
+_SM120_LINEAR_ROUTE_V8_MKR = _sm120_routes.SM120_LINEAR_ROUTE_V8_MKR
+
+
+_SM120_LINEAR_ROUTE_V9_MKR = _sm120_routes.SM120_LINEAR_ROUTE_V9_MKR
+
+
+_SM120_TACTIC_ABI_VERSION = _sm120_routes.SM120_TACTIC_ABI_VERSION
+
+
+_sm120_fused_prefix_uses_packed_l2t = (
+    _sm120_routes.sm120_fused_prefix_uses_packed_l2t
+)
+
+
+_sm120_linear_route_abi_version = _sm120_routes.sm120_linear_route_abi_version
+
+
+_sm120_producer_variants = _sm120_routes.sm120_producer_variants
+
+
+_sm120_pack_tactic = _sm120_routes.sm120_pack_tactic
+
+
+_sm120_unpack_tactic = _sm120_routes.sm120_unpack_tactic
+
+
+_sm120_tactic_producer_route = _sm120_routes.sm120_tactic_producer_route
+
+
+_sm120_tactic_abi_version = _sm120_routes.sm120_tactic_abi_version
+
+
+@functools.cache
+def get_nvfp4_svdquant_sm120_module():
+    """JIT-build and load the SM120 CUTLASS NVFP4 SVDQuant module."""
+    return gen_gemm_sm120_module_cutlass_nvfp4_svdquant().build_and_load()
+
+
+def _svdquant_backend_for_capability(major: int, minor: int) -> str:
+    """Map a compute capability to the SVDQuant kernel backend key.
+
+    SM100 (10.0) and SM103 (10.3) share the tcgen05/TMEM module; SM120 (12.0) uses
+    its own register-accumulator module with a separate JIT cache and tactic space.
+    Every other capability -- including other 10.x and 12.x parts -- is rejected
+    explicitly: none of them has a validated SVDQuant backend.
+    """
+    if (major, minor) in ((10, 0), (10, 3)):
+        return "sm100"
+    if (major, minor) == (12, 0):
+        return "sm120"
+    raise ValueError(
+        f"NVFP4 SVDQuant is not supported on compute capability {major}{minor}; "
+        "supported: 100, 103 (SM100 backend) and 120 (SM120 backend)"
+    )
+
+
+_SM120_M537_PACKED_L2T_K = frozenset({5120, 5376, 7168})
+
+
+_SM120_M537_PACKED_L2T_CACHE_CAPACITY = 64
+
+
+_SM120_M537_PACKED_L2T_CACHE: OrderedDict[
+    int, tuple[weakref.ReferenceType, int, torch.Tensor]
+] = OrderedDict()
+
+
+class _SM120M537L2TPackingError(ValueError):
+    """Report an unsupported matrix shape at the M537 packing boundary."""
+
+    shape: tuple[int, ...]
+
+    def __init__(self, shape: tuple[int, ...]) -> None:
+        self.shape = shape
+        super().__init__(
+            "M537 L2T packing requires rank 32 and K in "
+            f"{sorted(_SM120_M537_PACKED_L2T_K)}, got {shape}"
+        )
+
+
+def _pack_sm120_m537_l2t(l2t_smoothed: torch.Tensor) -> torch.Tensor:
+    """Pack an admitted M537 LoRA-down matrix for one load per lane."""
+    shape = tuple(l2t_smoothed.shape)
+    if len(shape) != 2 or shape[0] not in _SM120_M537_PACKED_L2T_K or shape[1] != 32:
+        raise _SM120M537L2TPackingError(shape)
+    k = shape[0]
+    return (
+        l2t_smoothed.reshape(k // 16, 2, 4, 2, 2, 2, 8)
+        .permute(0, 4, 5, 6, 2, 1, 3)
+        .contiguous()
+        .reshape(shape)
+    )
+
+
+def _cached_sm120_m537_l2t(
+    l2t_smoothed: torch.Tensor,
+) -> torch.Tensor:
+    """Cache an invariant M537 L2T pack and invalidate it on mutation."""
+    source_id = id(l2t_smoothed)
+    source_version = int(l2t_smoothed._version)
+    cached = _SM120_M537_PACKED_L2T_CACHE.get(source_id)
+    if (
+        cached is not None
+        and cached[0]() is l2t_smoothed
+        and cached[1] == source_version
+    ):
+        _SM120_M537_PACKED_L2T_CACHE.move_to_end(source_id)
+        return cached[2]
+
+    packed = _pack_sm120_m537_l2t(l2t_smoothed)
+
+    def discard(dead_ref: weakref.ReferenceType, *, key: int = source_id) -> None:
+        current = _SM120_M537_PACKED_L2T_CACHE.get(key)
+        if current is not None and current[0] is dead_ref:
+            _SM120_M537_PACKED_L2T_CACHE.pop(key, None)
+
+    source_ref = weakref.ref(l2t_smoothed, discard)
+    _SM120_M537_PACKED_L2T_CACHE[source_id] = (
+        source_ref,
+        source_version,
+        packed,
+    )
+    _SM120_M537_PACKED_L2T_CACHE.move_to_end(source_id)
+    while (
+        len(_SM120_M537_PACKED_L2T_CACHE)
+        > _SM120_M537_PACKED_L2T_CACHE_CAPACITY
+    ):
+        _SM120_M537_PACKED_L2T_CACHE.popitem(last=False)
+    return packed
+
+
+def _sm120_fused_linear_l2t(
+    x: torch.Tensor,
+    l2t_smoothed: torch.Tensor,
+    route: str | None = None,
+) -> torch.Tensor:
+    """Return the L2T layout required by the producer about to be dispatched.
+
+    ``route`` comes from the producer half of the packed tactic. It is threaded
+    rather than re-derived because the layout chosen here and the route the C++
+    dispatch takes must be the same one; disagreeing is silent.
+    """
+    m, k = x.shape
+    rank = l2t_smoothed.shape[1]
+    if _sm120_fused_prefix_uses_packed_l2t(m, k, rank, route):
+        return _cached_sm120_m537_l2t(l2t_smoothed)
+    return l2t_smoothed
+
+
+def _sm120_fused_linear_supported(m: int, k: int, rank: int) -> bool:
+    """Return whether a shape may offer the fused K12 route to the autotuner."""
+    if rank != SVDQUANT_LORA_RANK_GRANULARITY:
+        return False
+    return (m, k) in _SM120_FUSED_LINEAR_MK
+
+
+
+
+
+
+
+
+
+
+def _svdquant_op_name(backend_key: str) -> str:
+    """Autotune-cache namespace per backend (and per tactic ABI on SM120).
+
+    SM100 keeps the original name so existing tuning caches stay valid; other
+    backends are suffixed so tactic ids can never cross architectures or
+    tactic-table versions. The benchmark's tactic read-back must derive the
+    name the same way.
+    """
+    if backend_key == "sm100":
+        return "nvfp4_svdquant_gemm"
+    if backend_key == "sm120":
+        return f"nvfp4_svdquant_gemm_sm120_v{_SM120_TACTIC_ABI_VERSION}"
+    return f"nvfp4_svdquant_gemm_{backend_key}"
+
+
+def _get_nvfp4_svdquant_module_for_device(device: torch.device):
+    backend = _svdquant_backend_for_capability(*get_compute_capability(device))
+    if backend == "sm120":
+        return get_nvfp4_svdquant_sm120_module()
+    return get_nvfp4_svdquant_module()
+
+
+def _nvfp4_svdquant_valid_tactics(
+    module,
+    m: int,
+    n: int,
+    k: int,
+    rank: int,
+) -> List[int]:
+    """Return implementable tactics after the SM120 profitability filter."""
+    all_tactics = range(module.nvfp4_svdquant_gemm_tactic_num())
+    can_implement = getattr(module, "nvfp4_svdquant_gemm_can_implement", None)
+    if can_implement is None:
+        return list(all_tactics)
+    tactics = [t for t in all_tactics if can_implement(m, n, k, rank, t)]
+    tactic_row = getattr(module, "nvfp4_svdquant_gemm_tactic_row", None)
+    if tactic_row is not None:
+        tactics = [
+            t
+            for t in tactics
+            if _sm120_tactic_exposed(m, n, k, int(tactic_row(t)))
+        ]
+    return tactics
+
+
+
+
+def _nvfp4_svdquant_gemm_runners(
+    enable_pdl: bool,
+    device: torch.device,
+    m: int,
+    n: int,
+    k: int,
+    rank: int,
+) -> List[TunableRunner]:
+    """Build the per-shape candidate set; first runner is the eager fallback."""
+    return [_nvfp4_svdquant_gemm_runner(enable_pdl, device)]
+
+
+
+
+def _sm120_packed_linear_tactics(module, inputs: List[torch.Tensor]) -> List[int]:
+    """Cross the consumer rows this shape admits with its producer variants.
+
+    The consumer half is unchanged: exactly the rows
+    ``_nvfp4_svdquant_valid_tactics`` already returns, correctness- and
+    cost-filtered. The producer half indexes ``sm120_producer_variants``, whose
+    variant 0 is the ladder default, so on a shape whose ladder admits one route
+    -- which is every shape outside the nine-entry ladder -- the packed list is
+    numerically identical to the bare list this replaces.
+    """
+    m, n, k, rank = _sm120_linear_inputs_shape(inputs)
+    rows = _nvfp4_svdquant_valid_tactics(module, m, n, k, rank)
+    variants = range(len(_sm120_producer_variants(m, k)))
+    return [_sm120_pack_tactic(row, v) for v in variants for row in rows]
+
+
+
+
+def _sm120_linear_inputs_shape(inputs: List[torch.Tensor]) -> tuple[int, int, int, int]:
+    x, weight_fp4, _, _, _, l2t_smoothed = inputs[:6]
+    return x.shape[0], weight_fp4.shape[0], x.shape[1], l2t_smoothed.shape[1]
+
+
+def _sm120_run_unfused_linear_prefix(
+    module,
+    inputs: List[torch.Tensor],
+    enable_pdl: bool,
+) -> None:
+    (
+        x,
+        _,
+        _,
+        _,
+        pre_quant_scale,
+        l2t_smoothed,
+        _,
+        global_scale,
+        _,
+        xq,
+        x_sf,
+        down,
+        _,
+        _,
+    ) = inputs
+    module.nvfp4_quantize_smooth(
+        x,
+        pre_quant_scale,
+        global_scale,
+        xq,
+        x_sf,
+        enable_pdl,
+    )
+    torch.mm(x, l2t_smoothed, out=down)
+
+
+def _sm120_fused_linear_runner(enable_pdl: bool, device: torch.device):
+    module = get_nvfp4_svdquant_sm120_module()
+
+    class Sm120FusedLinearRunner(TunableRunner):
+        def get_valid_tactics(
+            self,
+            inputs: List[torch.Tensor],
+            profile: OptimizationProfile,
+        ) -> List[int]:
+            return _sm120_packed_linear_tactics(module, inputs)
+
+        def forward(
+            self,
+            inputs: List[torch.Tensor],
+            tactic: int = -1,
+            do_preparation: bool = False,
+            **kwargs,
+        ):
+            (
+                x,
+                weight_fp4,
+                weight_sf,
+                alpha,
+                pre_quant_scale,
+                l2t_smoothed,
+                l1_scaled,
+                global_scale,
+                bias,
+                xq,
+                x_sf,
+                down,
+                out,
+                workspace_buffer,
+            ) = inputs
+            # The producer half of the tactic decides two things that must
+            # describe the same route: the L2T layout prepared here, and the
+            # prefix the C++ dispatch takes. The packed tactic goes down whole
+            # and is unpacked there; the route is resolved here only to pick the
+            # layout. Workspace needs no widening -- the alternative variant is
+            # always the native prefix, and only the cuBLASLt one draws on the
+            # buffer, so switching can only lower the requirement.
+            _, producer_variant = _sm120_unpack_tactic(tactic)
+            route = _sm120_tactic_producer_route(
+                x.shape[0], x.shape[1], producer_variant
+            )
+            fused_l2t_smoothed = _sm120_fused_linear_l2t(x, l2t_smoothed, route)
+            module.nvfp4_svdquant_linear_sm120(
+                x,
+                pre_quant_scale,
+                global_scale,
+                fused_l2t_smoothed,
+                weight_fp4,
+                weight_sf,
+                alpha,
+                l1_scaled,
+                bias,
+                xq,
+                x_sf,
+                down,
+                out,
+                workspace_buffer,
+                tactic,
+                enable_pdl,
+            )
+            return out
+
+    return Sm120FusedLinearRunner()
+
+
+def _sm120_cutlass_linear_runner(enable_pdl: bool, device: torch.device):
+    module = get_nvfp4_svdquant_sm120_module()
+
+    class Sm120CutlassLinearRunner(TunableRunner):
+        def get_valid_tactics(
+            self,
+            inputs: List[torch.Tensor],
+            profile: OptimizationProfile,
+        ) -> List[int]:
+            return _nvfp4_svdquant_valid_tactics(
+                module, *_sm120_linear_inputs_shape(inputs)
+            )
+
+        def forward(
+            self,
+            inputs: List[torch.Tensor],
+            tactic: int = -1,
+            do_preparation: bool = False,
+            **kwargs,
+        ):
+            return _sm120_run_cutlass_linear(
+                module, inputs, tactic=tactic, enable_pdl=enable_pdl
+            )
+
+    return Sm120CutlassLinearRunner()
+
+
+def _sm120_run_cutlass_linear(
+    module,
+    inputs: List[torch.Tensor],
+    *,
+    tactic: int,
+    enable_pdl: bool,
+):
+    """Run the generic quantize/down prefix followed by one fixed CUTLASS K3."""
+    _sm120_run_unfused_linear_prefix(module, inputs, enable_pdl)
+    (
+        _,
+        weight_fp4,
+        weight_sf,
+        alpha,
+        _,
+        _,
+        l1_scaled,
+        _,
+        bias,
+        xq,
+        x_sf,
+        down,
+        out,
+        workspace_buffer,
+    ) = inputs
+    module.nvfp4_svdquant_gemm(
+        xq,
+        weight_fp4,
+        x_sf,
+        weight_sf,
+        alpha,
+        down,
+        l1_scaled,
+        bias,
+        out,
+        workspace_buffer,
+        tactic,
+        enable_pdl,
+    )
+    return out
+
+
+
+
+
+
+
+
+def _sm120_linear_runners(
+    enable_pdl: bool,
+    device: torch.device,
+    m: int,
+    n: int,
+    k: int,
+    rank: int,
+) -> List[TunableRunner]:
+    """Return every full-linear route valid for one exact SM120 shape."""
+    runners = []
+    if _sm120_fused_linear_supported(m, k, rank):
+        runners.append(_sm120_fused_linear_runner(enable_pdl, device))
+    runners.append(_sm120_cutlass_linear_runner(enable_pdl, device))
+    return runners
+
+
+@functools.cache
+def _cached_sm120_linear_runners(
+    enable_pdl: bool,
+    device: torch.device,
+    m: int,
+    n: int,
+    k: int,
+    rank: int,
+) -> List[TunableRunner]:
+    """Reuse stateless runner objects for repeated calls to one exact shape."""
+    return _sm120_linear_runners(enable_pdl, device, m, n, k, rank)
+
+
+def _exact_num_tokens_buckets(x, *args):
+    """Exact-shape tuning: the only bucket for M is M itself."""
+    return (x,)
+
+
+def _map_to_exact_bucket(x, *args):
+    return x
+
+
+_SVDQUANT_CONSTRAINT_SPECS = (
+    ConstraintSpec(
+        2,  # a_sf tensor index: 1-D 128x4-swizzled scale buffer sized by (m, k/16)
+        0,
+        lambda shapes: _swizzled_sf_size(shapes[0][0], shapes[0][1] * 2 // 16),
+    ),
+    ConstraintSpec(
+        5,  # d tensor index: [m, r] LoRA-down output (r kept from the real input)
+        0,
+        lambda shapes: shapes[0][0],
+    ),
+    ConstraintSpec(
+        8,  # out tensor index
+        0,
+        lambda shapes: shapes[0][0],
+    ),
+    ConstraintSpec(
+        9,  # workspace_buffer index: scratch; exclude its (resizable) size from the
+        0,  # cache key so a mid-tune resize never causes a silent cache miss.
+        lambda shapes: shapes[9][0],
+    ),
+)
+
+
+_NVFP4_SVDQUANT_GEMM_TUNING_CONFIG_EXACT = TuningConfig(
+    use_cuda_graph=True,
+    use_cold_l2_cache=True,
+    dynamic_tensor_specs=(
+        DynamicTensorSpec(
+            (0,),  # a_tensor_index
+            (0,),
+            _exact_num_tokens_buckets,
+            _map_to_exact_bucket,
+        ),
+    ),
+    constraint_specs=_SVDQUANT_CONSTRAINT_SPECS,
+)
+
+
+
+
+
+
+_SM120_LINEAR_TUNING_CONFIG_COLD = TuningConfig(
+    use_cuda_graph=False,
+    use_cold_l2_cache=True,
+    constraint_specs=(
+        ConstraintSpec(
+            13,  # workspace size is scratch state, not part of the problem key
+            0,
+            lambda shapes: shapes[13][0],
+        ),
+    ),
+)
+
+
+
+
+def _sm120_linear_op_name(m: int, k: int, rank: int, *, enable_pdl: bool) -> str:
+    """Name the autotune record for one exact SM120 linear shape and PDL mode.
+
+    PDL changes the measured cost of every runner (the launch overlaps the
+    preceding kernel), so a profile taken without it must not be replayed with
+    it. The in-process dispatch key always separated the two; the persistent
+    record did not, so a PDL=False winner could be replayed for PDL=True.
+
+    The name is only extended, never re-versioned: `enable_pdl=False` keeps the
+    exact historical name so the frozen/default benchmark path still reaches
+    every retained winner, and `enable_pdl=True` -- which never had a record of
+    its own -- gets its own stable `_pdl` suffix. `enable_pdl` is keyword-only
+    and has no default so no call site can silently reintroduce the collision.
+    """
+    name = (
+        f"svdquant_linear_sm120_routes_v{_sm120_linear_route_abi_version(m, k, rank)}"
+        f"_tactics_v{_sm120_tactic_abi_version(m, k)}"
+    )
+    return f"{name}_pdl" if enable_pdl else name
+
+
+_SM120_LINEAR_DISPATCH_CACHE: dict[tuple, tuple[int, int]] = {}
+
+
+
+
+_SM120_TUNING_BUDGET_US: Final = 20_000.0
+
+
+_SM120_TUNING_REPEAT_FLOOR: Final = 15
+
+
+_SM120_TUNING_REPEAT_CEIL: Final = 100
+
+
+_SM120_TUNING_LAUNCH_FLOOR_US: Final = 15.0
+
+
+_SM120_TUNING_FLOP_PER_US: Final = 8.0e8
+
+
+
+
+_SM120_SELECT_ROUNDS: Final = 3
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+_SM120_SELECT_FINALISTS: Final = 6
+
+
+_SM120_SELECT_FINALIST_MARGIN: Final = 0.05
+
+
+_SM120_SELECT_CAPTURE_WARMUP: Final = 3
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def _choose_sm120_linear_runner(
+    tuner: AutoTuner,
+    runners: List[TunableRunner],
+    tuning_config: TuningConfig,
+    inputs: List[torch.Tensor],
+    *,
+    device: torch.device,
+    m: int,
+    n: int,
+    k: int,
+    rank: int,
+    enable_pdl: bool,
+    has_bias: bool,
+) -> tuple[TunableRunner, int]:
+    """Choose once per exact shape, then bypass repeated shape-key construction."""
+    # One computed name for both seams: the persistent autotune record below and
+    # the in-process dispatch cache. If they ever diverged, a shape could profile
+    # under one name and replay under another.
+    op_name = _sm120_linear_op_name(m, k, rank, enable_pdl=enable_pdl)
+    cache_key = (
+        op_name,
+        device,
+        m,
+        n,
+        k,
+        rank,
+        enable_pdl,
+        has_bias,
+    )
+    if not tuner.is_tuning_mode:
+        cached = _SM120_LINEAR_DISPATCH_CACHE.get(cache_key)
+        if cached is not None:
+            runner_id, tactic = cached
+            return runners[runner_id], tactic
+
+    runner, tactic = tuner.choose_one(
+        op_name,
+        runners,
+        tuning_config,
+        inputs,
+    )
+    if tactic >= 0:
+        runner_id = next(
+            index for index, candidate in enumerate(runners) if candidate is runner
+        )
+        _SM120_LINEAR_DISPATCH_CACHE[cache_key] = (runner_id, tactic)
+    return runner, tactic
+
+
+_SM120_STATIC_KERNEL_TILES = {
+    23: (128, 64, True),
+    24: (128, 32, True),
+    25: (64, 128, False),
+    27: (128, 32, True),
+    28: (64, 32, True),
+}
+
+
+_SM120_WIDE_STATIC_KERNELS = frozenset({29, 30})
+
+
+def _sm120_tactic_exposed(m: int, n: int, k: int, packed_row: int) -> bool:
+    """Shape-aware exposure of SM120 runtime-tactic rows to the autotuner.
+
+    `can_implement` is the correctness boundary; this is a cost boundary.
+
+    It was introduced as a profitability boundary, on the grounds that with all
+    72 rows exposed "few-sample profiling on millisecond-scale kernels
+    mis-selects on near-ties" -- that is, to compensate for the selector. That
+    premise no longer holds: `_sm120_select_linear_tactic` now ranks under the
+    metric the report is written in. So the filter was priced again against the
+    unpruned field, ten shapes, every candidate measured under `graph_cupti_span`
+    (artifacts/selector-metric-20260821).
+
+    Removing it buys nothing. On the six large-M shapes it cuts the field from
+    166 candidates to 36, and on four of those the unpruned winner is a row it
+    prunes -- but the unpruned winner is faster by -0.33% to +0.44%, signs
+    mixed, entirely inside the cross-session floor of the measurement itself
+    (mean 0.06%, worst 1.65%). Those rows are ties, not wins.
+
+    What removing it costs is real: selection on `82752x28672x5376` goes from
+    17.8 s to 67.0 s, and the selector is marginally less reliable on the wider
+    field. So it stays, as a cost boundary, and the thresholds below keep the
+    admission-matrix evidence they were built from:
+
+    - swap spikes and the 64-row driver only ever win at M <= 512;
+    - forced Split-K only wins on long-K problems with an underfilled grid;
+    - raster/swizzle variants won only at M <= 8192 and mis-selected above;
+    - the small-M static-scheduler rows won only when every CTA gets exactly
+      one tile (one wave) and regressed at seven waves, so they are exposed
+      only inside the one-wave envelope of their own tile grid;
+    - the 256-wide static rows do not follow that pattern and are exposed
+      everywhere, see _SM120_WIDE_STATIC_KERNELS.
+    """
+    kernel_id = packed_row & 0xFF
+    splits = (packed_row >> 8) & 0xFF
+    raster = (packed_row >> 16) & 0xFF
+    swizzle = (packed_row >> 24) & 0xFF
+    if kernel_id in _SM120_WIDE_STATIC_KERNELS:  # 256-wide static rows 81-82
+        return True
+    if kernel_id in _SM120_STATIC_KERNEL_TILES:  # static-scheduler rows 75-77 and 79-80
+        tile_m, tile_n, swap = _SM120_STATIC_KERNEL_TILES[kernel_id]
+        pm, pn = (n, m) if swap else (m, n)
+        tiles = -(pm // -tile_m) * -(pn // -tile_n)
+        return m <= 512 and tiles <= 110
+    if kernel_id >= 16:  # small-N swap spikes + 64-row driver (rows 64-74)
+        return m <= 512
+    if splits > 1:  # forced Split-K rows 16-31 on legacy Stream-K kernels
+        output_tiles = ((m + 127) // 128) * ((n + 127) // 128)
+        return k >= 8192 and output_tiles <= 220
+    if raster != 0 or swizzle > 1:  # raster/swizzle rows 32-63
+        return m <= 8192
+    return True  # legacy defaults (rows 0-15)
+
+
+def _svdquant_tuning_config(backend_key: str) -> TuningConfig:
+    return (
+        _NVFP4_SVDQUANT_GEMM_TUNING_CONFIG_EXACT
+        if backend_key == "sm120"
+        else _NVFP4_SVDQUANT_GEMM_TUNING_CONFIG
+    )
+
+
+
+
+_SM120_WORKSPACE_BYTES_CACHE: dict = {}
+
+
+def _sm120_max_workspace_bytes(
+    device: torch.device, m: int, n: int, k: int, rank: int
+) -> int:
+    key = (device.index, m, n, k, rank)
+    cached = _SM120_WORKSPACE_BYTES_CACHE.get(key)
+    if cached is not None:
+        return cached
+    module = _get_nvfp4_svdquant_module_for_device(device)
+    required = 0
+    for t in _nvfp4_svdquant_valid_tactics(module, m, n, k, rank):
+        required = max(required, module.nvfp4_svdquant_gemm_workspace_size(m, n, k, t))
+    _SM120_WORKSPACE_BYTES_CACHE[key] = required
+    return required
+
+
+def _nvfp4_svdquant_gemm_runner(enable_pdl: bool, device: torch.device):
+    module = _get_nvfp4_svdquant_module_for_device(device)
+
+    class Nvfp4SvdquantGemmRunner(TunableRunner):
+        def get_valid_tactics(
+            self,
+            inputs: List[torch.Tensor],
+            profile: OptimizationProfile,
+        ) -> List[int]:
+            if not hasattr(module, "nvfp4_svdquant_gemm_can_implement"):
+                return list(range(module.nvfp4_svdquant_gemm_tactic_num()))
+            a, b, _, _, _, d = inputs[:6]
+            m, k = a.shape[0], a.shape[1] * 2
+            n = b.shape[0]
+            rank = d.shape[1]
+            return _nvfp4_svdquant_valid_tactics(module, m, n, k, rank)
+
+        def forward(
+            self,
+            inputs: List[torch.Tensor],
+            tactic: int = -1,
+            do_preparation: bool = False,
+            **kwargs,
+        ):
+            (a, b, a_sf, b_sf, alpha, d, l1, bias, out, workspace_buffer) = inputs
+            module.nvfp4_svdquant_gemm(
+                a,
+                b,
+                a_sf,
+                b_sf,
+                alpha,
+                d,
+                l1,
+                bias,
+                out,
+                workspace_buffer,
+                tactic,
+                enable_pdl,
+            )
+            return out
+
+    return Nvfp4SvdquantGemmRunner()
+
+
+def mm_nvfp4_svdquant(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_sf: torch.Tensor,
+    b_sf: torch.Tensor,
+    alpha: torch.Tensor,
+    d: torch.Tensor,
+    l1: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    out: Optional[torch.Tensor],
+    enable_pdl: Optional[bool],
+) -> torch.Tensor:
+    """``backend="cutlass-sm120"`` for :func:`flashinfer.gemm.mm_nvfp4_svdquant`.
+
+    The GEMM half only: the caller has already quantized and projected. The
+    tactic space is the CUTLASS module's, and the tuner picks over it under the
+    SM120 tactic-ABI namespace so a record can never be read back by a build
+    whose tactic ids mean something else.
+    """
+    if enable_pdl is None:
+        enable_pdl = device_support_pdl(a.device)
+    if out is None:
+        out = torch.empty(a.shape[0], b.shape[0], dtype=torch.bfloat16, device=a.device)
+
+    m, n, k, rank = a.shape[0], b.shape[0], a.shape[1] * 2, d.shape[1]
+    # Sized to the maximum over candidate tactics so the launcher never has to
+    # allocate; the first eager call for a shape provisions the cache buffer,
+    # and CUDA-graph capture afterwards reuses it allocation-free.
+    workspace_bytes = max(
+        DEFAULT_WORKSPACE_SIZE,
+        _sm120_max_workspace_bytes(a.device, m, n, k, rank),
+    )
+    workspace_buffer = _get_cache_buf(
+        "nvfp4_svdquant_gemm_workspace", workspace_bytes, a.device
+    )
+
+    tuner = AutoTuner.get()
+    runners = _nvfp4_svdquant_gemm_runners(enable_pdl, a.device, m, n, k, rank)
+    inputs = [a, b, a_sf, b_sf, alpha, d, l1, bias, out, workspace_buffer]
+    runner, tactic = tuner.choose_one(
+        _svdquant_op_name("sm120"),
+        runners,
+        _svdquant_tuning_config("sm120"),
+        inputs,
+    )
+    runner(inputs=inputs, tactic=tactic)
+    return out
+
+
+def svdquant_linear(
+    x: torch.Tensor,
+    weight_fp4: torch.Tensor,
+    weight_sf: torch.Tensor,
+    alpha: torch.Tensor,
+    pre_quant_scale: torch.Tensor,
+    l2t_smoothed: torch.Tensor,
+    l1_scaled: torch.Tensor,
+    global_scale: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    enable_pdl: Optional[bool],
+) -> torch.Tensor:
+    """``backend="cutlass-sm120"`` for :func:`flashinfer.gemm.svdquant_linear`.
+
+    The whole chain in one tuned unit, which is what separates this backend from
+    upstream's: the prefix that smooth-quantizes and projects rank-32 LoRA-down
+    is a route the tuner selects over -- one fused launch where the composed
+    path spends two -- and the tactic it picks names the prefix and the GEMM
+    together, so the pair is chosen on measured cost rather than independently.
+    """
+    if enable_pdl is None:
+        enable_pdl = device_support_pdl(x.device)
+
+    m, k = x.shape if x.ndim == 2 else (-1, -1)
+    n = weight_fp4.shape[0] if weight_fp4.ndim == 2 else -1
+    rank = l2t_smoothed.shape[1] if l2t_smoothed.ndim == 2 else -1
+    if rank != SVDQUANT_LORA_RANK_GRANULARITY:
+        raise ValueError(
+            f"the SM120 CUTLASS SVDQuant backend supports LoRA rank "
+            f"{SVDQUANT_LORA_RANK_GRANULARITY} only, got {rank}"
+        )
+
+    xq = torch.empty((m, k // 2), dtype=torch.uint8, device=x.device)
+    x_sf = torch.empty(
+        (_swizzled_sf_size(m, k // 16),), dtype=torch.uint8, device=x.device
+    )
+    down = torch.empty((m, rank), dtype=torch.bfloat16, device=x.device)
+    out = torch.empty((m, n), dtype=torch.bfloat16, device=x.device)
+    # Sized before the tactic is known, so it must cover every tactic the
+    # tuner can select for this shape.
+    workspace_bytes = max(
+        DEFAULT_WORKSPACE_SIZE, _sm120_max_workspace_bytes(x.device, m, n, k, rank)
+    )
+    workspace_buffer = _get_cache_buf(
+        "nvfp4_svdquant_gemm_workspace", workspace_bytes, x.device
+    )
+    inputs = [
+        x,
+        weight_fp4,
+        weight_sf,
+        alpha,
+        pre_quant_scale,
+        l2t_smoothed,
+        l1_scaled,
+        global_scale,
+        bias,
+        xq,
+        x_sf,
+        down,
+        out,
+        workspace_buffer,
+    ]
+    tuner = AutoTuner.get()
+    runners = _cached_sm120_linear_runners(enable_pdl, x.device, m, n, k, rank)
+    runner, tactic = _choose_sm120_linear_runner(
+        tuner,
+        runners,
+        _SM120_LINEAR_TUNING_CONFIG_COLD,
+        inputs,
+        device=x.device,
+        m=m,
+        n=n,
+        k=k,
+        rank=rank,
+        enable_pdl=enable_pdl,
+        has_bias=bias is not None,
+    )
+    runner(inputs=inputs, tactic=tactic)
+    return out
