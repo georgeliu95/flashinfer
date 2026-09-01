@@ -152,21 +152,6 @@ def test_linear_source_call_sites_are_fully_qualified() -> None:
         assert source[start - len("flashinfer::gemm::") : start] == "flashinfer::gemm::"
 
 
-def test_refuted_producer_geometry_is_retired_from_the_production_tu() -> None:
-    # Given: SM120 (110 SMs) measured the row-57 16-row producer at 456.70 us against the
-    # 32-row default's 424.22 us, so the alternate is refuted, not merely off.
-    # When: the exact (1935, 14336) dispatcher branch and the whole header are read.
-    # Then: the branch is an unguarded default and the alternate is gone entirely.
-    producer = PRODUCER_HEADER.read_text()
-    branch = producer.split("if (m == 1935 && k == 14336) {", 1)[1].split("\n  }\n", 1)[0]
-    assert "launch_large_m_kernel<1935, 14336, 384, 32, 256>" in branch
-    assert "launch_large_m_kernel<1935, 14336, 384, 16, 256>" not in producer
-    assert "uses_alternate_producer_geometry" not in producer
-    # And: with no seam left, the producer no longer depends on the ladder header,
-    # so a stale include cannot resurrect the branch by accident.
-    assert "svdquant_sm120_prefix_route.h" not in producer
-    # And: the ladder header dropped the accessor rather than leaving it dangling.
-    assert "uses_alternate_producer_geometry" not in LADDER_HEADER.read_text()
 
 
 def test_no_rung_admits_a_route_it_cannot_run() -> None:

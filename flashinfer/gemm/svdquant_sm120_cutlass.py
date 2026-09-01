@@ -51,6 +51,9 @@ from .gemm_svdquant import (
 _SM120_FUSED_LINEAR_MK = _sm120_routes.SM120_FUSED_LINEAR_MK
 
 
+_sm120_fused_prefix_route = _sm120_routes.sm120_fused_prefix_route
+
+
 _SM120_LINEAR_ROUTE_ABI_VERSION = _sm120_routes.SM120_LINEAR_ROUTE_ABI_VERSION
 
 
@@ -76,17 +79,6 @@ _sm120_fused_prefix_uses_packed_l2t = (
 
 _sm120_linear_route_abi_version = _sm120_routes.sm120_linear_route_abi_version
 
-
-_sm120_producer_variants = _sm120_routes.sm120_producer_variants
-
-
-_sm120_pack_tactic = _sm120_routes.sm120_pack_tactic
-
-
-_sm120_unpack_tactic = _sm120_routes.sm120_unpack_tactic
-
-
-_sm120_tactic_producer_route = _sm120_routes.sm120_tactic_producer_route
 
 
 _sm120_tactic_abi_version = _sm120_routes.sm120_tactic_abi_version
@@ -285,22 +277,16 @@ def _nvfp4_svdquant_gemm_runners(
 
 
 
-def _sm120_packed_linear_tactics(module, inputs: List[torch.Tensor]) -> List[int]:
-    """Cross the consumer rows this shape admits with its producer variants.
+def _sm120_linear_tactics(module, inputs: List[torch.Tensor]) -> List[int]:
+    """The consumer rows this shape admits, correctness- and cost-filtered.
 
-    The consumer half is unchanged: exactly the rows
-    ``_nvfp4_svdquant_valid_tactics`` already returns, correctness- and
-    cost-filtered. The producer half indexes ``sm120_producer_variants``, whose
-    variant 0 is the ladder default, so on a shape whose ladder admits one route
-    -- which is every shape outside the nine-entry ladder -- the packed list is
-    numerically identical to the bare list this replaces.
+    A tactic is one K3 row and nothing else. It briefly also carried a producer
+    geometry in its high bits, but the geometries that axis offered were never
+    instantiated on the C++ side, so every shape is back to the single axis the
+    kernel actually implements.
     """
     m, n, k, rank = _sm120_linear_inputs_shape(inputs)
-    rows = _nvfp4_svdquant_valid_tactics(module, m, n, k, rank)
-    variants = range(len(_sm120_producer_variants(m, k)))
-    return [_sm120_pack_tactic(row, v) for v in variants for row in rows]
-
-
+    return _nvfp4_svdquant_valid_tactics(module, m, n, k, rank)
 
 
 def _sm120_linear_inputs_shape(inputs: List[torch.Tensor]) -> tuple[int, int, int, int]:
@@ -349,7 +335,7 @@ def _sm120_fused_linear_runner(enable_pdl: bool, device: torch.device):
             inputs: List[torch.Tensor],
             profile: OptimizationProfile,
         ) -> List[int]:
-            return _sm120_packed_linear_tactics(module, inputs)
+            return _sm120_linear_tactics(module, inputs)
 
         def forward(
             self,
@@ -374,17 +360,11 @@ def _sm120_fused_linear_runner(enable_pdl: bool, device: torch.device):
                 out,
                 workspace_buffer,
             ) = inputs
-            # The producer half of the tactic decides two things that must
-            # describe the same route: the L2T layout prepared here, and the
-            # prefix the C++ dispatch takes. The packed tactic goes down whole
-            # and is unpacked there; the route is resolved here only to pick the
-            # layout. Workspace needs no widening -- the alternative variant is
-            # always the native prefix, and only the cuBLASLt one draws on the
-            # buffer, so switching can only lower the requirement.
-            _, producer_variant = _sm120_unpack_tactic(tactic)
-            route = _sm120_tactic_producer_route(
-                x.shape[0], x.shape[1], producer_variant
-            )
+            # The L2T layout prepared here and the prefix the C++ dispatch
+            # takes have to describe the same route, so both read it from the
+            # ladder rather than from the tactic: the tactic selects the K3
+            # consumer row only.
+            route = _sm120_fused_prefix_route(x.shape[0], x.shape[1])
             fused_l2t_smoothed = _sm120_fused_linear_l2t(x, l2t_smoothed, route)
             module.nvfp4_svdquant_linear_sm120(
                 x,

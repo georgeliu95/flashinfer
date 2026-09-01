@@ -81,9 +81,9 @@ def _fake_workspace_module(with_tactic_row=True):
 
 def _patch_workspace_module(monkeypatch, module):
     monkeypatch.setattr(
-        gemm_svdquant, "_get_nvfp4_svdquant_module_for_device",
+        svdquant_sm120_cutlass, "_get_nvfp4_svdquant_module_for_device",
         lambda device: module)
-    monkeypatch.setattr(gemm_svdquant, "_SM120_WORKSPACE_BYTES_CACHE", {})
+    monkeypatch.setattr(svdquant_sm120_cutlass, "_SM120_WORKSPACE_BYTES_CACHE", {})
 
 
 def test_sm120_workspace_skips_tactics_the_autotuner_cannot_select(monkeypatch):
