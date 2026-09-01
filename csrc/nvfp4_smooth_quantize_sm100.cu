@@ -192,6 +192,32 @@ void nvfp4_quantize_smooth_lora_down_geometry_sm120(
       x, pqs, global_scale, l2t_smoothed, xq, sf, down, false, geometry_variant);
 }
 
+// Runtime-M/K entry, for measuring what the templated shape specialisation is
+// worth. Takes the geometry explicitly because there is no per-shape pin to
+// read it from -- that is the whole point of the variant.
+void nvfp4_quantize_smooth_lora_down_dyn_sm120(
+    TensorView x, TensorView pqs, TensorView global_scale,
+    TensorView l2t_smoothed, TensorView xq, TensorView sf, TensorView down,
+    int block_threads, int tile_m, int tile_k, int address_policy) {
+  CHECK_INPUT_AND_TYPE(x, dl_bfloat16);
+  CHECK_INPUT_AND_TYPE(pqs, dl_bfloat16);
+  CHECK_INPUT_AND_TYPE(global_scale, dl_float32);
+  CHECK_INPUT_AND_TYPE(l2t_smoothed, dl_bfloat16);
+  CHECK_INPUT_AND_TYPE(xq, dl_uint8);
+  CHECK_INPUT_AND_TYPE(sf, dl_uint8);
+  CHECK_INPUT_AND_TYPE(down, dl_bfloat16);
+  int const m = static_cast<int>(x.size(0));
+  int const k = static_cast<int>(x.size(1));
+  cudaStream_t stream = get_stream(x.device());
+  cudaError_t status = flashinfer::gemm::nvfp4_smooth_quantize_lora_down_dyn_sm120(
+      x.data_ptr(), pqs.data_ptr(), static_cast<float const*>(global_scale.data_ptr()),
+      xq.data_ptr(), sf.data_ptr(), l2t_smoothed.data_ptr(), down.data_ptr(),
+      m, k, block_threads, tile_m, tile_k, stream, address_policy);
+  TVM_FFI_ICHECK_EQ(status, cudaSuccess)
+      << "nvfp4_quantize_smooth_lora_down_dyn_sm120 failed: "
+      << cudaGetErrorString(status);
+}
+
 void nvfp4_quantize_smooth_lora_down_overlap_sm120(
     TensorView x, TensorView pqs, TensorView global_scale,
     TensorView l2t_smoothed, TensorView xq, TensorView sf, TensorView down) {
@@ -271,6 +297,8 @@ void nvfp4_quantize_smooth_lora_down_m512_k3072_n16_experimental_sm120(
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(nvfp4_quantize_smooth, torch_ext::nvfp4_quantize_smooth);
 #if defined(FLASHINFER_ENABLE_SVDQ_SM120_K1_K2_FUSION)
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(nvfp4_quantize_smooth_lora_down_dyn_sm120,
+                              torch_ext::nvfp4_quantize_smooth_lora_down_dyn_sm120);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(nvfp4_quantize_smooth_lora_down_sm120,
                               torch_ext::nvfp4_quantize_smooth_lora_down_sm120);
 // Diagnostic-only export; deliberately not referenced by any production path.
