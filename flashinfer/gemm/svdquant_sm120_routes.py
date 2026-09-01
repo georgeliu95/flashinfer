@@ -102,6 +102,125 @@ def sm120_tactic_abi_version(m: int, k: int) -> int:
     return SM120_TACTIC_ABI_VERSION
 
 
+# The producer geometries the kernel is built for. A property of the kernel, not
+# of any shape: every one is instantiated, and which of them a given (M, K) may
+# use is decided by the predicate below rather than by a table.
+SM120_PRODUCER_GEOMETRY_LADDER: Final[tuple[tuple[int, int, int], ...]] = (
+    (192, 16, 512),
+    (192, 32, 128),
+    (192, 48, 128),
+    (224, 48, 128),
+    (256, 32, 256),
+    (256, 80, 128),
+    (288, 80, 128),
+    (384, 32, 256),
+)
+
+# How the runtime row offset is formed. Both are built; which one is faster is a
+# property of the geometry -- accumulating wins by 13% on (224, 48, 128) and
+# loses 10% on (192, 32, 128) -- so the tuner picks, on the device it is running
+# on.
+SM120_ADDRESS_POLICIES: Final[tuple[int, ...]] = (0, 1)  # 0 recompute, 1 accumulate
+
+_GEOMETRY_RANK: Final = 32
+_GEOMETRY_SF_VEC: Final = 16
+_GEOMETRY_ELEM_BYTES: Final = 2
+_GEOMETRY_DOWN_WARPS: Final = 4
+_GEOMETRY_SHARED_LIMIT: Final = 48 * 1024
+
+
+def sm120_producer_geometry_is_valid(
+    m: int, k: int, block_threads: int, tile_m: int, tile_k: int
+) -> bool:
+    """Mirror of the launcher's compile-time guard, as a predicate.
+
+    Enumeration has to be able to skip a combination this shape cannot
+    instantiate, and the C++ side refuses the same set, so the two must agree.
+    Nothing here reads a shape table: it is arithmetic on (M, K) and the
+    geometry.
+    """
+    if tile_k <= 0 or k % tile_k:
+        return False
+    if tile_k % (4 * _GEOMETRY_SF_VEC):
+        return False
+    if not (0 < tile_m <= 80 and tile_m % 16 == 0):
+        return False
+    quant_threads = block_threads - _GEOMETRY_DOWN_WARPS * 32
+    if block_threads % 32 or quant_threads <= 0:
+        return False
+    sf_cols_per_tile = tile_k // _GEOMETRY_SF_VEC
+    if (tile_m * sf_cols_per_tile) % quant_threads:
+        return False
+    long_k = k >= 8192
+    padded_m = (m + 127) // 128 * 128
+    grid_blocks = (padded_m + tile_m - 1) // tile_m
+    if long_k:
+        prefetch_lines = k * _GEOMETRY_RANK * _GEOMETRY_ELEM_BYTES // 128
+        if grid_blocks * block_threads < prefetch_lines:
+            return False
+    shared_bytes = (
+        2 * tile_m * (tile_k + 8) * _GEOMETRY_ELEM_BYTES
+        + 2 * tile_k * _GEOMETRY_ELEM_BYTES
+        + 2 * ((tile_m * sf_cols_per_tile) if long_k else 1)
+    )
+    return shared_bytes <= _GEOMETRY_SHARED_LIMIT
+
+
+@functools.cache
+def sm120_producer_variants(m: int, k: int) -> tuple[tuple[tuple[int, int, int], int], ...]:
+    """Every (geometry, address policy) this exact shape can run.
+
+    Computed, so a shape nobody measured still reaches the fused prefix, and a
+    card nobody measured on still gets to rank the candidates itself.
+    """
+    return tuple(
+        (geometry, policy)
+        for geometry in SM120_PRODUCER_GEOMETRY_LADDER
+        if sm120_producer_geometry_is_valid(m, k, *geometry)
+        for policy in SM120_ADDRESS_POLICIES
+    )
+
+
+def sm120_producer_variant_count(m: int, k: int) -> int:
+    return len(sm120_producer_variants(m, k))
+
+
+SM120_PRODUCER_SHIFT: Final = 8
+SM120_K3_ROW_MASK: Final = (1 << SM120_PRODUCER_SHIFT) - 1
+
+
+def sm120_pack_tactic(k3_row: int, producer_variant: int = 0) -> int:
+    """Pack a (consumer row, producer variant) pair into one tactic integer."""
+    if not 0 <= k3_row <= SM120_K3_ROW_MASK:
+        raise ValueError(f"k3 row outside the packable range: {k3_row}")
+    if producer_variant < 0:
+        raise ValueError(f"negative producer variant: {producer_variant}")
+    return k3_row | (producer_variant << SM120_PRODUCER_SHIFT)
+
+
+def sm120_unpack_tactic(tactic: int) -> tuple[int, int]:
+    """Split a packed tactic back into (consumer row, producer variant)."""
+    if tactic < 0:
+        return tactic, 0
+    return tactic & SM120_K3_ROW_MASK, tactic >> SM120_PRODUCER_SHIFT
+
+
+def sm120_decode_producer_variant(
+    m: int, k: int, variant: int
+) -> tuple[tuple[int, int, int], int]:
+    """Resolve a variant index to the geometry and policy the launcher needs.
+
+    Out of range falls back to the first admissible pair rather than failing: a
+    persisted tactic must still run something correct after the ladder moves.
+    """
+    variants = sm120_producer_variants(m, k)
+    if not variants:
+        raise ValueError(f"no admissible producer geometry for m={m} k={k}")
+    if not 0 <= variant < len(variants):
+        return variants[0]
+    return variants[variant]
+
+
 PREFIX_ROUTE_OVERRIDE_ENV: Final = "SVDQ_SM120_PREFIX_ROUTE"
 
 PrefixRoute: TypeAlias = str

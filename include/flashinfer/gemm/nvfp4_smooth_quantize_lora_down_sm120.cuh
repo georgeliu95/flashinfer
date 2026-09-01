@@ -2276,6 +2276,486 @@ inline cudaError_t launch_large_m_kernel(void const* x, void const* pre_quant_sc
 
 
 
+// ---------------------------------------------------------------------------
+// Runtime-M/K variant, built to measure what pinning M and K into the
+// template is worth. Same body as the templated kernel above; only the
+// shape leaves the type.
+// ---------------------------------------------------------------------------
+
+// How the runtime-K row offset is formed. Recompute derives it from the loop
+// counter every iteration, which leaves the compiler free to overlap
+// iterations; Accumulate carries it, which trades that freedom for one add in
+// place of a multiply. Which wins is a property of the geometry, not of the
+// shape, and it is measured rather than assumed.
+enum class DynAddress { kRecompute, kAccumulate };
+
+template <int BlockThreads, bool LongK, int KernelTileM, int KernelTileK = 128,
+          DynAddress Policy = DynAddress::kRecompute>
+__device__ __forceinline__ void copy_x_tile_async_dyn(
+    quant::Type const* __restrict__ x, quant::Type* __restrict__ x_tile,
+    int row_base, int tile_k, int thread, std::uint64_t l2_policy, int M, int K) {
+  constexpr int kKernelTileM = KernelTileM;
+  constexpr bool kUseStreamingX = LongK;
+  constexpr int kKernelQuantThreads =
+      BlockThreads - kDownWarps * 32;
+  constexpr int kLoadThreads = LongK ? kKernelQuantThreads : BlockThreads;
+  constexpr int kTileK = KernelTileK;
+  constexpr int kTileStride = kTileK + 8;
+  constexpr int kLoadItems = kKernelTileM * kTileK / 8;
+  int const load_thread = LongK ? thread - kDownWarps * 32 : thread;
+  constexpr int kColsPerRow = kTileK / 8;
+  constexpr bool kWholeRowStep = kLoadThreads % kColsPerRow == 0;
+  std::int64_t const k64 = K;
+  // Accumulate needs the thread stride to cover whole rows, otherwise the
+  // column moves too and there is nothing to carry.
+  if constexpr (Policy == DynAddress::kAccumulate && kWholeRowStep) {
+    constexpr int kRowsPerStep = kLoadThreads / kColsPerRow;
+    int const load_col = (load_thread % kColsPerRow) * 8;
+    int load_row = load_thread / kColsPerRow;
+    int global_row = row_base + load_row;
+    std::int64_t row_offset = static_cast<std::int64_t>(global_row) * k64;
+    std::int64_t const row_step = static_cast<std::int64_t>(kRowsPerStep) * k64;
+    for (int item = load_thread; item >= 0 && item < kLoadItems;
+         item += kLoadThreads) {
+      quant::Type const* source =
+          x + (global_row < M ? row_offset : 0) + tile_k + load_col;
+      quant::Type* destination = x_tile + load_row * kTileStride + load_col;
+      std::uint32_t const shared_address =
+          static_cast<std::uint32_t>(__cvta_generic_to_shared(destination));
+      int const source_bytes = global_row < M ? 16 : 0;
+      if constexpr (kUseStreamingX) {
+        asm volatile(
+            "cp.async.cg.shared.global.L2::cache_hint "
+            "[%0], [%1], 16, %2, %3;\n"
+            :
+            : "r"(shared_address), "l"(source), "r"(source_bytes),
+              "l"(l2_policy));
+      } else {
+        asm volatile(
+            "cp.async.cg.shared.global [%0], [%1], 16, %2;\n"
+            :
+            : "r"(shared_address), "l"(source), "r"(source_bytes));
+      }
+      load_row += kRowsPerStep;
+      global_row += kRowsPerStep;
+      row_offset += row_step;
+    }
+    return;
+  }
+  for (int item = load_thread; item >= 0 && item < kLoadItems;
+       item += kLoadThreads) {
+    int const load_row = item / kColsPerRow;
+    int const load_col = (item % kColsPerRow) * 8;
+    int const global_row = row_base + load_row;
+    quant::Type const* source =
+        x + static_cast<std::int64_t>(global_row < M ? global_row : 0) * k64 +
+        tile_k + load_col;
+    quant::Type* destination = x_tile + load_row * kTileStride + load_col;
+    std::uint32_t const shared_address =
+        static_cast<std::uint32_t>(__cvta_generic_to_shared(destination));
+    int const source_bytes = global_row < M ? 16 : 0;
+    if constexpr (kUseStreamingX) {
+      asm volatile(
+          "cp.async.cg.shared.global.L2::cache_hint "
+          "[%0], [%1], 16, %2, %3;\n"
+          :
+          : "r"(shared_address), "l"(source), "r"(source_bytes),
+            "l"(l2_policy));
+    } else {
+      asm volatile(
+          "cp.async.cg.shared.global [%0], [%1], 16, %2;\n"
+          :
+          : "r"(shared_address), "l"(source), "r"(source_bytes));
+    }
+  }
+}
+
+template <bool LongK, int KernelTileK = 128>
+__device__ __forceinline__ void copy_pre_quant_scale_tile_async_dyn(
+    quant::Type const* __restrict__ pre_quant_scale,
+    quant::Type* __restrict__ scale_tile, int tile_k, int thread) {
+  constexpr int kTileK = KernelTileK;
+  constexpr int kLoadItems = kTileK / 8;
+  int const load_thread = LongK ? thread - kDownWarps * 32 : thread;
+  if (load_thread >= 0 && load_thread < kLoadItems) {
+    quant::Type const* source =
+        pre_quant_scale + tile_k + load_thread * 8;
+    quant::Type* destination = scale_tile + load_thread * 8;
+    std::uint32_t const shared_address =
+        static_cast<std::uint32_t>(__cvta_generic_to_shared(destination));
+    asm volatile(
+        "cp.async.cg.shared.global [%0], [%1], 16;\n"
+        :
+        : "r"(shared_address), "l"(source));
+  }
+}
+
+template <int BlockThreads, bool LongK, int KernelTileM, int KernelTileK = 128,
+          DynAddress Policy = DynAddress::kRecompute>
+__global__ __launch_bounds__(BlockThreads) void
+nvfp4_smooth_quantize_lora_down_large_m_dyn_sm120_kernel(
+    quant::Type const* __restrict__ x, quant::Type const* __restrict__ pre_quant_scale,
+    float const* __restrict__ global_scale, std::uint64_t* __restrict__ xq,
+    std::uint8_t* __restrict__ sf, quant::Type const* __restrict__ l2t_smoothed,
+    quant::Type* __restrict__ down, int M, int K) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1200)
+  constexpr int kKernelTileM = KernelTileM;
+  constexpr bool kUseStreamingX = LongK;
+  constexpr int kKernelQuantThreads =
+      BlockThreads - kDownWarps * 32;
+  constexpr int kTileK = KernelTileK;
+  constexpr int kTileStride = kTileK + 8;
+  constexpr int kSfColsPerTile = kTileK / quant::SF_VEC_SIZE;
+  int const kPaddedM = (M + 127) / 128 * 128;
+  static_assert(
+      (kKernelTileM * kSfColsPerTile) % kKernelQuantThreads == 0);
+  int const kSfCols = K / quant::SF_VEC_SIZE;
+  __shared__ __align__(16) quant::Type
+      x_tiles[2][kKernelTileM * kTileStride];
+  __shared__ __align__(16) quant::Type scale_tiles[2][kTileK];
+  __shared__ __align__(4) std::uint8_t
+      sf_tiles[2][LongK ? kKernelTileM * kSfColsPerTile : 1];
+
+  int const thread = static_cast<int>(threadIdx.x);
+  int const warp = thread / 32;
+  int const lane = thread % 32;
+  int const group = lane / 4;
+  int const pair_col = (lane % 4) * 2;
+  float const scale = global_scale[0];
+  std::uint64_t l2_evict_first_policy = 0;
+  if constexpr (kUseStreamingX) {
+    l2_evict_first_policy = make_l2_evict_first_policy();
+  }
+  if constexpr (LongK) {
+    constexpr int kL2PrefetchBytes = 128;
+    int const kL2Bytes = K * kRank * static_cast<int>(sizeof(quant::Type));
+    int const kL2PrefetchLines = kL2Bytes / kL2PrefetchBytes;
+    int const prefetch_line =
+        static_cast<int>(blockIdx.x) * BlockThreads + thread;
+    if (prefetch_line < kL2PrefetchLines) {
+      std::uint8_t const* prefetch_address =
+          reinterpret_cast<std::uint8_t const*>(l2t_smoothed) +
+          prefetch_line * kL2PrefetchBytes;
+      asm volatile("prefetch.global.L2 [%0];" : : "l"(prefetch_address));
+    }
+  }
+
+  int const row_tile = static_cast<int>(blockIdx.x);
+  int const row_base = row_tile * kKernelTileM;
+  float d0 = 0.0f;
+  float d1 = 0.0f;
+  float d2 = 0.0f;
+  float d3 = 0.0f;
+  float d4 = 0.0f;
+  float d5 = 0.0f;
+  float d6 = 0.0f;
+  float d7 = 0.0f;
+  float d8 = 0.0f;
+  float d9 = 0.0f;
+  float d10 = 0.0f;
+  float d11 = 0.0f;
+  float d12 = 0.0f;
+  float d13 = 0.0f;
+  float d14 = 0.0f;
+  float d15 = 0.0f;
+  float d16 = 0.0f;
+  float d17 = 0.0f;
+  float d18 = 0.0f;
+  float d19 = 0.0f;
+
+  copy_x_tile_async_dyn<BlockThreads, LongK, KernelTileM, KernelTileK, Policy>(
+      x, x_tiles[0], row_base, 0, thread, l2_evict_first_policy, M, K);
+  copy_pre_quant_scale_tile_async_dyn<LongK, KernelTileK>(
+      pre_quant_scale, scale_tiles[0], 0, thread);
+  commit_x_tile_async();
+  wait_x_tile_async();
+  __syncthreads();
+
+  int tile_buffer = 0;
+#pragma unroll 1
+  for (int tile_k = 0; tile_k < K; tile_k += kTileK) {
+    int const next_tile_k = tile_k + kTileK;
+    int const next_buffer = tile_buffer ^ 1;
+    if (next_tile_k < K) {
+      copy_x_tile_async_dyn<BlockThreads, LongK, KernelTileM, KernelTileK, Policy>(
+          x, x_tiles[next_buffer], row_base, next_tile_k, thread,
+          l2_evict_first_policy, M, K);
+      copy_pre_quant_scale_tile_async_dyn<LongK, KernelTileK>(
+          pre_quant_scale, scale_tiles[next_buffer], next_tile_k, thread);
+      commit_x_tile_async();
+    }
+    quant::Type const* x_tile = x_tiles[tile_buffer];
+    quant::Type const* scale_tile = scale_tiles[tile_buffer];
+    std::uint8_t* sf_tile = sf_tiles[tile_buffer];
+
+    if (warp < kDownWarps) {
+#pragma unroll
+      for (int local_k = 0; local_k < kTileK; local_k += 16) {
+        quant::Type const* a_base =
+            x_tile + group * kTileStride + local_k + pair_col;
+        std::uint32_t const a0 = base::load_bf16_pair(a_base);
+        std::uint32_t const a1 = base::load_bf16_pair(a_base + 8 * kTileStride);
+        std::uint32_t const a2 = base::load_bf16_pair(a_base + 8);
+        std::uint32_t const a3 =
+            base::load_bf16_pair(a_base + 8 * kTileStride + 8);
+
+        int const b_col = warp * 8 + group;
+        int const b_row = tile_k + local_k + pair_col;
+        quant::Type const* b_base =
+            l2t_smoothed + b_row * kRank + b_col;
+        std::uint32_t const b0 =
+            base::pack_bf16_pair(b_base, b_base + kRank);
+        std::uint32_t const b1 =
+            base::pack_bf16_pair(b_base + 8 * kRank, b_base + 9 * kRank);
+        base::mma_m16n8k16_row_col(
+            d0, d1, d2, d3, a0, a1, a2, a3, b0, b1);
+        if constexpr (kKernelTileM >= 32) {
+          quant::Type const* a_upper = a_base + 16 * kTileStride;
+          std::uint32_t const a4 = base::load_bf16_pair(a_upper);
+          std::uint32_t const a5 =
+              base::load_bf16_pair(a_upper + 8 * kTileStride);
+          std::uint32_t const a6 = base::load_bf16_pair(a_upper + 8);
+          std::uint32_t const a7 =
+              base::load_bf16_pair(a_upper + 8 * kTileStride + 8);
+          base::mma_m16n8k16_row_col(
+              d4, d5, d6, d7, a4, a5, a6, a7, b0, b1);
+        }
+        if constexpr (kKernelTileM >= 48) {
+          quant::Type const* a_lower = a_base + 32 * kTileStride;
+          std::uint32_t const a8 = base::load_bf16_pair(a_lower);
+          std::uint32_t const a9 =
+              base::load_bf16_pair(a_lower + 8 * kTileStride);
+          std::uint32_t const a10 = base::load_bf16_pair(a_lower + 8);
+          std::uint32_t const a11 =
+              base::load_bf16_pair(a_lower + 8 * kTileStride + 8);
+          base::mma_m16n8k16_row_col(
+              d8, d9, d10, d11, a8, a9, a10, a11, b0, b1);
+        }
+        if constexpr (kKernelTileM >= 64) {
+          quant::Type const* a_bottom = a_base + 48 * kTileStride;
+          std::uint32_t const a12 = base::load_bf16_pair(a_bottom);
+          std::uint32_t const a13 =
+              base::load_bf16_pair(a_bottom + 8 * kTileStride);
+          std::uint32_t const a14 = base::load_bf16_pair(a_bottom + 8);
+          std::uint32_t const a15 =
+              base::load_bf16_pair(a_bottom + 8 * kTileStride + 8);
+          base::mma_m16n8k16_row_col(
+              d12, d13, d14, d15, a12, a13, a14, a15, b0, b1);
+        }
+        if constexpr (kKernelTileM >= 80) {
+          quant::Type const* a_tail = a_base + 64 * kTileStride;
+          std::uint32_t const a16 = base::load_bf16_pair(a_tail);
+          std::uint32_t const a17 =
+              base::load_bf16_pair(a_tail + 8 * kTileStride);
+          std::uint32_t const a18 = base::load_bf16_pair(a_tail + 8);
+          std::uint32_t const a19 =
+              base::load_bf16_pair(a_tail + 8 * kTileStride + 8);
+          base::mma_m16n8k16_row_col(
+              d16, d17, d18, d19, a16, a17, a18, a19, b0, b1);
+        }
+      }
+    } else {
+      constexpr int kQuantItems = kKernelTileM * kSfColsPerTile;
+      for (int quant_item = thread - kDownWarps * 32;
+           quant_item < kQuantItems;
+           quant_item += kKernelQuantThreads) {
+        int const row_offset = quant_item / kSfColsPerTile;
+        int const sf_in_tile =
+            quant_item - row_offset * kSfColsPerTile;
+        int const row = row_base + row_offset;
+        int const sf_col =
+            tile_k / quant::SF_VEC_SIZE + sf_in_tile;
+        if (row < M) {
+          quant::Bf16x8 x_lo;
+          quant::Bf16x8 x_hi;
+          quant::Bf16x8 pqs_lo;
+          quant::Bf16x8 pqs_hi;
+          quant::Type const* tile_ptr =
+              x_tile + row_offset * kTileStride +
+              sf_in_tile * quant::FAST_ELTS_PER_THREAD;
+          quant::loadBf16x8(tile_ptr, x_lo);
+          quant::loadBf16x8(tile_ptr + 8, x_hi);
+          quant::Type const* pqs_ptr =
+              scale_tile + sf_in_tile * quant::FAST_ELTS_PER_THREAD;
+          quant::loadBf16x8(pqs_ptr, pqs_lo);
+          quant::loadBf16x8(pqs_ptr + 8, pqs_hi);
+          std::int64_t const vec_offset =
+              static_cast<std::int64_t>(row) * kSfCols + sf_col;
+          if constexpr (LongK) {
+            xq[vec_offset] = quant::quantizeSmoothed16(
+                x_lo, x_hi, pqs_lo, pqs_hi, scale,
+                sf_tile + quant_item);
+          } else {
+            std::int64_t const sf_offset =
+                quant::get_sf_out_offset_128x4(
+                    row, sf_col, kSfCols);
+            std::uint64_t const quantized = quant::quantizeSmoothed16(
+                x_lo, x_hi, pqs_lo, pqs_hi, scale,
+                sf + sf_offset);
+            xq[vec_offset] = quantized;
+          }
+        } else if (row < kPaddedM) {
+          if constexpr (LongK) {
+            sf_tile[quant_item] = 0u;
+          } else {
+            std::int64_t const sf_offset =
+                quant::get_sf_out_offset_128x4(
+                    row, sf_col, kSfCols);
+            sf[sf_offset] = 0u;
+          }
+        }
+      }
+    }
+    if (next_tile_k < K) {
+      wait_x_tile_async();
+    }
+    if constexpr (LongK) {
+      __syncthreads();
+      constexpr int kSfGroupsPerTile = kSfColsPerTile / 4;
+      constexpr int kSfStoresPerTile =
+          kKernelTileM * kSfGroupsPerTile;
+      for (int sf_store = thread - kDownWarps * 32;
+           sf_store >= 0 && sf_store < kSfStoresPerTile;
+           sf_store += kKernelQuantThreads) {
+        int const row_offset =
+            sf_store / kSfGroupsPerTile;
+        int const sf_group =
+            sf_store - row_offset * kSfGroupsPerTile;
+        int const row = row_base + row_offset;
+        int const sf_col =
+            tile_k / quant::SF_VEC_SIZE + sf_group * 4;
+        if (row < kPaddedM) {
+          std::int64_t const sf_offset =
+              quant::get_sf_out_offset_128x4(
+                  row, sf_col, kSfCols);
+          *reinterpret_cast<std::uint32_t*>(sf + sf_offset) =
+              *reinterpret_cast<std::uint32_t const*>(
+                  sf_tile + row_offset * kSfColsPerTile + sf_group * 4);
+        }
+      }
+      if (next_tile_k < K) {
+        tile_buffer = next_buffer;
+      }
+    } else if (next_tile_k < K) {
+      __syncthreads();
+      tile_buffer = next_buffer;
+    }
+  }
+
+  if (warp < kDownWarps) {
+    constexpr bool kUsePackedDownStore = false;
+    int const row0 = row_base + group;
+    int const row1 = row0 + 8;
+    int const col = warp * 8 + pair_col;
+    if (row0 < M) {
+      store_down_pair<kUsePackedDownStore>(
+          down + row0 * kRank + col, d0, d1);
+    }
+    if (row1 < M) {
+      store_down_pair<kUsePackedDownStore>(
+          down + row1 * kRank + col, d2, d3);
+    }
+    if constexpr (kKernelTileM >= 32) {
+      int const row2 = row0 + 16;
+      int const row3 = row0 + 24;
+      if (row2 < M) {
+        store_down_pair<kUsePackedDownStore>(
+            down + row2 * kRank + col, d4, d5);
+      }
+      if (row3 < M) {
+        store_down_pair<kUsePackedDownStore>(
+            down + row3 * kRank + col, d6, d7);
+      }
+    }
+    if constexpr (kKernelTileM >= 48) {
+      int const row4 = row0 + 32;
+      int const row5 = row0 + 40;
+      if (row4 < M) {
+        store_down_pair<kUsePackedDownStore>(
+            down + row4 * kRank + col, d8, d9);
+      }
+      if (row5 < M) {
+        store_down_pair<kUsePackedDownStore>(
+            down + row5 * kRank + col, d10, d11);
+      }
+    }
+    if constexpr (kKernelTileM >= 64) {
+      int const row6 = row0 + 48;
+      int const row7 = row0 + 56;
+      if (row6 < M) {
+        store_down_pair<kUsePackedDownStore>(
+            down + row6 * kRank + col, d12, d13);
+      }
+      if (row7 < M) {
+        store_down_pair<kUsePackedDownStore>(
+            down + row7 * kRank + col, d14, d15);
+      }
+    }
+    if constexpr (kKernelTileM >= 80) {
+      int const row8 = row0 + 64;
+      int const row9 = row0 + 72;
+      if (row8 < M) {
+        store_down_pair<kUsePackedDownStore>(
+            down + row8 * kRank + col, d16, d17);
+      }
+      if (row9 < M) {
+        store_down_pair<kUsePackedDownStore>(
+            down + row9 * kRank + col, d18, d19);
+      }
+    }
+  }
+#else
+  if (threadIdx.x == 0 && blockIdx.x == 0) {
+    __trap();
+  }
+#endif
+}
+
+
+// Runtime-M/K launch. The geometry stays a template parameter -- shared memory
+// and every unroll constant come from it -- while M and K become arguments, so
+// one instantiation serves every shape whose K divides the tile.
+template <int BlockThreads, bool LongK, int TileM, int TileK, DynAddress Policy>
+inline cudaError_t launch_large_m_dyn_kernel(void const* x, void const* pre_quant_scale,
+                                             float const* global_scale, void* xq, void* sf,
+                                             void const* l2t_smoothed, void* down,
+                                             int m, int k, cudaStream_t stream) {
+  // KernelLaunchGeometry passes TileM straight through; the kernel's default
+  // template argument (K >= 8192 ? 80 : kTileM) is never what the launcher uses.
+  constexpr int kKernelTileM = TileM;
+  constexpr int kQuantThreads = BlockThreads - kDownWarps * 32;
+  constexpr int kSfColsPerTile = TileK / quant::SF_VEC_SIZE;
+  // Guard the instantiation, not just the call: a (geometry, LongK) pair whose
+  // quantize work does not divide across its threads has no kernel to build,
+  // and the templated path never produced one because such a pair never got
+  // matched to a shape.
+  constexpr int kSharedBytes =
+      2 * kKernelTileM * (TileK + 8) * static_cast<int>(sizeof(quant::Type)) +
+      2 * TileK * static_cast<int>(sizeof(quant::Type)) +
+      2 * (LongK ? kKernelTileM * kSfColsPerTile : 1);
+  if constexpr ((kKernelTileM * kSfColsPerTile) % kQuantThreads != 0 ||
+                kSharedBytes > 48 * 1024) {
+    return cudaErrorInvalidValue;
+  } else {
+    // What the templated kernel asserted at compile time is a precondition here.
+    if (k % TileK != 0) return cudaErrorInvalidValue;
+    if (LongK != (k >= 8192)) return cudaErrorInvalidValue;
+    int const padded_m = (m + 127) / 128 * 128;
+    int const grid_blocks = (padded_m + kKernelTileM - 1) / kKernelTileM;
+    if constexpr (LongK) {
+      int const l2_lines = k * kRank * static_cast<int>(sizeof(quant::Type)) / 128;
+      if (grid_blocks * BlockThreads < l2_lines) return cudaErrorInvalidValue;
+    }
+    nvfp4_smooth_quantize_lora_down_large_m_dyn_sm120_kernel<
+        BlockThreads, LongK, kKernelTileM, TileK, Policy>
+        <<<grid_blocks, BlockThreads, 0, stream>>>(
+        static_cast<quant::Type const*>(x), static_cast<quant::Type const*>(pre_quant_scale),
+        global_scale, static_cast<std::uint64_t*>(xq), static_cast<std::uint8_t*>(sf),
+        static_cast<quant::Type const*>(l2t_smoothed), static_cast<quant::Type*>(down), m, k);
+    return cudaGetLastError();
+  }
+}
+
 // Launch one exact shape under a selected geometry.
 //
 // The recursion instantiates the kernel once per variant this shape offers, so
@@ -2293,19 +2773,71 @@ inline cudaError_t launch_large_m_variant(int geometry_variant, void const* x,
   if constexpr (Index < geometry_variant_count(M, K, pinned)) {
     if (geometry_variant == Index) {
       constexpr ProducerGeometry g = geometry_for_variant(M, K, pinned, Index);
-      return launch_large_m_kernel<M, K, g.block_threads, g.tile_m, g.tile_k>(
-          x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, stream);
+      // The shape reaches the kernel as an argument now. Which geometry to run
+      // is still resolved here, from the pin; what changed is that the kernel
+      // is no longer built for this M and K, so one instantiation per geometry
+      // serves every shape that selects it.
+      return launch_large_m_dyn_kernel<g.block_threads, (K >= 8192), g.tile_m,
+                                       g.tile_k, DynAddress::kRecompute>(
+          x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, M, K, stream);
     }
     return launch_large_m_variant<M, K, PinBlockThreads, PinTileM, PinTileK, Index + 1>(
         geometry_variant, x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down,
         stream);
   } else {
-    return launch_large_m_kernel<M, K, PinBlockThreads, PinTileM, PinTileK>(
-        x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, stream);
+    return launch_large_m_dyn_kernel<PinBlockThreads, (K >= 8192), PinTileM, PinTileK,
+                                     DynAddress::kRecompute>(
+        x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, M, K, stream);
   }
 }
 
 }  // namespace smooth_quantize_lora_down_large_m_sm120_detail
+
+// Runtime-M/K entry. Geometry is still a template parameter -- shared memory and
+// every unroll constant come from it -- so this switch is over the ladder, not
+// over shapes. One instantiation per (geometry, LongK) serves every shape.
+inline cudaError_t nvfp4_smooth_quantize_lora_down_dyn_sm120(
+    void const* x, void const* pre_quant_scale, float const* global_scale, void* xq,
+    void* sf, void const* l2t_smoothed, void* down, int m, int k, int block_threads,
+    int tile_m, int tile_k, cudaStream_t stream, int address_policy = 0) {
+  namespace large_m = smooth_quantize_lora_down_large_m_sm120_detail;
+  using large_m::DynAddress;
+  bool const long_k = k >= 8192;
+  bool const accumulate = address_policy == 1;
+#define FI_SVDQ_DYN_CASE(BT, TM, TK)                                                    \
+  if (block_threads == (BT) && tile_m == (TM) && tile_k == (TK)) {                      \
+    if (long_k) {                                                                        \
+      return accumulate                                                                  \
+          ? large_m::launch_large_m_dyn_kernel<BT, true, TM, TK,                          \
+                                               DynAddress::kAccumulate>(                 \
+                x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, m, k,       \
+                stream)                                                                  \
+          : large_m::launch_large_m_dyn_kernel<BT, true, TM, TK,                          \
+                                               DynAddress::kRecompute>(                  \
+                x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, m, k,       \
+                stream);                                                                 \
+    }                                                                                    \
+    return accumulate                                                                    \
+        ? large_m::launch_large_m_dyn_kernel<BT, false, TM, TK,                           \
+                                             DynAddress::kAccumulate>(                   \
+              x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, m, k,         \
+              stream)                                                                    \
+        : large_m::launch_large_m_dyn_kernel<BT, false, TM, TK,                           \
+                                             DynAddress::kRecompute>(                    \
+              x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, m, k,         \
+              stream);                                                                   \
+  }
+  FI_SVDQ_DYN_CASE(192, 16, 512)
+  FI_SVDQ_DYN_CASE(192, 32, 128)
+  FI_SVDQ_DYN_CASE(192, 48, 128)
+  FI_SVDQ_DYN_CASE(224, 48, 128)
+  FI_SVDQ_DYN_CASE(256, 32, 256)
+  FI_SVDQ_DYN_CASE(256, 80, 128)
+  FI_SVDQ_DYN_CASE(288, 80, 128)
+  FI_SVDQ_DYN_CASE(384, 32, 256)
+#undef FI_SVDQ_DYN_CASE
+  return cudaErrorInvalidValue;
+}
 
 inline cudaError_t nvfp4_smooth_quantize_lora_down_sm120(
     void const* x, void const* pre_quant_scale, float const* global_scale, void* xq, void* sf,
@@ -2350,36 +2882,25 @@ inline cudaError_t nvfp4_smooth_quantize_lora_down_sm120(
       constexpr int tile_m = 32;
       constexpr int tile_k = 128;
       int const grid_blocks = (padded_m + tile_m - 1) / tile_m;
-      large_m::nvfp4_smooth_quantize_lora_down_large_m_sm120_kernel<
-          7800, 5120, block_threads, tile_m, tile_k><<<
-          grid_blocks, block_threads, 0, stream>>>(
-          static_cast<large_m::quant::Type const*>(x),
-          static_cast<large_m::quant::Type const*>(pre_quant_scale), global_scale,
-          static_cast<std::uint64_t*>(xq), static_cast<std::uint8_t*>(sf),
-          static_cast<large_m::quant::Type const*>(l2t_smoothed),
-          static_cast<large_m::quant::Type*>(down));
+      large_m::launch_large_m_dyn_kernel<block_threads, false, tile_m, tile_k,
+          large_m::DynAddress::kRecompute>(
+          x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down,
+          7800, 5120, stream);
     } else if (m == 32760) {
       constexpr int block_threads = 256;
       constexpr int tile_m = 32;
       constexpr int tile_k = 256;
       int const grid_blocks = (padded_m + tile_m - 1) / tile_m;
-      large_m::nvfp4_smooth_quantize_lora_down_large_m_sm120_kernel<
-          32760, 5120, block_threads, tile_m, tile_k><<<
-          grid_blocks, block_threads, 0, stream>>>(
-          static_cast<large_m::quant::Type const*>(x),
-          static_cast<large_m::quant::Type const*>(pre_quant_scale), global_scale,
-          static_cast<std::uint64_t*>(xq), static_cast<std::uint8_t*>(sf),
-          static_cast<large_m::quant::Type const*>(l2t_smoothed),
-          static_cast<large_m::quant::Type*>(down));
+      large_m::launch_large_m_dyn_kernel<block_threads, false, tile_m, tile_k,
+          large_m::DynAddress::kRecompute>(
+          x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down,
+          32760, 5120, stream);
     } else {
       int const grid_blocks = padded_m / large_m::kTileM;
-      large_m::nvfp4_smooth_quantize_lora_down_large_m_sm120_kernel<75600, 5120><<<
-          grid_blocks, large_m::kBlockThreads, 0, stream>>>(
-          static_cast<large_m::quant::Type const*>(x),
-          static_cast<large_m::quant::Type const*>(pre_quant_scale), global_scale,
-          static_cast<std::uint64_t*>(xq), static_cast<std::uint8_t*>(sf),
-          static_cast<large_m::quant::Type const*>(l2t_smoothed),
-          static_cast<large_m::quant::Type*>(down));
+      large_m::launch_large_m_dyn_kernel<large_m::kBlockThreads, false, large_m::kTileM, 128,
+          large_m::DynAddress::kRecompute>(
+          x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down,
+          75600, 5120, stream);
     }
     return cudaGetLastError();
   }
@@ -2388,14 +2909,10 @@ inline cudaError_t nvfp4_smooth_quantize_lora_down_sm120(
     int const padded_m = (m + 127) / 128 * 128;
     constexpr int tile_m = 80;
     int const grid_blocks = (padded_m + tile_m - 1) / tile_m;
-    large_m::nvfp4_smooth_quantize_lora_down_large_m_sm120_kernel<
-        7800, 8960><<<
-        grid_blocks, large_m::kBlockThreads, 0, stream>>>(
-        static_cast<large_m::quant::Type const*>(x),
-        static_cast<large_m::quant::Type const*>(pre_quant_scale), global_scale,
-        static_cast<std::uint64_t*>(xq), static_cast<std::uint8_t*>(sf),
-        static_cast<large_m::quant::Type const*>(l2t_smoothed),
-        static_cast<large_m::quant::Type*>(down));
+    large_m::launch_large_m_dyn_kernel<large_m::kBlockThreads, true, large_m::kTileM, 128,
+          large_m::DynAddress::kRecompute>(
+          x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down,
+          7800, 8960, stream);
     return cudaGetLastError();
   }
 
@@ -2403,14 +2920,10 @@ inline cudaError_t nvfp4_smooth_quantize_lora_down_sm120(
     int const padded_m = (m + 127) / 128 * 128;
     constexpr int tile_m = 80;
     int const grid_blocks = (padded_m + tile_m - 1) / tile_m;
-    large_m::nvfp4_smooth_quantize_lora_down_large_m_sm120_kernel<
-        32760, 8960><<<
-        grid_blocks, large_m::kBlockThreads, 0, stream>>>(
-        static_cast<large_m::quant::Type const*>(x),
-        static_cast<large_m::quant::Type const*>(pre_quant_scale), global_scale,
-        static_cast<std::uint64_t*>(xq), static_cast<std::uint8_t*>(sf),
-        static_cast<large_m::quant::Type const*>(l2t_smoothed),
-        static_cast<large_m::quant::Type*>(down));
+    large_m::launch_large_m_dyn_kernel<large_m::kBlockThreads, true, large_m::kTileM, 128,
+          large_m::DynAddress::kRecompute>(
+          x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down,
+          32760, 8960, stream);
     return cudaGetLastError();
   }
 
@@ -2418,13 +2931,10 @@ inline cudaError_t nvfp4_smooth_quantize_lora_down_sm120(
     int const padded_m = (m + 127) / 128 * 128;
     constexpr int tile_m = 80;
     int const grid_blocks = (padded_m + tile_m - 1) / tile_m;
-    large_m::nvfp4_smooth_quantize_lora_down_large_m_sm120_kernel<
-        7800, 13824, 288><<<grid_blocks, 288, 0, stream>>>(
-        static_cast<large_m::quant::Type const*>(x),
-        static_cast<large_m::quant::Type const*>(pre_quant_scale), global_scale,
-        static_cast<std::uint64_t*>(xq), static_cast<std::uint8_t*>(sf),
-        static_cast<large_m::quant::Type const*>(l2t_smoothed),
-        static_cast<large_m::quant::Type*>(down));
+    large_m::launch_large_m_dyn_kernel<288, true, 80, 128,
+                                       large_m::DynAddress::kRecompute>(
+        x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, 7800, 13824,
+        stream);
     return cudaGetLastError();
   }
 
@@ -2432,14 +2942,10 @@ inline cudaError_t nvfp4_smooth_quantize_lora_down_sm120(
     int const padded_m = (m + 127) / 128 * 128;
     constexpr int tile_m = 80;
     int const grid_blocks = (padded_m + tile_m - 1) / tile_m;
-    large_m::nvfp4_smooth_quantize_lora_down_large_m_sm120_kernel<
-        32760, 13824><<<
-        grid_blocks, large_m::kBlockThreads, 0, stream>>>(
-        static_cast<large_m::quant::Type const*>(x),
-        static_cast<large_m::quant::Type const*>(pre_quant_scale), global_scale,
-        static_cast<std::uint64_t*>(xq), static_cast<std::uint8_t*>(sf),
-        static_cast<large_m::quant::Type const*>(l2t_smoothed),
-        static_cast<large_m::quant::Type*>(down));
+    large_m::launch_large_m_dyn_kernel<large_m::kBlockThreads, true, large_m::kTileM, 128,
+          large_m::DynAddress::kRecompute>(
+          x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down,
+          32760, 13824, stream);
     return cudaGetLastError();
   }
 
@@ -2447,14 +2953,10 @@ inline cudaError_t nvfp4_smooth_quantize_lora_down_sm120(
     int const padded_m = (m + 127) / 128 * 128;
     constexpr int tile_m = 80;
     int const grid_blocks = (padded_m + tile_m - 1) / tile_m;
-    large_m::nvfp4_smooth_quantize_lora_down_large_m_sm120_kernel<
-        75600, 13824><<<
-        grid_blocks, large_m::kBlockThreads, 0, stream>>>(
-        static_cast<large_m::quant::Type const*>(x),
-        static_cast<large_m::quant::Type const*>(pre_quant_scale), global_scale,
-        static_cast<std::uint64_t*>(xq), static_cast<std::uint8_t*>(sf),
-        static_cast<large_m::quant::Type const*>(l2t_smoothed),
-        static_cast<large_m::quant::Type*>(down));
+    large_m::launch_large_m_dyn_kernel<large_m::kBlockThreads, true, large_m::kTileM, 128,
+          large_m::DynAddress::kRecompute>(
+          x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down,
+          75600, 13824, stream);
     return cudaGetLastError();
   }
 
@@ -2466,28 +2968,18 @@ inline cudaError_t nvfp4_smooth_quantize_lora_down_sm120(
       constexpr int case6_block_threads = 256;
       int const grid_blocks =
           (padded_m + case6_tile_m - 1) / case6_tile_m;
-      large_m::nvfp4_smooth_quantize_lora_down_large_m_sm120_kernel<
-          27280, 3072, case6_block_threads, case6_tile_m, case6_tile_k><<<
-          grid_blocks, case6_block_threads, 0, stream>>>(
-          static_cast<large_m::quant::Type const*>(x),
-          static_cast<large_m::quant::Type const*>(pre_quant_scale), global_scale,
-          static_cast<std::uint64_t*>(xq), static_cast<std::uint8_t*>(sf),
-          static_cast<large_m::quant::Type const*>(l2t_smoothed),
-          static_cast<large_m::quant::Type*>(down));
+      large_m::launch_large_m_dyn_kernel<case6_block_threads, false, case6_tile_m,
+                                         case6_tile_k, large_m::DynAddress::kRecompute>(
+          x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, 27280, 3072, stream);
     } else {
       constexpr int case7_tile_m = 32;
       constexpr int case7_tile_k = 256;
       constexpr int case7_block_threads = 384;
       int const grid_blocks =
           (padded_m + case7_tile_m - 1) / case7_tile_m;
-      large_m::nvfp4_smooth_quantize_lora_down_large_m_sm120_kernel<
-          27280, 14336, case7_block_threads, case7_tile_m, case7_tile_k><<<
-          grid_blocks, case7_block_threads, 0, stream>>>(
-          static_cast<large_m::quant::Type const*>(x),
-          static_cast<large_m::quant::Type const*>(pre_quant_scale), global_scale,
-          static_cast<std::uint64_t*>(xq), static_cast<std::uint8_t*>(sf),
-          static_cast<large_m::quant::Type const*>(l2t_smoothed),
-          static_cast<large_m::quant::Type*>(down));
+      large_m::launch_large_m_dyn_kernel<case7_block_threads, true, case7_tile_m,
+                                         case7_tile_k, large_m::DynAddress::kRecompute>(
+          x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, 27280, 14336, stream);
     }
     return cudaGetLastError();
   }
