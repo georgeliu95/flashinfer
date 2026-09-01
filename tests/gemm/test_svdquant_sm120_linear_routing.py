@@ -26,22 +26,22 @@ def test_table_miss_packs_m537_l2t_only_inside_fused_runner(
     module = SimpleNamespace(
         nvfp4_svdquant_linear_sm120=lambda *args: native_calls.append(args),
     )
-    monkeypatch.setattr(gemm_svdquant, "get_compute_capability", lambda device: (12, 0))
+    monkeypatch.setattr(svdquant_sm120_cutlass, "get_compute_capability", lambda device: (12, 0))
     monkeypatch.setattr(
-        gemm_svdquant, "get_nvfp4_svdquant_sm120_module", lambda: module
+        svdquant_sm120_cutlass, "get_nvfp4_svdquant_sm120_module", lambda: module
     )
     monkeypatch.setattr(gemm_svdquant.torch, "empty", fake_empty)
     monkeypatch.setattr(
         gemm_svdquant, "_get_cache_buf", lambda *args, **kwargs: "workspace"
     )
-    monkeypatch.setattr(gemm_svdquant, "_sm120_max_workspace_bytes", lambda *args: 0)
+    monkeypatch.setattr(svdquant_sm120_cutlass, "_sm120_max_workspace_bytes", lambda *args: 0)
     monkeypatch.setattr(
         gemm_svdquant,
         "_sm120_cutedsl_fallback_device_info",
         lambda device: (110, False),
     )
     monkeypatch.setattr(
-        gemm_svdquant,
+        svdquant_sm120_cutlass,
         "_cached_sm120_m537_l2t",
         lambda l2t: packed_l2t,
     )
@@ -49,14 +49,14 @@ def test_table_miss_packs_m537_l2t_only_inside_fused_runner(
 
     runner = svdquant_sm120_cutlass._sm120_fused_linear_runner(False, "cuda:0")
     monkeypatch.setattr(
-        gemm_svdquant, "_cached_sm120_linear_runners", lambda *args: [runner]
+        svdquant_sm120_cutlass, "_cached_sm120_linear_runners", lambda *args: [runner]
     )
 
     def choose_runner(tuner, runners, tuning_config, inputs, **kwargs):
         chooser_inputs.append(inputs)
         return runner, 81
 
-    monkeypatch.setattr(gemm_svdquant, "_choose_sm120_linear_runner", choose_runner)
+    monkeypatch.setattr(svdquant_sm120_cutlass, "_choose_sm120_linear_runner", choose_runner)
 
     x = SimpleNamespace(ndim=2, shape=(537, 5376), device="cuda:0")
     weight = SimpleNamespace(ndim=2, shape=(5376, 2688))

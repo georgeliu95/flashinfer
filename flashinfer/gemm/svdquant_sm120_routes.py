@@ -33,7 +33,6 @@ SM120_TACTIC_ABI_VERSION: Final = 3
 # test_sm120_linear_op_name_keeps_v5_for_every_other_shape: an earlier global
 # bump made every unrelated shape miss its record and re-profile, and one such
 # re-tune picked a slower tactic and regressed that shape by 8.47%.
-SM120_PACKED_TACTIC_ABI_VERSION: Final = 4
 SM120_LINEAR_ROUTE_ABI_VERSION: Final = 5
 
 # A route version changes only when the runner set for that exact (M, K, rank)
@@ -95,14 +94,12 @@ def sm120_linear_route_abi_version(m: int, k: int, rank: int) -> int:
 def sm120_tactic_abi_version(m: int, k: int) -> int:
     """Return the tactic namespace for one exact shape.
 
-    Shape-keyed for the same reason the route ABI is: only the shapes whose
-    candidate space actually changed should lose their persisted winners.
+    One namespace for every shape now that a tactic is just a K3 consumer row.
+    It stayed shape-keyed while a second, producer-geometry axis was packed into
+    the same integer, because only the shapes that carried that axis had a
+    candidate space that changed meaning.
     """
-    return (
-        SM120_PACKED_TACTIC_ABI_VERSION
-        if len(sm120_producer_variants(m, k)) > 1
-        else SM120_TACTIC_ABI_VERSION
-    )
+    return SM120_TACTIC_ABI_VERSION
 
 
 PREFIX_ROUTE_OVERRIDE_ENV: Final = "SVDQ_SM120_PREFIX_ROUTE"
@@ -235,42 +232,12 @@ def sm120_fused_prefix_route(m: int, k: int) -> PrefixRoute:
 # where the axis is degenerate: a packed tactic whose producer half is zero is
 # numerically the same integer as the bare row it replaces, and selects the same
 # producer that row selected before this axis existed.
-SM120_PRODUCER_SHIFT: Final = 8
-SM120_K3_ROW_MASK: Final = (1 << SM120_PRODUCER_SHIFT) - 1
 
 
-def sm120_producer_variants(m: int, k: int) -> tuple[PrefixRoute, ...]:
-    """Admitted producer routes for one exact shape, the default first.
-
-    Default-first is a contract the packing depends on, not a convenience.
-    Shapes outside the ladder resolve to the native producer and have exactly
-    one variant, so the axis is degenerate for them.
-    """
-    ladder = SM120_PREFIX_ROUTE_LADDER.get((m, k))
-    if ladder is None:
-        return ("native",)
-    default, admitted = ladder
-    return (default, *sorted(admitted - {default}))
 
 
-def sm120_pack_tactic(k3_row: int, producer_variant: int = 0) -> int:
-    """Pack a (consumer row, producer variant) pair into one tactic integer."""
-    if not 0 <= k3_row <= SM120_K3_ROW_MASK:
-        raise ValueError(f"k3 row outside the packable range: {k3_row}")
-    if producer_variant < 0:
-        raise ValueError(f"negative producer variant: {producer_variant}")
-    return k3_row | (producer_variant << SM120_PRODUCER_SHIFT)
 
 
-def sm120_unpack_tactic(tactic: int) -> tuple[int, int]:
-    """Return ``(k3_row, producer_variant)``.
-
-    A negative tactic is the autotuner's "no selection" sentinel and passes
-    through unchanged on the consumer side, with the default producer.
-    """
-    if tactic < 0:
-        return tactic, 0
-    return tactic & SM120_K3_ROW_MASK, tactic >> SM120_PRODUCER_SHIFT
 
 
 # --- producer geometry axis -------------------------------------------------
@@ -284,163 +251,25 @@ def sm120_unpack_tactic(tactic: int) -> tuple[int, int]:
 # order to launch it. Tests hold the two against each other.
 
 # ORDER IS ABI -- see the same note on kGeometryLadder in the header.
-SM120_PRODUCER_GEOMETRY_LADDER: Final[tuple[tuple[int, int, int], ...]] = (
-    (192, 16, 512),
-    (192, 32, 128),
-    (192, 48, 128),
-    (224, 48, 128),
-    (256, 32, 256),
-    (256, 80, 128),
-    (288, 80, 128),
-    (384, 32, 256),
-)
 
 # Budget, not a judgement: every admitted geometry is another instantiation in a
 # single translation unit and another candidate the tuner profiles. Measured on
 # SM120 (110 SMs), raising this from 1 to 4 took that unit from 6.9 s to 11.9 s to
 # compile and its object from 700 KB to 1058 KB.
-SM120_MAX_PRODUCER_GEOMETRIES: Final = 4
 
 # The geometry each exact large-M shape is pinned to today, which is always
 # variant 0 so an unselected shape runs what it has always run.
-SM120_PINNED_PRODUCER_GEOMETRY: Final[Mapping[PrefixRouteKey, tuple[int, int, int]]] = (
-    MappingProxyType({
-        (1024, 12288): (192, 16, 512),
-        (1935, 14336): (384, 32, 256),
-        (4096, 3072): (384, 32, 256),
-        (4096, 12288): (384, 32, 256),
-        (6889, 3072): (224, 48, 128),
-        (6889, 12288): (288, 80, 128),
-        (6913, 5120): (192, 32, 128),
-        (6913, 5376): (192, 32, 128),
-        (6913, 7168): (256, 32, 256),
-        (6913, 14336): (384, 32, 256),
-        (7800, 1536): (224, 48, 128),
-        (9216, 3072): (192, 48, 128),
-        (9216, 12288): (288, 80, 128),
-        (16384, 3072): (288, 80, 128),
-        (16384, 12288): (288, 80, 128),
-        (32760, 1536): (256, 32, 256),
-        (61056, 5376): (256, 32, 256),
-        (61056, 7168): (256, 32, 256),
-        (61056, 14336): (256, 80, 128),
-        (73984, 5376): (256, 32, 256),
-        (73984, 7168): (256, 32, 256),
-        (73984, 14336): (256, 80, 128),
-        (82752, 5376): (256, 32, 256),
-        (82752, 7168): (256, 32, 256),
-        (82752, 14336): (256, 80, 128),
-    })
-)
-
-_GEOMETRY_RANK: Final = 32
-_GEOMETRY_SF_VEC: Final = 16
-_GEOMETRY_ELEM_BYTES: Final = 2
-_GEOMETRY_DOWN_WARPS: Final = 4
-_GEOMETRY_SHARED_LIMIT: Final = 48 * 1024
 
 
-def sm120_producer_geometry_is_valid(
-    m: int, k: int, block_threads: int, tile_m: int, tile_k: int
-) -> bool:
-    """Mirror of ``geometry_is_valid`` in the producer header.
-
-    Restates KernelLaunchGeometry's static_asserts as a predicate. It has to be
-    a predicate rather than an assertion on both sides: enumeration must be able
-    to skip a combination this shape cannot instantiate, and a static_assert on
-    an unselected geometry is a build failure rather than a rejected candidate.
-    """
-    if tile_k <= 0 or k % tile_k:
-        return False
-    if tile_k % (4 * _GEOMETRY_SF_VEC):
-        return False
-    if not (0 < tile_m <= 80 and tile_m % 16 == 0):
-        return False
-    quant_threads = block_threads - _GEOMETRY_DOWN_WARPS * 32
-    if block_threads % 32 or quant_threads <= 0:
-        return False
-    sf_cols_per_tile = tile_k // _GEOMETRY_SF_VEC
-    if (tile_m * sf_cols_per_tile) % quant_threads:
-        return False
-    padded_m = (m + 127) // 128 * 128
-    grid_blocks = (padded_m + tile_m - 1) // tile_m
-    prefetch_lines = k * _GEOMETRY_RANK * _GEOMETRY_ELEM_BYTES // 128
-    if not (k < 8192 or grid_blocks * block_threads >= prefetch_lines):
-        return False
-    shared_bytes = (
-        2 * tile_m * (tile_k + 8) * _GEOMETRY_ELEM_BYTES
-        + 2 * tile_k * _GEOMETRY_ELEM_BYTES
-        + 2 * ((tile_m * sf_cols_per_tile) if k >= 8192 else 1)
-    )
-    return shared_bytes <= _GEOMETRY_SHARED_LIMIT
 
 
-def sm120_producer_geometries(m: int, k: int) -> tuple[tuple[int, int, int], ...]:
-    """Geometries one exact shape offers, its pinned one first.
-
-    A shape with no large-M producer offers nothing here and gets an empty
-    tuple, which is what makes the geometry axis degenerate for it.
-    """
-    pinned = SM120_PINNED_PRODUCER_GEOMETRY.get((m, k))
-    if pinned is None:
-        return ()
-    offered = [pinned]
-    for candidate in SM120_PRODUCER_GEOMETRY_LADDER:
-        if len(offered) >= SM120_MAX_PRODUCER_GEOMETRIES:
-            break
-        if candidate == pinned:
-            continue
-        if sm120_producer_geometry_is_valid(m, k, *candidate):
-            offered.append(candidate)
-    return tuple(offered)
 
 
-def sm120_producer_variant_count(m: int, k: int) -> int:
-    """How many producer variants the tactic space offers for one shape.
-
-    Routes first, then geometries appended. Appending is the ABI rule: a phase-1
-    record holds a route index, and putting geometries in front of it would
-    silently repoint every one of them.
-    """
-    routes = len(sm120_producer_variants(m, k))
-    geometries = len(sm120_producer_geometries(m, k))
-    return routes + max(0, geometries - 1)
 
 
-def sm120_decode_producer_variant(m: int, k: int, variant: int) -> tuple[PrefixRoute, int]:
-    """Split a producer variant into the route and the geometry it names.
-
-    The two axes are disjoint in the manifest -- no shape admits more than one
-    route AND carries a geometry ladder -- and a test pins that, because it is
-    what makes this split unambiguous rather than a convention.
-    """
-    routes = sm120_producer_variants(m, k)
-    if variant < len(routes):
-        return sm120_tactic_producer_route(m, k, variant), 0
-    return routes[0], variant - len(routes) + 1
 
 
-def sm120_tactic_producer_route(m: int, k: int, producer_variant: int) -> PrefixRoute:
-    """Route named by the producer half of a packed tactic.
 
-    This is a mirror of ``resolve_cublaslt_prefix`` in
-    ``include/flashinfer/gemm/svdquant_sm120_prefix_route.h`` and has to stay one,
-    because the two run on the same call: C++ picks the prefix and Python picks
-    the L2T layout it will read. Paraphrasing the rule instead of mirroring it is
-    what broke the environment override -- variant 0 resolved to the ladder
-    default here while C++ resolved it to the effective route, so an override on
-    an M537 shape handed the row-major matrix to the prepacked producer.
-
-    Variant 0, and any index the variant list does not hold, means the EFFECTIVE
-    route, so the override keeps working exactly as it did before this axis
-    existed. A variant above 0 names its route outright and the override does not
-    reach it.
-    """
-    if producer_variant > 0:
-        variants = sm120_producer_variants(m, k)
-        if producer_variant < len(variants):
-            return variants[producer_variant]
-    return sm120_fused_prefix_route(m, k)
 
 
 def sm120_fused_prefix_uses_packed_l2t(

@@ -17,10 +17,7 @@ import pytest
 
 from flashinfer.gemm.svdquant_sm120_routes import (
     PREFIX_ROUTE_OVERRIDE_ENV,
-    SM120_K3_ROW_MASK,
-    SM120_PACKED_TACTIC_ABI_VERSION,
     SM120_TACTIC_ABI_VERSION,
-    SM120_PRODUCER_SHIFT,
     SM120_FUSED_LINEAR_MK,
     SM120_LINEAR_ROUTE_ABI_OVERRIDES,
     SM120_LINEAR_ROUTE_V6_MKR,
@@ -29,12 +26,8 @@ from flashinfer.gemm.svdquant_sm120_routes import (
     sm120_fused_prefix_route,
     sm120_fused_prefix_uses_packed_l2t,
     sm120_linear_route_abi_version,
-    sm120_pack_tactic,
     sm120_prefix_route_overrides,
     sm120_tactic_abi_version,
-    sm120_producer_variants,
-    sm120_tactic_producer_route,
-    sm120_unpack_tactic,
 )
 
 
@@ -568,170 +561,23 @@ def test_every_production_prefix_has_a_fused_producer() -> None:
 # the one failure mode that is silent rather than loud.
 
 
-def test_producer_variants_put_the_default_first() -> None:
-    # Given: a packed tactic addresses a producer by index into this sequence.
-    # When: the variants of every ladder shape are enumerated.
-    # Then: index 0 is the ladder default, which is what lets variant 0 mean
-    # "whatever this shape did before the axis existed".
-    for key, (default, admitted) in SM120_PREFIX_ROUTE_LADDER.items():
-        variants = sm120_producer_variants(*key)
-        assert variants[0] == default, key
-        assert set(variants) == set(admitted), key
-        assert len(variants) == len(set(variants)), key
-    # And: a shape off the ladder has one variant, so its axis is degenerate.
-    assert sm120_producer_variants(6913, 14336) == ("native",)
 
 
-def test_packed_tactic_is_the_bare_row_where_the_axis_is_degenerate() -> None:
-    # Given: most shapes admit exactly one producer.
-    # When: their rows are packed with variant 0.
-    # Then: the integer is unchanged, so records and caches keyed on a bare row
-    # describe the same selection under the new grammar.
-    for row in (0, 9, 52, 80, 82):
-        assert sm120_pack_tactic(row, 0) == row
-        assert sm120_unpack_tactic(row) == (row, 0)
 
 
-def test_packing_round_trips_and_passes_the_sentinel_through() -> None:
-    for row in (0, 1, 82, SM120_K3_ROW_MASK):
-        for variant in (0, 1, 2, 7):
-            assert sm120_unpack_tactic(sm120_pack_tactic(row, variant)) == (row, variant)
-    # The autotuner's "no selection" sentinel has to reach the consumer intact
-    # rather than being masked into a valid row.
-    assert sm120_unpack_tactic(-1) == (-1, 0)
 
 
-def test_pack_rejects_values_it_cannot_represent() -> None:
-    with pytest.raises(ValueError):
-        sm120_pack_tactic(SM120_K3_ROW_MASK + 1, 0)
-    with pytest.raises(ValueError):
-        sm120_pack_tactic(-1, 0)
-    with pytest.raises(ValueError):
-        sm120_pack_tactic(0, -1)
 
 
-def test_packed_l2t_layout_follows_the_tactic_selected_route() -> None:
-    # Given: the M537 native producer indexes L2T with the prepacked layout while
-    # the cuBLASLt prefix reads the row-major one, and a mismatched pair misreads
-    # the matrix instead of failing.
-    # When: a variant other than the default is selected.
-    # Then: the layout query follows THAT route rather than the ladder default.
-    m, k, rank = 537, 5120, 32
-    variants = sm120_producer_variants(m, k)
-    assert variants[0] == "cublaslt" and "native" in variants
-    assert not sm120_fused_prefix_uses_packed_l2t(m, k, rank, "cublaslt")
-    assert sm120_fused_prefix_uses_packed_l2t(m, k, rank, "native")
-    # And: omitting the route still reproduces the ladder default, so callers
-    # that never select a variant are unaffected.
-    assert sm120_fused_prefix_uses_packed_l2t(m, k, rank) == (
-        sm120_fused_prefix_uses_packed_l2t(m, k, rank, variants[0])
-    )
 
 
-def test_variant_zero_still_answers_to_the_environment_override(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # Given: C++ resolve_cublaslt_prefix sends variant 0 to route_for(), which
-    # reads the override, while Python picks the L2T layout for the same call.
-    # The first cut of the packed axis resolved variant 0 to the ladder DEFAULT
-    # here, so an override on an M537 shape prepared the row-major matrix for the
-    # prepacked producer -- a misread, not a failure.
-    # When: the override names the non-default route and no variant is selected.
-    # Then: the layout follows the override, as it did before the axis existed.
-    m, k, rank = 537, 5120, 32
-    assert sm120_producer_variants(m, k)[0] == "cublaslt"
-    monkeypatch.setenv(PREFIX_ROUTE_OVERRIDE_ENV, f"{m}:{k}=native")
-    assert sm120_tactic_producer_route(m, k, 0) == "native"
-    assert sm120_fused_prefix_uses_packed_l2t(
-        m, k, rank, sm120_tactic_producer_route(m, k, 0)
-    )
 
 
-def test_a_selected_variant_outranks_the_environment_override(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # Given: the same mirror, on the other branch -- C++ answers a variant above
-    # zero from the variant list and never consults route_for().
-    # When: the override names one route and the tactic names the other.
-    # Then: the tactic wins, because a profiled candidate has to mean the same
-    # thing on the run that measured it and the run that replays it.
-    m, k = 537, 5120
-    variants = sm120_producer_variants(m, k)
-    assert variants == ("cublaslt", "native")
-    monkeypatch.setenv(PREFIX_ROUTE_OVERRIDE_ENV, f"{m}:{k}=native")
-    assert sm120_tactic_producer_route(m, k, 1) == "native"
-    monkeypatch.setenv(PREFIX_ROUTE_OVERRIDE_ENV, f"{m}:{k}=cublaslt")
-    assert sm120_tactic_producer_route(m, k, 1) == "native"
 
 
-def test_out_of_range_variants_fall_back_the_way_cpp_does() -> None:
-    # Given: C++ range-checks the index and falls through to route_for() when the
-    # variant list does not hold it; an earlier Python cut wrapped with a modulo
-    # instead, which agrees only while nothing overrides the route.
-    # When: an index past the end is resolved.
-    # Then: both sides answer with the effective route.
-    m, k = 537, 5120
-    beyond = len(sm120_producer_variants(m, k)) + 3
-    assert sm120_tactic_producer_route(m, k, beyond) == sm120_fused_prefix_route(m, k)
-    # And: a shape off the ladder has one variant and cannot disagree at all.
-    assert sm120_tactic_producer_route(6913, 14336, 1) == "native"
 
 
-def test_the_cpp_mirror_still_has_the_shape_python_mirrors() -> None:
-    # Given: sm120_tactic_producer_route is a mirror, and a mirror is only
-    # correct while the thing it reflects keeps its shape.
-    # When: the header's resolver is read.
-    # Then: it still guards on a positive variant, still range-checks the index,
-    # and still ends at route_for -- the three facts the Python side copies.
-    root = Path(__file__).resolve().parents[2]
-    header = (
-        root / "include/flashinfer/gemm/svdquant_sm120_prefix_route.h"
-    ).read_text()
-    body = header.split("inline bool resolve_cublaslt_prefix(")[1].split("\n}")[0]
-    assert "if (producer_variant > 0) {" in body
-    assert "< variants.size()" in body
-    assert body.rstrip().endswith("return route_for(m, k) == Route::kCublaslt;")
 
 
-def test_producer_variant_order_is_a_cross_language_abi() -> None:
-    # Given: Python packs a variant index and C++ unpacks it, so the ORDER of
-    # the variant list is an ABI between the two, not an implementation detail.
-    # When: the header's constants and enumeration order are read out.
-    # Then: they match what sm120_producer_variants builds -- default first, then
-    # the grammar spellings in sort order.
-    root = Path(__file__).resolve().parents[2]
-    header = (
-        root / "include/flashinfer/gemm/svdquant_sm120_prefix_route.h"
-    ).read_text()
-    assert f"kProducerShift = {SM120_PRODUCER_SHIFT}" in header
-    order = re.search(r"for \(Route candidate : \{([^}]*)\}\)", header)
-    assert order is not None, "C++ variant enumeration order not found"
-    assert [token.strip() for token in order.group(1).split(",")] == [
-        "Route::kCublaslt",
-        "Route::kNative",
-        "Route::kNativeAlt",
-    ]
 
 
-def test_tactic_abi_bumps_only_where_the_candidate_space_changed() -> None:
-    # Given: an earlier GLOBAL bump made every unrelated shape miss its record
-    # and re-profile, and one of those re-tunes regressed a shape 8.47% -- the
-    # incident recorded on test_sm120_linear_op_name_keeps_v5_for_every_other_shape.
-    # When: the packed producer axis is introduced.
-    # Then: only shapes that actually gained a second producer move namespace.
-    # Everywhere else a packed tactic is the same integer as the bare row it
-    # replaces, so the persisted winner still resolves and is kept.
-    moved = {
-        key
-        for key in SM120_PREFIX_ROUTE_LADDER
-        if sm120_tactic_abi_version(*key) == SM120_PACKED_TACTIC_ABI_VERSION
-    }
-    assert moved == {
-        key
-        for key, (_, admitted) in SM120_PREFIX_ROUTE_LADDER.items()
-        if len(admitted) > 1
-    }
-    # And: a ladder shape whose alternates were all refuted keeps its records.
-    assert sm120_tactic_abi_version(537, 5376) == SM120_TACTIC_ABI_VERSION
-    # And: so does everything off the ladder.
-    assert sm120_tactic_abi_version(6913, 14336) == SM120_TACTIC_ABI_VERSION

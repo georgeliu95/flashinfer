@@ -1702,23 +1702,7 @@ __device__ __forceinline__ std::uint64_t make_l2_evict_first_policy() {
   return policy;
 }
 
-__device__ __forceinline__ std::uint64_t make_l2_evict_last_policy() {
-  std::uint64_t policy;
-  asm volatile(
-      "createpolicy.fractional.L2::evict_last.b64 %0, 1.0;\n"
-      : "=l"(policy));
-  return policy;
-}
 
-__device__ __forceinline__ void store_u64_l2_cache_hint(
-    std::uint64_t* destination, std::uint64_t value,
-    std::uint64_t l2_policy) {
-  asm volatile(
-      "st.global.L2::cache_hint.b64 [%0], %1, %2;\n"
-      :
-      : "l"(destination), "l"(value), "l"(l2_policy)
-      : "memory");
-}
 
 template <bool UsePackedStore>
 __device__ __forceinline__ void store_down_pair(
@@ -1743,8 +1727,7 @@ __device__ __forceinline__ void copy_x_tile_async(
     quant::Type const* __restrict__ x, quant::Type* __restrict__ x_tile,
     int row_base, int tile_k, int thread, std::uint64_t l2_policy) {
   constexpr int kKernelTileM = KernelTileM;
-  constexpr bool kUseStreamingX =
-      K >= 8192 || (M == 27280 && K == 3072);
+  constexpr bool kUseStreamingX = K >= 8192;
   constexpr int kKernelQuantThreads =
       BlockThreads - kDownWarps * 32;
   constexpr int kLoadThreads = K >= 8192
@@ -1823,8 +1806,7 @@ nvfp4_smooth_quantize_lora_down_large_m_sm120_kernel(
     quant::Type* __restrict__ down) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1200)
   constexpr int kKernelTileM = KernelTileM;
-  constexpr bool kUseStreamingX =
-      K >= 8192 || (M == 27280 && K == 3072);
+  constexpr bool kUseStreamingX = K >= 8192;
   constexpr int kKernelQuantThreads =
       BlockThreads - kDownWarps * 32;
   constexpr int kTileK = KernelTileK;
@@ -1850,10 +1832,6 @@ nvfp4_smooth_quantize_lora_down_large_m_sm120_kernel(
   std::uint64_t l2_evict_first_policy = 0;
   if constexpr (kUseStreamingX) {
     l2_evict_first_policy = make_l2_evict_first_policy();
-  }
-  std::uint64_t l2_evict_last_policy = 0;
-  if constexpr (M == 27280 && K == 3072) {
-    l2_evict_last_policy = make_l2_evict_last_policy();
   }
   if constexpr (K >= 8192) {
     constexpr int kL2PrefetchBytes = 128;
@@ -2022,12 +2000,7 @@ nvfp4_smooth_quantize_lora_down_large_m_sm120_kernel(
             std::uint64_t const quantized = quant::quantizeSmoothed16(
                 x_lo, x_hi, pqs_lo, pqs_hi, scale,
                 sf + sf_offset);
-            if constexpr (M == 27280 && K == 3072) {
-              store_u64_l2_cache_hint(
-                  xq + vec_offset, quantized, l2_evict_last_policy);
-            } else {
-              xq[vec_offset] = quantized;
-            }
+            xq[vec_offset] = quantized;
           }
         } else if (row < kPaddedM) {
           if constexpr (K >= 8192) {
@@ -2078,8 +2051,7 @@ nvfp4_smooth_quantize_lora_down_large_m_sm120_kernel(
   }
 
   if (warp < kDownWarps) {
-    constexpr bool kUsePackedDownStore =
-        M == 27280 && K == 3072;
+    constexpr bool kUsePackedDownStore = false;
     int const row0 = row_base + group;
     int const row1 = row0 + 8;
     int const col = warp * 8 + pair_col;
@@ -2300,6 +2272,8 @@ inline cudaError_t launch_large_m_kernel(void const* x, void const* pre_quant_sc
       static_cast<quant::Type const*>(l2t_smoothed), static_cast<quant::Type*>(down));
   return cudaGetLastError();
 }
+
+
 
 
 // Launch one exact shape under a selected geometry.
