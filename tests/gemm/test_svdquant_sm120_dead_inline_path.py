@@ -60,7 +60,9 @@ _MUST_KEEP_INLINE_DOWN: Final = frozenset(
 def _header_list() -> frozenset[str]:
     body = _TEMPLATE_PATH.read_text(encoding="utf-8")
     start = body.index("#define SVDQ_SM120_NO_INLINE_DOWN_CONFIG_LIST(X)")
-    end = body.index("template <class Config>\ninline constexpr bool kCompileInlineDownSm120", start)
+    end = body.index(
+        "template <class Config>\ninline constexpr bool kCompileInlineDownSm120", start
+    )
     return frozenset(re.findall(r"X\((Tactic\w+)\)", body[start:end]))
 
 
@@ -81,7 +83,10 @@ def test_collective_still_exposes_the_compile_time_toggle() -> None:
     # the list. Pinning the ">" made this fail the moment a parameter was added
     # after it, which says nothing about the toggle.
     assert "bool CompileInlineDown_ = true" in collective_source
-    assert "static constexpr bool CompileInlineDown = CompileInlineDown_;" in collective_source
+    assert (
+        "static constexpr bool CompileInlineDown = CompileInlineDown_;"
+        in collective_source
+    )
     # The LoRA rank reached the collective the same way, and for the same reason:
     # it has to be known at compile time for the smem overlay to be sized.
     assert "int LoRaK_ = 32" in collective_source
@@ -89,7 +94,10 @@ def test_collective_still_exposes_the_compile_time_toggle() -> None:
     assert "if constexpr (CollectiveMainloop::CompileInlineDown)" in collective_source
     assert "CollectiveMainloop::inline_lora_down_m537_k5120(" in collective_source
     assert "using CollectiveMainloop = CollectiveMainloopT<true>;" in template_source
-    assert "using CollectiveMainloopNoInlineDown = CollectiveMainloopT<false>;" in template_source
+    assert (
+        "using CollectiveMainloopNoInlineDown = CollectiveMainloopT<false>;"
+        in template_source
+    )
     assert "run_tactic_no_inline_down" in template_source
 
 

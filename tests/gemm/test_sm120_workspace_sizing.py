@@ -26,8 +26,9 @@ from flashinfer.testing.svdq_model_shapes import MODEL_SHAPE_CASES
 
 
 def _pack_row(kernel_id, splits=1, raster=0, swizzle=1, streamk=0):
-    return (kernel_id | (splits << 8) | (raster << 16) | (swizzle << 24)
-            | (streamk << 32))
+    return (
+        kernel_id | (splits << 8) | (raster << 16) | (swizzle << 24) | (streamk << 32)
+    )
 
 
 # MiniMax-H3 row 69, the largest shape in the frozen benchmark matrix and one of
@@ -79,8 +80,7 @@ def _fake_workspace_module(with_tactic_row=True):
         nvfp4_svdquant_gemm_tactic_num=lambda: 4,
         nvfp4_svdquant_gemm_can_implement=lambda m, n, k, rank, t: True,
         nvfp4_svdquant_gemm_workspace_size=lambda m, n, k, t: (
-            _SPLITK_WORKSPACE_BYTES if t == _SPLITK_TACTIC
-            else _LEGACY_WORKSPACE_BYTES
+            _SPLITK_WORKSPACE_BYTES if t == _SPLITK_TACTIC else _LEGACY_WORKSPACE_BYTES
         ),
     )
     if with_tactic_row:
@@ -90,8 +90,10 @@ def _fake_workspace_module(with_tactic_row=True):
 
 def _patch_workspace_module(monkeypatch, module):
     monkeypatch.setattr(
-        svdquant_sm120_cutlass, "_get_nvfp4_svdquant_module_for_device",
-        lambda device, lora_rank=32: module)
+        svdquant_sm120_cutlass,
+        "_get_nvfp4_svdquant_module_for_device",
+        lambda device, lora_rank=32: module,
+    )
     monkeypatch.setattr(svdquant_sm120_cutlass, "_SM120_WORKSPACE_BYTES_CACHE", {})
     # The budget is decided once per shape and held, so it has to be cleared
     # alongside the sizes or one test's card size answers for the next.
@@ -107,9 +109,12 @@ _CARD_TOO_SMALL_FOR_SPLITK = int((_SPLITK_WORKSPACE_BYTES - 1) / 0.25)
 def _patch_budget(monkeypatch, total_memory_bytes):
     """Stand in for the card, so these stay CPU-only tests."""
     monkeypatch.setattr(
-        svdquant_sm120_cutlass, "_sm120_workspace_budget_bytes",
+        svdquant_sm120_cutlass,
+        "_sm120_workspace_budget_bytes",
         lambda device_index: int(
-            total_memory_bytes * svdquant_sm120_cutlass._SM120_WORKSPACE_BUDGET_FRACTION))
+            total_memory_bytes * svdquant_sm120_cutlass._SM120_WORKSPACE_BUDGET_FRACTION
+        ),
+    )
 
 
 def test_sm120_workspace_skips_tactics_the_card_cannot_back(monkeypatch):
@@ -125,9 +130,12 @@ def test_sm120_workspace_skips_tactics_the_card_cannot_back(monkeypatch):
     m, n, k, rank = _H3_LARGEST
     device = SimpleNamespace(index=0)
     assert _SPLITK_TACTIC not in svdquant_sm120_cutlass._nvfp4_svdquant_valid_tactics(
-        _fake_workspace_module(), m, n, k, rank, device)
-    assert svdquant_sm120_cutlass._sm120_max_workspace_bytes(
-        device, m, n, k, rank) == _LEGACY_WORKSPACE_BYTES
+        _fake_workspace_module(), m, n, k, rank, device
+    )
+    assert (
+        svdquant_sm120_cutlass._sm120_max_workspace_bytes(device, m, n, k, rank)
+        == _LEGACY_WORKSPACE_BYTES
+    )
 
 
 def test_sm120_workspace_covers_every_selectable_tactic(monkeypatch):
@@ -142,17 +150,24 @@ def test_sm120_workspace_covers_every_selectable_tactic(monkeypatch):
         _patch_workspace_module(monkeypatch, module)
         _patch_budget(monkeypatch, total)
         device = SimpleNamespace(index=0)
-        for m, n, k in [_H3_LARGEST[:3], _H3_SPLITK_SHAPE[:3], (512, 3072, 3072),
-                        _H3_ROW52[:3]]:
+        for m, n, k in [
+            _H3_LARGEST[:3],
+            _H3_SPLITK_SHAPE[:3],
+            (512, 3072, 3072),
+            _H3_ROW52[:3],
+        ]:
             rank = 32
             allotted = svdquant_sm120_cutlass._sm120_max_workspace_bytes(
-                device, m, n, k, rank)
+                device, m, n, k, rank
+            )
             selectable = svdquant_sm120_cutlass._nvfp4_svdquant_valid_tactics(
-                module, m, n, k, rank, device)
+                module, m, n, k, rank, device
+            )
             assert selectable, f"no tactic selectable for {(m, n, k)}"
             for t in selectable:
                 assert allotted >= module.nvfp4_svdquant_gemm_workspace_size(
-                    m, n, k, t), f"tactic {t} under-runs the buffer at {(m, n, k)}"
+                    m, n, k, t
+                ), f"tactic {t} under-runs the buffer at {(m, n, k)}"
 
 
 def test_sm120_workspace_sizes_splitk_when_the_card_can_back_it(monkeypatch):
@@ -169,9 +184,12 @@ def test_sm120_workspace_sizes_splitk_when_the_card_can_back_it(monkeypatch):
     m, n, k, rank = _H3_LARGEST
     device = SimpleNamespace(index=0)
     assert _SPLITK_TACTIC in svdquant_sm120_cutlass._nvfp4_svdquant_valid_tactics(
-        _fake_workspace_module(), m, n, k, rank, device)
-    assert svdquant_sm120_cutlass._sm120_max_workspace_bytes(
-        device, m, n, k, rank) == _SPLITK_WORKSPACE_BYTES
+        _fake_workspace_module(), m, n, k, rank, device
+    )
+    assert (
+        svdquant_sm120_cutlass._sm120_max_workspace_bytes(device, m, n, k, rank)
+        == _SPLITK_WORKSPACE_BYTES
+    )
 
 
 def test_sm120_valid_tactics_are_unbounded_without_a_device():
@@ -183,14 +201,20 @@ def test_sm120_valid_tactics_are_unbounded_without_a_device():
     module = _fake_workspace_module()
     m, n, k, rank = _H3_LARGEST
     every = list(range(module.nvfp4_svdquant_gemm_tactic_num()))
-    assert svdquant_sm120_cutlass._nvfp4_svdquant_valid_tactics(
-        module, m, n, k, rank) == every
+    assert (
+        svdquant_sm120_cutlass._nvfp4_svdquant_valid_tactics(module, m, n, k, rank)
+        == every
+    )
     no_query = SimpleNamespace(
         nvfp4_svdquant_gemm_tactic_num=module.nvfp4_svdquant_gemm_tactic_num,
         nvfp4_svdquant_gemm_can_implement=module.nvfp4_svdquant_gemm_can_implement,
     )
-    assert svdquant_sm120_cutlass._nvfp4_svdquant_valid_tactics(
-        no_query, m, n, k, rank, SimpleNamespace(index=0)) == every
+    assert (
+        svdquant_sm120_cutlass._nvfp4_svdquant_valid_tactics(
+            no_query, m, n, k, rank, SimpleNamespace(index=0)
+        )
+        == every
+    )
 
 
 def test_sm120_budget_keeps_one_tactic_when_the_card_backs_none(monkeypatch):
@@ -205,10 +229,12 @@ def test_sm120_budget_keeps_one_tactic_when_the_card_backs_none(monkeypatch):
     _patch_budget(monkeypatch, 4096)
     m, n, k, rank = _H3_LARGEST
     selectable = svdquant_sm120_cutlass._nvfp4_svdquant_valid_tactics(
-        module, m, n, k, rank, SimpleNamespace(index=0))
+        module, m, n, k, rank, SimpleNamespace(index=0)
+    )
     assert len(selectable) == 1
     assert module.nvfp4_svdquant_gemm_workspace_size(m, n, k, selectable[0]) == (
-        _LEGACY_WORKSPACE_BYTES)
+        _LEGACY_WORKSPACE_BYTES
+    )
 
 
 def test_sm120_h3_shapes_match_the_frozen_registry():
@@ -246,8 +272,7 @@ def test_sm120_budget_is_decided_once_per_shape(monkeypatch):
     tactic the already-provisioned buffer cannot hold, which the C++ ICHECK_GE
     refuses at launch.
     """
-    monkeypatch.setattr(
-        svdquant_sm120_cutlass, "_SM120_WORKSPACE_BUDGET_CACHE", {})
+    monkeypatch.setattr(svdquant_sm120_cutlass, "_SM120_WORKSPACE_BUDGET_CACHE", {})
     seen = []
 
     def moving_target(device_index):
@@ -255,7 +280,8 @@ def test_sm120_budget_is_decided_once_per_shape(monkeypatch):
         return (1 << 40) if not seen[:-1] else 4096
 
     monkeypatch.setattr(
-        svdquant_sm120_cutlass, "_sm120_workspace_budget_bytes", moving_target)
+        svdquant_sm120_cutlass, "_sm120_workspace_budget_bytes", moving_target
+    )
     device = SimpleNamespace(index=0)
     key = (0, 64, 64, 64, 32)
     first = svdquant_sm120_cutlass._sm120_shape_workspace_budget(device, key)
@@ -278,8 +304,10 @@ def test_sm120_budget_prunes_nothing_over_the_frozen_matrix():
     """
     widest_measured = 8.86 * 1024**3
     frac = svdquant_sm120_cutlass._SM120_WORKSPACE_BUDGET_FRACTION
-    for card_bytes in (73415 * 1024**2,   # SM120 (110 SMs)
-                       85651 * 1024**2):  # SM120 (156 SMs)
+    for card_bytes in (
+        73415 * 1024**2,  # SM120 (110 SMs)
+        85651 * 1024**2,
+    ):  # SM120 (156 SMs)
         assert card_bytes * frac > widest_measured
 
 
@@ -294,6 +322,10 @@ def test_sm120_row52_admission_does_not_widen_its_workspace(monkeypatch):
     _patch_budget(monkeypatch, _CARD_TOO_SMALL_FOR_SPLITK)
     m, n, k, rank = _H3_ROW52
     assert (m, n, k) in _H3_SHAPES
-    assert svdquant_sm120_cutlass._sm120_max_workspace_bytes(
-        SimpleNamespace(index=0), m, n, k, rank) == _LEGACY_WORKSPACE_BYTES
+    assert (
+        svdquant_sm120_cutlass._sm120_max_workspace_bytes(
+            SimpleNamespace(index=0), m, n, k, rank
+        )
+        == _LEGACY_WORKSPACE_BYTES
+    )
     assert svdquant_sm120_cutlass._sm120_fused_linear_supported(m, k, rank)

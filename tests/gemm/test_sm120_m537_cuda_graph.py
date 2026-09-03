@@ -32,9 +32,7 @@ class TestSm120M537CudaGraph(unittest.TestCase):
             device="cuda",
         )
         down = torch.empty((m, rank), dtype=torch.bfloat16, device="cuda")
-        workspace = torch.empty(
-            (32 * 1024 * 1024,), dtype=torch.uint8, device="cuda"
-        )
+        workspace = torch.empty((32 * 1024 * 1024,), dtype=torch.uint8, device="cuda")
         module = get_nvfp4_svdquant_sm120_module()
 
         def run() -> None:

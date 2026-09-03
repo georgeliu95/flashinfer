@@ -85,10 +85,11 @@ void nvfp4_quantize_smooth(TensorView x, TensorView pqs, TensorView global_scale
 }
 
 #if defined(FLASHINFER_ENABLE_SVDQ_SM120_K1_K2_FUSION)
-void nvfp4_quantize_smooth_lora_down_sm120_impl(
-    TensorView x, TensorView pqs, TensorView global_scale,
-    TensorView l2t_smoothed, TensorView xq, TensorView sf, TensorView down,
-    bool signal_m537_quant_ready, int geometry_variant = 0) {
+void nvfp4_quantize_smooth_lora_down_sm120_impl(TensorView x, TensorView pqs,
+                                                TensorView global_scale, TensorView l2t_smoothed,
+                                                TensorView xq, TensorView sf, TensorView down,
+                                                bool signal_m537_quant_ready,
+                                                int geometry_variant = 0) {
   CHECK_INPUT_AND_TYPE(x, dl_bfloat16);
   CHECK_INPUT_AND_TYPE(pqs, dl_bfloat16);
   CHECK_INPUT_AND_TYPE(global_scale, dl_float32);
@@ -103,8 +104,7 @@ void nvfp4_quantize_smooth_lora_down_sm120_impl(
   CHECK_DEVICE(sf, x);
   CHECK_DEVICE(down, x);
 
-  TVM_FFI_ICHECK_EQ(x.ndim(), 2)
-      << "x must be one of the measured SM120 K12 shapes";
+  TVM_FFI_ICHECK_EQ(x.ndim(), 2) << "x must be one of the measured SM120 K12 shapes";
   int const m = static_cast<int>(x.size(0));
   int const k = static_cast<int>(x.size(1));
   // The three (M, K) lists that gate this route -- this check, the producer
@@ -112,41 +112,26 @@ void nvfp4_quantize_smooth_lora_down_sm120_impl(
   // and SM120_FUSED_LINEAR_MK in flashinfer/gemm/svdquant_sm120_routes.py -- must
   // agree. tests/gemm/test_svdquant_sm120_routes.py holds all three against each
   // other; they drifted apart once, and this guard is what caught it.
-  TVM_FFI_ICHECK(((m == 512 || m == 7800 || m == 32760) && k == 1536) ||
-                 ((m == 64 || m == 256 || m == 512 || m == 1024 || m == 4096 ||
-                   m == 6889 || m == 9216 || m == 16384 || m == 27280) &&
-                  k == 3072) ||
-                 ((m == 64 || m == 256 || m == 512 || m == 1024) && k == 12288) ||
-                 ((m == 512 || m == 7800 || m == 32760 || m == 75600) && k == 5120) ||
-                 ((m == 7800 || m == 32760) && k == 8960) ||
-                 (m == 7800 && k == 13824) ||
-                 (m == 32760 && k == 13824) ||
-                 (m == 75600 && k == 13824) ||
-                 (m == 27280 && k == 14336) ||
-                 (m == 73984 && k == 14336) ||
-                 (m == 73984 && k == 7168) ||
-                 (m == 61056 && k == 7168) ||
-                 (m == 61056 && k == 14336) ||
-                 (m == 82752 && k == 14336) ||
-                 (m == 82752 && k == 7168) ||
-                 (m == 537 && k == 5120) ||
-                 (m == 537 && k == 7168) ||
-                 (m == 537 && k == 5376) ||
-                 (m == 537 && k == 14336) ||
-                 (m == 1935 && k == 5376) ||
-                 (m == 1935 && k == 5120) ||
-                 (m == 1935 && k == 7168) ||
-                 (m == 1935 && k == 14336) ||
-                 (m == 6913 && k == 5120) ||
-                 (m == 6913 && k == 5376) ||
-                 (m == 6913 && k == 7168) ||
-                 (m == 6913 && k == 14336) ||
-                 ((m == 73984 || m == 61056 || m == 82752) && k == 5376) ||
-                 ((m == 4096 || m == 6889 || m == 9216 || m == 16384) && k == 12288))
+  TVM_FFI_ICHECK(
+      ((m == 512 || m == 7800 || m == 32760) && k == 1536) ||
+      ((m == 64 || m == 256 || m == 512 || m == 1024 || m == 4096 || m == 6889 || m == 9216 ||
+        m == 16384 || m == 27280) &&
+       k == 3072) ||
+      ((m == 64 || m == 256 || m == 512 || m == 1024) && k == 12288) ||
+      ((m == 512 || m == 7800 || m == 32760 || m == 75600) && k == 5120) ||
+      ((m == 7800 || m == 32760) && k == 8960) || (m == 7800 && k == 13824) ||
+      (m == 32760 && k == 13824) || (m == 75600 && k == 13824) || (m == 27280 && k == 14336) ||
+      (m == 73984 && k == 14336) || (m == 73984 && k == 7168) || (m == 61056 && k == 7168) ||
+      (m == 61056 && k == 14336) || (m == 82752 && k == 14336) || (m == 82752 && k == 7168) ||
+      (m == 537 && k == 5120) || (m == 537 && k == 7168) || (m == 537 && k == 5376) ||
+      (m == 537 && k == 14336) || (m == 1935 && k == 5376) || (m == 1935 && k == 5120) ||
+      (m == 1935 && k == 7168) || (m == 1935 && k == 14336) || (m == 6913 && k == 5120) ||
+      (m == 6913 && k == 5376) || (m == 6913 && k == 7168) || (m == 6913 && k == 14336) ||
+      ((m == 73984 || m == 61056 || m == 82752) && k == 5376) ||
+      ((m == 4096 || m == 6889 || m == 9216 || m == 16384) && k == 12288))
       << "x must be one of the measured SM120 K12 shapes";
   TVM_FFI_ICHECK_EQ(pqs.numel(), k) << "pqs must have k elements";
-  TVM_FFI_ICHECK_GE(global_scale.numel(), 1)
-      << "global_scale must contain at least one element";
+  TVM_FFI_ICHECK_GE(global_scale.numel(), 1) << "global_scale must contain at least one element";
   TVM_FFI_ICHECK_EQ(l2t_smoothed.ndim(), 2) << "l2t_smoothed must be [k, 32]";
   TVM_FFI_ICHECK_EQ(l2t_smoothed.size(0), k) << "l2t_smoothed must be [k, 32]";
   TVM_FFI_ICHECK_EQ(l2t_smoothed.size(1), 32) << "l2t_smoothed must be [k, 32]";
@@ -170,11 +155,11 @@ void nvfp4_quantize_smooth_lora_down_sm120_impl(
       << cudaGetErrorString(status);
 }
 
-void nvfp4_quantize_smooth_lora_down_sm120(
-    TensorView x, TensorView pqs, TensorView global_scale,
-    TensorView l2t_smoothed, TensorView xq, TensorView sf, TensorView down) {
-  nvfp4_quantize_smooth_lora_down_sm120_impl(
-      x, pqs, global_scale, l2t_smoothed, xq, sf, down, false);
+void nvfp4_quantize_smooth_lora_down_sm120(TensorView x, TensorView pqs, TensorView global_scale,
+                                           TensorView l2t_smoothed, TensorView xq, TensorView sf,
+                                           TensorView down) {
+  nvfp4_quantize_smooth_lora_down_sm120_impl(x, pqs, global_scale, l2t_smoothed, xq, sf, down,
+                                             false);
 }
 
 // Geometry-selecting entry for the fused route.
@@ -184,21 +169,23 @@ void nvfp4_quantize_smooth_lora_down_sm120(
 // with exactly seven arguments, so widening it would change an ABI that tests
 // and the diagnostic probe both depend on. This one is internal -- only
 // dispatch_svdquant_producer_sm120 calls it -- so the export stays as it was.
-void nvfp4_quantize_smooth_lora_down_geometry_sm120(
-    TensorView x, TensorView pqs, TensorView global_scale,
-    TensorView l2t_smoothed, TensorView xq, TensorView sf, TensorView down,
-    int geometry_variant) {
-  nvfp4_quantize_smooth_lora_down_sm120_impl(
-      x, pqs, global_scale, l2t_smoothed, xq, sf, down, false, geometry_variant);
+void nvfp4_quantize_smooth_lora_down_geometry_sm120(TensorView x, TensorView pqs,
+                                                    TensorView global_scale,
+                                                    TensorView l2t_smoothed, TensorView xq,
+                                                    TensorView sf, TensorView down,
+                                                    int geometry_variant) {
+  nvfp4_quantize_smooth_lora_down_sm120_impl(x, pqs, global_scale, l2t_smoothed, xq, sf, down,
+                                             false, geometry_variant);
 }
 
 // Runtime-M/K entry, for measuring what the templated shape specialisation is
 // worth. Takes the geometry explicitly because there is no per-shape pin to
 // read it from -- that is the whole point of the variant.
-void nvfp4_quantize_smooth_lora_down_dyn_sm120(
-    TensorView x, TensorView pqs, TensorView global_scale,
-    TensorView l2t_smoothed, TensorView xq, TensorView sf, TensorView down,
-    int family, int tiling0, int tiling1, int tiling2, int address_policy) {
+void nvfp4_quantize_smooth_lora_down_dyn_sm120(TensorView x, TensorView pqs,
+                                               TensorView global_scale, TensorView l2t_smoothed,
+                                               TensorView xq, TensorView sf, TensorView down,
+                                               int family, int tiling0, int tiling1, int tiling2,
+                                               int address_policy) {
   CHECK_INPUT_AND_TYPE(x, dl_bfloat16);
   CHECK_INPUT_AND_TYPE(pqs, dl_bfloat16);
   CHECK_INPUT_AND_TYPE(global_scale, dl_float32);
@@ -211,18 +198,17 @@ void nvfp4_quantize_smooth_lora_down_dyn_sm120(
   cudaStream_t stream = get_stream(x.device());
   cudaError_t status = flashinfer::gemm::nvfp4_smooth_quantize_lora_down_family_sm120(
       x.data_ptr(), pqs.data_ptr(), static_cast<float const*>(global_scale.data_ptr()),
-      xq.data_ptr(), sf.data_ptr(), l2t_smoothed.data_ptr(), down.data_ptr(),
-      m, k, family, tiling0, tiling1, tiling2, address_policy, stream);
+      xq.data_ptr(), sf.data_ptr(), l2t_smoothed.data_ptr(), down.data_ptr(), m, k, family, tiling0,
+      tiling1, tiling2, address_policy, stream);
   TVM_FFI_ICHECK_EQ(status, cudaSuccess)
-      << "nvfp4_quantize_smooth_lora_down_dyn_sm120 failed: "
-      << cudaGetErrorString(status);
+      << "nvfp4_quantize_smooth_lora_down_dyn_sm120 failed: " << cudaGetErrorString(status);
 }
 
-void nvfp4_quantize_smooth_lora_down_overlap_sm120(
-    TensorView x, TensorView pqs, TensorView global_scale,
-    TensorView l2t_smoothed, TensorView xq, TensorView sf, TensorView down) {
-  nvfp4_quantize_smooth_lora_down_sm120_impl(
-      x, pqs, global_scale, l2t_smoothed, xq, sf, down, true);
+void nvfp4_quantize_smooth_lora_down_overlap_sm120(TensorView x, TensorView pqs,
+                                                   TensorView global_scale, TensorView l2t_smoothed,
+                                                   TensorView xq, TensorView sf, TensorView down) {
+  nvfp4_quantize_smooth_lora_down_sm120_impl(x, pqs, global_scale, l2t_smoothed, xq, sf, down,
+                                             true);
 }
 // Direct-only diagnostic entry for the accepted n16 geometry of the (512,
 // 3072) native K12 producer. The symbol used by the acceptance A/B trace is
@@ -234,9 +220,11 @@ void nvfp4_quantize_smooth_lora_down_overlap_sm120(
 // The layout contract below repeats the production entry's checks rather than
 // refactoring them into a shared helper, so the production validation and its
 // error strings stay byte-for-byte unchanged.
-void nvfp4_quantize_smooth_lora_down_m512_k3072_n16_experimental_sm120(
-    TensorView x, TensorView pqs, TensorView global_scale, TensorView l2t_smoothed,
-    TensorView xq, TensorView sf, TensorView down) {
+void nvfp4_quantize_smooth_lora_down_m512_k3072_n16_experimental_sm120(TensorView x, TensorView pqs,
+                                                                       TensorView global_scale,
+                                                                       TensorView l2t_smoothed,
+                                                                       TensorView xq, TensorView sf,
+                                                                       TensorView down) {
   CHECK_INPUT_AND_TYPE(x, dl_bfloat16);
   CHECK_INPUT_AND_TYPE(pqs, dl_bfloat16);
   CHECK_INPUT_AND_TYPE(global_scale, dl_float32);
@@ -264,12 +252,10 @@ void nvfp4_quantize_smooth_lora_down_m512_k3072_n16_experimental_sm120(
   TVM_FFI_ICHECK(m == kDiagnosticM && k == kDiagnosticK)
       << "x must be exactly the experimental SM120 (512, 3072) n16 K12 shape";
   TVM_FFI_ICHECK_EQ(pqs.numel(), k) << "pqs must have k elements";
-  TVM_FFI_ICHECK_GE(global_scale.numel(), 1)
-      << "global_scale must contain at least one element";
+  TVM_FFI_ICHECK_GE(global_scale.numel(), 1) << "global_scale must contain at least one element";
   TVM_FFI_ICHECK_EQ(l2t_smoothed.ndim(), 2) << "l2t_smoothed must be [k, 32]";
   TVM_FFI_ICHECK_EQ(l2t_smoothed.size(0), k) << "l2t_smoothed must be [k, 32]";
-  TVM_FFI_ICHECK_EQ(l2t_smoothed.size(1), kDiagnosticRank)
-      << "l2t_smoothed must be [k, 32]";
+  TVM_FFI_ICHECK_EQ(l2t_smoothed.size(1), kDiagnosticRank) << "l2t_smoothed must be [k, 32]";
   TVM_FFI_ICHECK_EQ(xq.ndim(), 2) << "xq must be [m, k/2]";
   TVM_FFI_ICHECK_EQ(xq.size(0), m) << "xq must be [m, k/2]";
   TVM_FFI_ICHECK_EQ(xq.size(1), k / 2) << "xq must be [m, k/2]";
@@ -283,9 +269,8 @@ void nvfp4_quantize_smooth_lora_down_m512_k3072_n16_experimental_sm120(
   auto stream = get_stream(x.device());
   cudaError_t const status =
       flashinfer::gemm::nvfp4_smooth_quantize_lora_down_m512_k3072_n16_experimental_sm120(
-          x.data_ptr(), pqs.data_ptr(),
-          static_cast<float const*>(global_scale.data_ptr()), xq.data_ptr(), sf.data_ptr(),
-          l2t_smoothed.data_ptr(), down.data_ptr(), m, k, stream);
+          x.data_ptr(), pqs.data_ptr(), static_cast<float const*>(global_scale.data_ptr()),
+          xq.data_ptr(), sf.data_ptr(), l2t_smoothed.data_ptr(), down.data_ptr(), m, k, stream);
   TVM_FFI_ICHECK_EQ(status, cudaSuccess)
       << "failed to launch the experimental SM120 M512/K3072 n16 fused "
          "smooth-quantize + LoRA-down kernel: "

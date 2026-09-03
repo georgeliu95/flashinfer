@@ -91,11 +91,22 @@ def test_mm_nvfp4_svdquant_rejects_noncontiguous_out():
     storage = torch.empty(n, m, dtype=torch.bfloat16, device=p["xq"].device)
     out_view = storage.t()  # shape [m, n], non-contiguous strides
     module = _svdquant_module()
-    workspace = torch.zeros(DEFAULT_WORKSPACE_SIZE, dtype=torch.uint8, device=p["xq"].device)
+    workspace = torch.zeros(
+        DEFAULT_WORKSPACE_SIZE, dtype=torch.uint8, device=p["xq"].device
+    )
     with pytest.raises(Exception, match="contiguous"):
         module.nvfp4_svdquant_gemm(
-            p["xq"], p["wq"], p["x_sf_flat"], p["w_sf_flat"], p["alpha"],
-            p["d"], p["l1_scaled"], p["bias"], out_view, workspace, 0,
+            p["xq"],
+            p["wq"],
+            p["x_sf_flat"],
+            p["w_sf_flat"],
+            p["alpha"],
+            p["d"],
+            p["l1_scaled"],
+            p["bias"],
+            out_view,
+            workspace,
+            0,
             device_support_pdl(p["xq"].device),
         )
 
@@ -124,15 +135,29 @@ def test_mm_nvfp4_svdquant_model_shapes(m, n, k, use_bias):
     out = torch.full((m, n), float("nan"), dtype=torch.bfloat16, device=device)
     with autotune(True):
         mm_nvfp4_svdquant(
-            p["xq"], p["wq"], p["x_sf_flat"], p["w_sf_flat"], p["alpha"],
-            p["d"], p["l1_scaled"], bias=bias, out=out,
+            p["xq"],
+            p["wq"],
+            p["x_sf_flat"],
+            p["w_sf_flat"],
+            p["alpha"],
+            p["d"],
+            p["l1_scaled"],
+            bias=bias,
+            out=out,
         )
     assert _sqnr_db(ref, out.float()) > 40.0
 
     replay = torch.full((m, n), float("nan"), dtype=torch.bfloat16, device=device)
     mm_nvfp4_svdquant(
-        p["xq"], p["wq"], p["x_sf_flat"], p["w_sf_flat"], p["alpha"],
-        p["d"], p["l1_scaled"], bias=bias, out=replay,
+        p["xq"],
+        p["wq"],
+        p["x_sf_flat"],
+        p["w_sf_flat"],
+        p["alpha"],
+        p["d"],
+        p["l1_scaled"],
+        bias=bias,
+        out=replay,
     )
     assert _sqnr_db(ref, replay.float()) > 40.0
 
@@ -140,8 +165,17 @@ def test_mm_nvfp4_svdquant_model_shapes(m, n, k, use_bias):
     out0 = torch.full((m, n), float("nan"), dtype=torch.bfloat16, device=device)
     workspace = torch.zeros(DEFAULT_WORKSPACE_SIZE, dtype=torch.uint8, device=device)
     module.nvfp4_svdquant_gemm(
-        p["xq"], p["wq"], p["x_sf_flat"], p["w_sf_flat"], p["alpha"],
-        p["d"], p["l1_scaled"], bias, out0, workspace, 0,
+        p["xq"],
+        p["wq"],
+        p["x_sf_flat"],
+        p["w_sf_flat"],
+        p["alpha"],
+        p["d"],
+        p["l1_scaled"],
+        bias,
+        out0,
+        workspace,
+        0,
         device_support_pdl(device),
     )
     assert _sqnr_db(ref, out0.float()) > 40.0
@@ -172,16 +206,36 @@ def test_sm120_runtime_tactic_table_decode():
     for t in range(16):
         row = _decode_row(module, t)
         assert row == {
-            "kernel_id": t, "splits": 1, "raster": 0, "swizzle": 1,
+            "kernel_id": t,
+            "splits": 1,
+            "raster": 0,
+            "swizzle": 1,
             "streamk": t % 4 >= 2,
         }, f"legacy row {t} changed meaning: {row}"
     assert _decode_row(module, 16) == {
-        "kernel_id": 2, "splits": 2, "raster": 0, "swizzle": 1, "streamk": True}
+        "kernel_id": 2,
+        "splits": 2,
+        "raster": 0,
+        "swizzle": 1,
+        "streamk": True,
+    }
     assert _decode_row(module, 31)["splits"] == 4
     assert _decode_row(module, 32)["raster"] == 1  # AlongM on kernel 0
     assert _decode_row(module, 63)["swizzle"] == 4
     spikes = [_decode_row(module, t) for t in range(64, 75)]
-    assert [s["kernel_id"] for s in spikes] == [16, 17, 17, 17, 18, 19, 20, 21, 22, 22, 22]
+    assert [s["kernel_id"] for s in spikes] == [
+        16,
+        17,
+        17,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        22,
+        22,
+    ]
     assert [s["splits"] for s in spikes] == [1, 1, 2, 4, 1, 1, 1, 1, 1, 2, 4]
     # driver rows (70/71) are persistent; the K256-swap Stream-K rows are not
     assert not spikes[6]["streamk"] and not spikes[7]["streamk"]
@@ -189,29 +243,48 @@ def test_sm120_runtime_tactic_table_decode():
     # the first static-scheduler block uses scheduler-default persistent rows
     statics = [_decode_row(module, t) for t in range(75, 78)]
     assert [s["kernel_id"] for s in statics] == [23, 24, 25]
-    assert all(s["splits"] == 1 and s["raster"] == 0 and s["swizzle"] == 1
-               and not s["streamk"] for s in statics)
+    assert all(
+        s["splits"] == 1 and s["raster"] == 0 and s["swizzle"] == 1 and not s["streamk"]
+        for s in statics
+    )
     # the fill-geometry row closes the table as a scheduler-default row
     fill = _decode_row(module, 78)
-    assert fill == {"kernel_id": 26, "splits": 1, "raster": 0, "swizzle": 1,
-                    "streamk": False}
+    assert fill == {
+        "kernel_id": 26,
+        "splits": 1,
+        "raster": 0,
+        "swizzle": 1,
+        "streamk": False,
+    }
     assert _decode_row(module, 81) == {
-        "kernel_id": 29, "splits": 1, "raster": 0, "swizzle": 1,
+        "kernel_id": 29,
+        "splits": 1,
+        "raster": 0,
+        "swizzle": 1,
         "streamk": False,
     }
     assert _decode_row(module, 82) == {
-        "kernel_id": 30, "splits": 1, "raster": 0, "swizzle": 1,
+        "kernel_id": 30,
+        "splits": 1,
+        "raster": 0,
+        "swizzle": 1,
         "streamk": False,
     }
     # its static-scheduler sibling is append-only so row 78 keeps its meaning
     fill_static = _decode_row(module, 79)
     assert fill_static == {
-        "kernel_id": 27, "splits": 1, "raster": 0, "swizzle": 1,
+        "kernel_id": 27,
+        "splits": 1,
+        "raster": 0,
+        "swizzle": 1,
         "streamk": False,
     }
     small_m_fill_static = _decode_row(module, 80)
     assert small_m_fill_static == {
-        "kernel_id": 28, "splits": 1, "raster": 0, "swizzle": 1,
+        "kernel_id": 28,
+        "splits": 1,
+        "raster": 0,
+        "swizzle": 1,
         "streamk": False,
     }
 
@@ -226,9 +299,11 @@ def test_sm120_splitk_rows_respect_ktile_bound():
     assert module.nvfp4_svdquant_gemm_can_implement(m, n, k, _RANK, 17)
     # rows for kernel 6 (128x128x256 Sk): splits 4 > 2 K-tiles -> rejected
     splits4_k256 = next(
-        t for t in range(16, 32)
-        if _decode_row(module, t) == {"kernel_id": 6, "splits": 4, "raster": 0,
-                                      "swizzle": 1, "streamk": True})
+        t
+        for t in range(16, 32)
+        if _decode_row(module, t)
+        == {"kernel_id": 6, "splits": 4, "raster": 0, "swizzle": 1, "streamk": True}
+    )
     assert not module.nvfp4_svdquant_gemm_can_implement(m, n, k, _RANK, splits4_k256)
     # forced Split-K needs more reduction workspace than the heuristic row
     big = (4096, 3072, 12288)
@@ -238,7 +313,23 @@ def test_sm120_splitk_rows_respect_ktile_bound():
 
 
 _NEW_ROW_CLASS_TACTICS = [
-    16, 32, 35, 64, 65, 68, 69, 70, 71, 72, 73, 75, 76, 77, 78, 79, 80,
+    16,
+    32,
+    35,
+    64,
+    65,
+    68,
+    69,
+    70,
+    71,
+    72,
+    73,
+    75,
+    76,
+    77,
+    78,
+    79,
+    80,
 ]
 
 
@@ -253,13 +344,24 @@ def test_sm120_new_row_classes_match_reference(tactic, m, n, k):
         pytest.skip(f"tactic {tactic} not implementable for {(m, n, k)}")
     p = _make_gemm_problem(m, n, k, rank=_RANK)
     device = p["xq"].device
-    ws_bytes = max(DEFAULT_WORKSPACE_SIZE,
-                   int(module.nvfp4_svdquant_gemm_workspace_size(m, n, k, tactic)))
+    ws_bytes = max(
+        DEFAULT_WORKSPACE_SIZE,
+        int(module.nvfp4_svdquant_gemm_workspace_size(m, n, k, tactic)),
+    )
     workspace = torch.zeros(ws_bytes, dtype=torch.uint8, device=device)
     out = torch.full((m, n), float("nan"), dtype=torch.bfloat16, device=device)
     module.nvfp4_svdquant_gemm(
-        p["xq"], p["wq"], p["x_sf_flat"], p["w_sf_flat"], p["alpha"],
-        p["d"], p["l1_scaled"], p["bias"], out, workspace, tactic,
+        p["xq"],
+        p["wq"],
+        p["x_sf_flat"],
+        p["w_sf_flat"],
+        p["alpha"],
+        p["d"],
+        p["l1_scaled"],
+        p["bias"],
+        out,
+        workspace,
+        tactic,
         device_support_pdl(device),
     )
     torch.cuda.synchronize()
@@ -283,16 +385,27 @@ def test_sm120_fill_geometry_candidates_are_bitwise_equivalent(m):
     )
     ws_bytes = max(
         DEFAULT_WORKSPACE_SIZE,
-        max(int(module.nvfp4_svdquant_gemm_workspace_size(m, n, k, tactic))
-            for tactic in tactics),
+        max(
+            int(module.nvfp4_svdquant_gemm_workspace_size(m, n, k, tactic))
+            for tactic in tactics
+        ),
     )
     workspace = torch.zeros(ws_bytes, dtype=torch.uint8, device=device)
     outputs = []
     for tactic in tactics:
         out = torch.full((m, n), float("nan"), dtype=torch.bfloat16, device=device)
         module.nvfp4_svdquant_gemm(
-            p["xq"], p["wq"], p["x_sf_flat"], p["w_sf_flat"], p["alpha"],
-            p["d"], p["l1_scaled"], p["bias"], out, workspace, tactic,
+            p["xq"],
+            p["wq"],
+            p["x_sf_flat"],
+            p["w_sf_flat"],
+            p["alpha"],
+            p["d"],
+            p["l1_scaled"],
+            p["bias"],
+            out,
+            workspace,
+            tactic,
             device_support_pdl(device),
         )
         torch.cuda.synchronize()
@@ -352,8 +465,17 @@ def test_sm120_lora_smem_swizzle_is_bitwise_equivalent(m, lora_epi_overlap):
     for module in modules:
         out = torch.full((m, n), float("nan"), dtype=torch.bfloat16, device=device)
         module.nvfp4_svdquant_gemm(
-            p["xq"], p["wq"], p["x_sf_flat"], p["w_sf_flat"], p["alpha"],
-            p["d"], p["l1_scaled"], p["bias"], out, workspace, tactic,
+            p["xq"],
+            p["wq"],
+            p["x_sf_flat"],
+            p["w_sf_flat"],
+            p["alpha"],
+            p["d"],
+            p["l1_scaled"],
+            p["bias"],
+            out,
+            workspace,
+            tactic,
             device_support_pdl(device),
         )
         torch.cuda.synchronize()
@@ -399,8 +521,17 @@ def test_sm120_lora_smem_swizzle_cuda_graph(diagnostic_variant):
 
     def run(out_buf):
         module.nvfp4_svdquant_gemm(
-            p["xq"], p["wq"], p["x_sf_flat"], p["w_sf_flat"], p["alpha"],
-            p["d"], p["l1_scaled"], p["bias"], out_buf, workspace, tactic,
+            p["xq"],
+            p["wq"],
+            p["x_sf_flat"],
+            p["w_sf_flat"],
+            p["alpha"],
+            p["d"],
+            p["l1_scaled"],
+            p["bias"],
+            out_buf,
+            workspace,
+            tactic,
             enable_pdl,
         )
 
@@ -468,8 +599,17 @@ def test_sm120_row80_stage_override_is_bitwise_equivalent(
     for module in (baseline, staged):
         out = torch.full((m, n), float("nan"), dtype=torch.bfloat16, device=device)
         module.nvfp4_svdquant_gemm(
-            p["xq"], p["wq"], p["x_sf_flat"], p["w_sf_flat"], p["alpha"],
-            p["d"], p["l1_scaled"], p["bias"], out, workspace, tactic,
+            p["xq"],
+            p["wq"],
+            p["x_sf_flat"],
+            p["w_sf_flat"],
+            p["alpha"],
+            p["d"],
+            p["l1_scaled"],
+            p["bias"],
+            out,
+            workspace,
+            tactic,
             device_support_pdl(device),
         )
         torch.cuda.synchronize()
@@ -498,14 +638,25 @@ def test_sm120_cuda_graph_new_rows(tactic):
     p = _make_gemm_problem(m, n, k, rank=_RANK)
     device = p["xq"].device
     enable_pdl = device_support_pdl(device)
-    ws_bytes = max(DEFAULT_WORKSPACE_SIZE,
-                   int(module.nvfp4_svdquant_gemm_workspace_size(m, n, k, tactic)))
+    ws_bytes = max(
+        DEFAULT_WORKSPACE_SIZE,
+        int(module.nvfp4_svdquant_gemm_workspace_size(m, n, k, tactic)),
+    )
     workspace = torch.zeros(ws_bytes, dtype=torch.uint8, device=device)
 
     def run(out_buf):
         module.nvfp4_svdquant_gemm(
-            p["xq"], p["wq"], p["x_sf_flat"], p["w_sf_flat"], p["alpha"],
-            p["d"], p["l1_scaled"], p["bias"], out_buf, workspace, tactic,
+            p["xq"],
+            p["wq"],
+            p["x_sf_flat"],
+            p["w_sf_flat"],
+            p["alpha"],
+            p["d"],
+            p["l1_scaled"],
+            p["bias"],
+            out_buf,
+            workspace,
+            tactic,
             enable_pdl,
         )
 
@@ -544,6 +695,7 @@ def test_sm120_true_rank_tail_bitwise_vs_storage_fallback(mode, tactic):
     from flashinfer.jit.gemm.svdquant_sm120 import (
         gen_gemm_sm120_module_cutlass_nvfp4_svdquant as _gen,
     )
+
     torch.manual_seed(17)
     m, n, k = (256, 3072, 3072)
     module = _svdquant_module()
@@ -557,7 +709,8 @@ def test_sm120_true_rank_tail_bitwise_vs_storage_fallback(mode, tactic):
         # tail products are exact zeros with mixed signs
         p["d"][m // 2 :].zero_()
         p["d"][: m // 2] *= torch.where(
-            torch.rand_like(p["d"][: m // 2]) < 0.5, -1.0, 1.0)
+            torch.rand_like(p["d"][: m // 2]) < 0.5, -1.0, 1.0
+        )
         p["l1_scaled"][::2].zero_()
     elif mode == "negalpha":
         # zero activations with a negative dequant scale drive residual
@@ -577,16 +730,27 @@ def test_sm120_true_rank_tail_bitwise_vs_storage_fallback(mode, tactic):
         p["xq"].zero_()
         p["d"].zero_()
         p["bias"] = None
-    ws_bytes = max(DEFAULT_WORKSPACE_SIZE,
-                   int(module.nvfp4_svdquant_gemm_workspace_size(m, n, k, tactic)))
+    ws_bytes = max(
+        DEFAULT_WORKSPACE_SIZE,
+        int(module.nvfp4_svdquant_gemm_workspace_size(m, n, k, tactic)),
+    )
     workspace = torch.zeros(ws_bytes, dtype=torch.uint8, device=device)
     enable_pdl = device_support_pdl(device)
     outs = []
     for mod in (module, fallback):
         out = torch.full((m, n), float("nan"), dtype=torch.bfloat16, device=device)
         mod.nvfp4_svdquant_gemm(
-            p["xq"], p["wq"], p["x_sf_flat"], p["w_sf_flat"], p["alpha"],
-            p["d"], p["l1_scaled"], p["bias"], out, workspace, tactic,
+            p["xq"],
+            p["wq"],
+            p["x_sf_flat"],
+            p["w_sf_flat"],
+            p["alpha"],
+            p["d"],
+            p["l1_scaled"],
+            p["bias"],
+            out,
+            workspace,
+            tactic,
             enable_pdl,
         )
         torch.cuda.synchronize()
@@ -595,9 +759,11 @@ def test_sm120_true_rank_tail_bitwise_vs_storage_fallback(mode, tactic):
     negz_default = int((iv_default == -32768).sum())
     negz_fallback = int((iv_fallback == -32768).sum())
     assert negz_default == negz_fallback, (
-        f"negative-zero lane count diverged: {negz_default} vs {negz_fallback}")
+        f"negative-zero lane count diverged: {negz_default} vs {negz_fallback}"
+    )
     assert torch.equal(iv_default, iv_fallback), (
-        f"bit-pattern mismatch vs storage fallback (mode={mode}, tactic={tactic})")
+        f"bit-pattern mismatch vs storage fallback (mode={mode}, tactic={tactic})"
+    )
 
 
 @pytest.mark.parametrize("rank", [32, 64])
@@ -619,8 +785,16 @@ def test_public_entry_serves_rank_64(m, n, k, rank):
     torch.manual_seed(3)
     p = _make_gemm_problem(m, n, k, rank=rank)
     out = mm_nvfp4_svdquant(
-        p["xq"], p["wq"], p["x_sf_flat"], p["w_sf_flat"], p["alpha"],
-        p["d"], p["l1_scaled"], bias=None, out=None, backend="cutlass-sm120",
+        p["xq"],
+        p["wq"],
+        p["x_sf_flat"],
+        p["w_sf_flat"],
+        p["alpha"],
+        p["d"],
+        p["l1_scaled"],
+        bias=None,
+        out=None,
+        backend="cutlass-sm120",
     )
     assert _sqnr_db(p["ref"], out.float()) > 40.0
 

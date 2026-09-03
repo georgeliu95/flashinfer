@@ -53,9 +53,10 @@ __device__ __forceinline__ std::uint32_t pack_bf16_pair(quant::Type const* low,
   return low_bits | (high_bits << 16);
 }
 
-__device__ __forceinline__ void mma_m16n8k16_row_col(
-    float& d0, float& d1, float& d2, float& d3, std::uint32_t a0, std::uint32_t a1,
-    std::uint32_t a2, std::uint32_t a3, std::uint32_t b0, std::uint32_t b1) {
+__device__ __forceinline__ void mma_m16n8k16_row_col(float& d0, float& d1, float& d2, float& d3,
+                                                     std::uint32_t a0, std::uint32_t a1,
+                                                     std::uint32_t a2, std::uint32_t a3,
+                                                     std::uint32_t b0, std::uint32_t b1) {
   asm volatile(
       "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
       "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
@@ -63,8 +64,7 @@ __device__ __forceinline__ void mma_m16n8k16_row_col(
       : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
 }
 
-__global__ __launch_bounds__(kBlockThreads, 1) void
-nvfp4_smooth_quantize_lora_down_sm120_kernel(
+__global__ __launch_bounds__(kBlockThreads, 1) void nvfp4_smooth_quantize_lora_down_sm120_kernel(
     quant::Type const* __restrict__ x, quant::Type const* __restrict__ pre_quant_scale,
     float const* __restrict__ global_scale, std::uint64_t* __restrict__ xq,
     std::uint8_t* __restrict__ sf, quant::Type const* __restrict__ l2t_smoothed,
@@ -98,17 +98,13 @@ nvfp4_smooth_quantize_lora_down_sm120_kernel(
       quant::loadBf16x8(pre_quant_scale + sf_col * quant::FAST_ELTS_PER_THREAD + 8, pqs_hi);
 
       std::int64_t const sf_offset = quant::get_sf_out_offset_128x4(row, sf_col, kSfCols);
-      xq[vec_offset] =
-          quant::quantizeSmoothed16(x_lo, x_hi, pqs_lo, pqs_hi, scale, sf + sf_offset);
+      xq[vec_offset] = quant::quantizeSmoothed16(x_lo, x_hi, pqs_lo, pqs_hi, scale, sf + sf_offset);
     }
 
     constexpr int kPaddingRows = 128 - kM;
-    constexpr std::int64_t kPaddingStores =
-        static_cast<std::int64_t>(kPaddingRows) * kSfGroups;
-    for (std::int64_t item =
-             static_cast<std::int64_t>(block) * kBlockThreads + threadIdx.x;
-         item < kPaddingStores;
-         item += static_cast<std::int64_t>(kQuantBlocks) * kBlockThreads) {
+    constexpr std::int64_t kPaddingStores = static_cast<std::int64_t>(kPaddingRows) * kSfGroups;
+    for (std::int64_t item = static_cast<std::int64_t>(block) * kBlockThreads + threadIdx.x;
+         item < kPaddingStores; item += static_cast<std::int64_t>(kQuantBlocks) * kBlockThreads) {
       int const padding_row = static_cast<int>(item / kSfGroups);
       int const sf_group =
           static_cast<int>(item - static_cast<std::int64_t>(padding_row) * kSfGroups);
@@ -149,8 +145,7 @@ nvfp4_smooth_quantize_lora_down_sm120_kernel(
     int const b_row = k_base + pair_col;
     quant::Type const* b_base = l2t_smoothed + b_row * kRank + b_col;
     std::uint32_t const b0 = pack_bf16_pair(b_base, b_base + kRank);
-    std::uint32_t const b1 =
-        pack_bf16_pair(b_base + 8 * kRank, b_base + 9 * kRank);
+    std::uint32_t const b1 = pack_bf16_pair(b_base + 8 * kRank, b_base + 9 * kRank);
     mma_m16n8k16_row_col(d0, d1, d2, d3, a0, a1, a2, a3, b0, b1);
   }
 
@@ -205,8 +200,7 @@ static_assert(kM % 128 == 0);
 static_assert(kRank % kMmaN == 0, "the LoRA rank must hold whole MMA N fragments");
 
 template <int kK, int kBlockThreads, int kDownTileCols = kDownTileColsDefault>
-__global__ __launch_bounds__(kBlockThreads) void
-nvfp4_smooth_quantize_lora_down_m512_sm120_kernel(
+__global__ __launch_bounds__(kBlockThreads) void nvfp4_smooth_quantize_lora_down_m512_sm120_kernel(
     quant::Type const* __restrict__ x, quant::Type const* __restrict__ pre_quant_scale,
     float const* __restrict__ global_scale, std::uint64_t* __restrict__ xq,
     std::uint8_t* __restrict__ sf, quant::Type const* __restrict__ l2t_smoothed,
@@ -257,8 +251,7 @@ nvfp4_smooth_quantize_lora_down_m512_sm120_kernel(
       quant::loadBf16x8(pre_quant_scale + sf_col * quant::FAST_ELTS_PER_THREAD + 8, pqs_hi);
 
       std::int64_t const sf_offset = quant::get_sf_out_offset_128x4(row, sf_col, kSfCols);
-      xq[vec_offset] =
-          quant::quantizeSmoothed16(x_lo, x_hi, pqs_lo, pqs_hi, scale, sf + sf_offset);
+      xq[vec_offset] = quant::quantizeSmoothed16(x_lo, x_hi, pqs_lo, pqs_hi, scale, sf + sf_offset);
     }
     return;
   }
@@ -311,10 +304,9 @@ nvfp4_smooth_quantize_lora_down_m512_sm120_kernel(
     for (int fragment = 0; fragment < kNFragments; ++fragment) {
       quant::Type const* b_fragment = b_base + fragment * kMmaN;
       std::uint32_t const b0 = base::pack_bf16_pair(b_fragment, b_fragment + kRank);
-      std::uint32_t const b1 =
-          base::pack_bf16_pair(b_fragment + 8 * kRank, b_fragment + 9 * kRank);
-      base::mma_m16n8k16_row_col(d[fragment][0], d[fragment][1], d[fragment][2],
-                                 d[fragment][3], a0, a1, a2, a3, b0, b1);
+      std::uint32_t const b1 = base::pack_bf16_pair(b_fragment + 8 * kRank, b_fragment + 9 * kRank);
+      base::mma_m16n8k16_row_col(d[fragment][0], d[fragment][1], d[fragment][2], d[fragment][3], a0,
+                                 a1, a2, a3, b0, b1);
     }
   }
 
@@ -383,14 +375,11 @@ struct M512LaunchGeometry {
 
   static_assert(BlockThreads % 32 == 0 && kKernelDownWarps > 0,
                 "the LoRA-down role splits K across whole warps");
-  static_assert(K % kKernelDownWarps == 0,
-                "K must split evenly across the LoRA-down warps");
+  static_assert(K % kKernelDownWarps == 0, "K must split evenly across the LoRA-down warps");
   static_assert(kDownKPerWarp % 16 == 0,
                 "each warp's K span must be a whole number of m16n8k16 MMA steps");
-  static_assert(K % (4 * quant::SF_VEC_SIZE) == 0,
-                "K must hold whole four-column SF store groups");
-  static_assert(kSfCols * quant::SF_VEC_SIZE == K,
-                "the SF column count must cover K exactly");
+  static_assert(K % (4 * quant::SF_VEC_SIZE) == 0, "K must hold whole four-column SF store groups");
+  static_assert(kSfCols * quant::SF_VEC_SIZE == K, "the SF column count must cover K exactly");
   static_assert(kL2Bytes % kL2PrefetchBytes == 0,
                 "the L2 prefetch must cover whole 128-byte lines");
   static_assert(kL2PrefetchLines % kQuantBlocks == 0,
@@ -418,15 +407,14 @@ struct M512LaunchGeometry {
 template <int K, int BlockThreads, int DownTileCols = kDownTileColsDefault>
 inline cudaError_t launch_m512_kernel(void const* x, void const* pre_quant_scale,
                                       float const* global_scale, void* xq, void* sf,
-                                      void const* l2t_smoothed, void* down,
-                                      cudaStream_t stream) {
+                                      void const* l2t_smoothed, void* down, cudaStream_t stream) {
   using geometry = M512LaunchGeometry<K, BlockThreads, DownTileCols>;
   nvfp4_smooth_quantize_lora_down_m512_sm120_kernel<
-      geometry::kKernelK, geometry::kKernelBlockThreads, geometry::kKernelDownTileCols><<<
-      geometry::kGridBlocks, geometry::kKernelBlockThreads, 0, stream>>>(
-      static_cast<quant::Type const*>(x), static_cast<quant::Type const*>(pre_quant_scale),
-      global_scale, static_cast<std::uint64_t*>(xq), static_cast<std::uint8_t*>(sf),
-      static_cast<quant::Type const*>(l2t_smoothed), static_cast<quant::Type*>(down));
+      geometry::kKernelK, geometry::kKernelBlockThreads, geometry::kKernelDownTileCols>
+      <<<geometry::kGridBlocks, geometry::kKernelBlockThreads, 0, stream>>>(
+          static_cast<quant::Type const*>(x), static_cast<quant::Type const*>(pre_quant_scale),
+          global_scale, static_cast<std::uint64_t*>(xq), static_cast<std::uint8_t*>(sf),
+          static_cast<quant::Type const*>(l2t_smoothed), static_cast<quant::Type*>(down));
   return cudaGetLastError();
 }
 
@@ -441,10 +429,9 @@ constexpr int kRank = 32;
 constexpr int kMmaN = 8;
 constexpr int kL2PrefetchBytes = 128;
 
-template <int M, int K, int BlockThreads, int DownTileCols,
-          int RowsPerQuantBlock>
-__global__ __launch_bounds__(BlockThreads) void
-nvfp4_smooth_quantize_lora_down_small_m_sm120_kernel(
+template <int M, int K, int BlockThreads, int DownTileCols, int RowsPerQuantBlock>
+__global__
+__launch_bounds__(BlockThreads) void nvfp4_smooth_quantize_lora_down_small_m_sm120_kernel(
     quant::Type const* __restrict__ x, quant::Type const* __restrict__ pre_quant_scale,
     float const* __restrict__ global_scale, std::uint64_t* __restrict__ xq,
     std::uint8_t* __restrict__ sf, quant::Type const* __restrict__ l2t_smoothed,
@@ -463,40 +450,33 @@ nvfp4_smooth_quantize_lora_down_small_m_sm120_kernel(
 
   int const block = static_cast<int>(blockIdx.x);
   if (block < kQuantBlocks) {
-    for (int line = block * BlockThreads + static_cast<int>(threadIdx.x);
-         line < kL2PrefetchLines; line += kQuantBlocks * BlockThreads) {
+    for (int line = block * BlockThreads + static_cast<int>(threadIdx.x); line < kL2PrefetchLines;
+         line += kQuantBlocks * BlockThreads) {
       std::uint8_t const* prefetch_address =
-          reinterpret_cast<std::uint8_t const*>(l2t_smoothed) +
-          line * kL2PrefetchBytes;
+          reinterpret_cast<std::uint8_t const*>(l2t_smoothed) + line * kL2PrefetchBytes;
       asm volatile("prefetch.global.L2 [%0];" : : "l"(prefetch_address));
     }
 
     float const scale = global_scale[0];
     int const row_base = block * RowsPerQuantBlock;
     constexpr int kWorkItems = RowsPerQuantBlock * kSfCols;
-    for (int item = static_cast<int>(threadIdx.x); item < kWorkItems;
-         item += BlockThreads) {
+    for (int item = static_cast<int>(threadIdx.x); item < kWorkItems; item += BlockThreads) {
       int const row_offset = item / kSfCols;
       int const sf_col = item - row_offset * kSfCols;
       int const row = row_base + row_offset;
-      std::int64_t const sf_offset =
-          quant::get_sf_out_offset_128x4(row, sf_col, kSfCols);
+      std::int64_t const sf_offset = quant::get_sf_out_offset_128x4(row, sf_col, kSfCols);
       if (row < M) {
-        std::int64_t const vec_offset =
-            static_cast<std::int64_t>(row) * kSfCols + sf_col;
+        std::int64_t const vec_offset = static_cast<std::int64_t>(row) * kSfCols + sf_col;
         quant::Bf16x8 x_lo;
         quant::Bf16x8 x_hi;
         quant::Bf16x8 pqs_lo;
         quant::Bf16x8 pqs_hi;
         quant::loadBf16x8(x + vec_offset * quant::FAST_ELTS_PER_THREAD, x_lo);
-        quant::loadBf16x8(
-            x + vec_offset * quant::FAST_ELTS_PER_THREAD + 8, x_hi);
-        quant::loadBf16x8(
-            pre_quant_scale + sf_col * quant::FAST_ELTS_PER_THREAD, pqs_lo);
-        quant::loadBf16x8(
-            pre_quant_scale + sf_col * quant::FAST_ELTS_PER_THREAD + 8, pqs_hi);
-        xq[vec_offset] = quant::quantizeSmoothed16(
-            x_lo, x_hi, pqs_lo, pqs_hi, scale, sf + sf_offset);
+        quant::loadBf16x8(x + vec_offset * quant::FAST_ELTS_PER_THREAD + 8, x_hi);
+        quant::loadBf16x8(pre_quant_scale + sf_col * quant::FAST_ELTS_PER_THREAD, pqs_lo);
+        quant::loadBf16x8(pre_quant_scale + sf_col * quant::FAST_ELTS_PER_THREAD + 8, pqs_hi);
+        xq[vec_offset] =
+            quant::quantizeSmoothed16(x_lo, x_hi, pqs_lo, pqs_hi, scale, sf + sf_offset);
       } else {
         sf[sf_offset] = 0u;
       }
@@ -505,16 +485,13 @@ nvfp4_smooth_quantize_lora_down_small_m_sm120_kernel(
     constexpr int kRemainingPaddingRows = kPaddedM - kCoveredRows;
     constexpr std::int64_t kRemainingPaddingItems =
         static_cast<std::int64_t>(kRemainingPaddingRows) * kSfCols;
-    for (std::int64_t item =
-             static_cast<std::int64_t>(block) * BlockThreads + threadIdx.x;
+    for (std::int64_t item = static_cast<std::int64_t>(block) * BlockThreads + threadIdx.x;
          item < kRemainingPaddingItems;
          item += static_cast<std::int64_t>(kQuantBlocks) * BlockThreads) {
       int const padding_row = static_cast<int>(item / kSfCols);
-      int const sf_col =
-          static_cast<int>(item - static_cast<std::int64_t>(padding_row) * kSfCols);
+      int const sf_col = static_cast<int>(item - static_cast<std::int64_t>(padding_row) * kSfCols);
       int const row = kCoveredRows + padding_row;
-      std::int64_t const sf_offset =
-          quant::get_sf_out_offset_128x4(row, sf_col, kSfCols);
+      std::int64_t const sf_offset = quant::get_sf_out_offset_128x4(row, sf_col, kSfCols);
       sf[sf_offset] = 0u;
     }
     return;
@@ -559,25 +536,20 @@ nvfp4_smooth_quantize_lora_down_small_m_sm120_kernel(
       a3 = base::load_bf16_pair(a_upper + 8);
     }
 
-    quant::Type const* b_base =
-        l2t_smoothed + (k_base + pair_col) * kRank + b_col;
+    quant::Type const* b_base = l2t_smoothed + (k_base + pair_col) * kRank + b_col;
 #pragma unroll
     for (int fragment = 0; fragment < kNFragments; ++fragment) {
       quant::Type const* b_fragment = b_base + fragment * kMmaN;
-      std::uint32_t const b0 =
-          base::pack_bf16_pair(b_fragment, b_fragment + kRank);
-      std::uint32_t const b1 = base::pack_bf16_pair(
-          b_fragment + 8 * kRank, b_fragment + 9 * kRank);
-      base::mma_m16n8k16_row_col(
-          d[fragment][0], d[fragment][1], d[fragment][2], d[fragment][3],
-          a0, a1, a2, a3, b0, b1);
+      std::uint32_t const b0 = base::pack_bf16_pair(b_fragment, b_fragment + kRank);
+      std::uint32_t const b1 = base::pack_bf16_pair(b_fragment + 8 * kRank, b_fragment + 9 * kRank);
+      base::mma_m16n8k16_row_col(d[fragment][0], d[fragment][1], d[fragment][2], d[fragment][3], a0,
+                                 a1, a2, a3, b0, b1);
     }
   }
 
 #pragma unroll
   for (int fragment = 0; fragment < kNFragments; ++fragment) {
-    int const output0 =
-        group * DownTileCols + fragment * kMmaN + pair_col;
+    int const output0 = group * DownTileCols + fragment * kMmaN + pair_col;
     int const output1 = output0 + 8 * DownTileCols;
     *reinterpret_cast<float2*>(&accumulator_tiles[warp][output0]) =
         make_float2(d[fragment][0], d[fragment][1]);
@@ -606,10 +578,9 @@ nvfp4_smooth_quantize_lora_down_small_m_sm120_kernel(
 #endif
 }
 
-template <int K, int BlockThreads, int DownWarps, int DownTileCols,
-          int RowsPerBlock>
-__global__ __launch_bounds__(BlockThreads) void
-nvfp4_smooth_quantize_lora_down_m537_mixed_sm120_kernel(
+template <int K, int BlockThreads, int DownWarps, int DownTileCols, int RowsPerBlock>
+__global__
+__launch_bounds__(BlockThreads) void nvfp4_smooth_quantize_lora_down_m537_mixed_sm120_kernel(
     quant::Type const* __restrict__ x, quant::Type const* __restrict__ pre_quant_scale,
     float const* __restrict__ global_scale, std::uint64_t* __restrict__ xq,
     std::uint8_t* __restrict__ sf, quant::Type const* __restrict__ l2t_smoothed,
@@ -620,8 +591,7 @@ nvfp4_smooth_quantize_lora_down_m537_mixed_sm120_kernel(
   constexpr int kBlockWarps = BlockThreads / 32;
   constexpr int kQuantWarps = kBlockWarps - DownWarps;
   constexpr int kQuantThreads = kQuantWarps * 32;
-  constexpr int kActiveQuantThreads =
-      kQuantThreads == 0 ? BlockThreads : kQuantThreads;
+  constexpr int kActiveQuantThreads = kQuantThreads == 0 ? BlockThreads : kQuantThreads;
   constexpr int kDownNTiles = kRank / DownTileCols;
   constexpr int kDownElements = 16 * DownTileCols;
   constexpr int kGridBlocks = ((kM + 15) / 16) * kDownNTiles;
@@ -636,25 +606,21 @@ nvfp4_smooth_quantize_lora_down_m537_mixed_sm120_kernel(
   static_assert(K % 16 == 0 && K % (4 * quant::SF_VEC_SIZE) == 0);
   static_assert(kGridBlocks * RowsPerBlock >= kM);
   static_assert(kGridBlocks * RowsPerBlock <= kPaddedM);
-  static_assert(RowsPerBlock == kQuantWarps,
-                "one quant warp must own each row in the mixed CTA");
+  static_assert(RowsPerBlock == kQuantWarps, "one quant warp must own each row in the mixed CTA");
 
   int const block = static_cast<int>(blockIdx.x);
   int const warp = static_cast<int>(threadIdx.x) / 32;
   int const lane = static_cast<int>(threadIdx.x) % 32;
   __shared__ __align__(8) float accumulator_tiles[DownWarps][kDownElements];
 
-  constexpr int kPrefetchLinesPerBlock =
-      (kL2PrefetchLines + kGridBlocks - 1) / kGridBlocks;
+  constexpr int kPrefetchLinesPerBlock = (kL2PrefetchLines + kGridBlocks - 1) / kGridBlocks;
   int const prefetch_begin = block * kPrefetchLinesPerBlock;
   int const prefetch_limit = prefetch_begin + kPrefetchLinesPerBlock;
-  int const prefetch_end =
-      prefetch_limit < kL2PrefetchLines ? prefetch_limit : kL2PrefetchLines;
-  for (int line = prefetch_begin + static_cast<int>(threadIdx.x);
-       line < prefetch_end; line += BlockThreads) {
+  int const prefetch_end = prefetch_limit < kL2PrefetchLines ? prefetch_limit : kL2PrefetchLines;
+  for (int line = prefetch_begin + static_cast<int>(threadIdx.x); line < prefetch_end;
+       line += BlockThreads) {
     std::uint8_t const* prefetch_address =
-        reinterpret_cast<std::uint8_t const*>(l2t_smoothed) +
-        line * kL2PrefetchBytes;
+        reinterpret_cast<std::uint8_t const*>(l2t_smoothed) + line * kL2PrefetchBytes;
     asm volatile("prefetch.global.L2 [%0];" : : "l"(prefetch_address));
   }
 
@@ -703,32 +669,26 @@ nvfp4_smooth_quantize_lora_down_m537_mixed_sm120_kernel(
           // [K/16, rank/16, DownTileCols/8, 32 lanes, 4 bf16].  One aligned
           // 64-bit load then supplies both B operands, replacing four
           // scattered U16 loads and their dependent pack-address IMAD chain.
-          auto const* packed_l2t =
-              reinterpret_cast<uint2 const*>(l2t_smoothed);
+          auto const* packed_l2t = reinterpret_cast<uint2 const*>(l2t_smoothed);
           int const packed_index =
-              (((step * kDownNTiles + tile_n) * kNFragments + fragment) * 32) +
-              lane;
+              (((step * kDownNTiles + tile_n) * kNFragments + fragment) * 32) + lane;
           uint2 const packed_b = packed_l2t[packed_index];
           b0 = packed_b.x;
           b1 = packed_b.y;
         } else {
-          quant::Type const* b_base =
-              l2t_smoothed + (k_base + pair_col) * kRank + b_col;
+          quant::Type const* b_base = l2t_smoothed + (k_base + pair_col) * kRank + b_col;
           quant::Type const* b_fragment = b_base + fragment * kMmaN;
           b0 = base::pack_bf16_pair(b_fragment, b_fragment + kRank);
-          b1 = base::pack_bf16_pair(
-              b_fragment + 8 * kRank, b_fragment + 9 * kRank);
+          b1 = base::pack_bf16_pair(b_fragment + 8 * kRank, b_fragment + 9 * kRank);
         }
-        base::mma_m16n8k16_row_col(
-            d[fragment][0], d[fragment][1], d[fragment][2], d[fragment][3],
-            a0, a1, a2, a3, b0, b1);
+        base::mma_m16n8k16_row_col(d[fragment][0], d[fragment][1], d[fragment][2], d[fragment][3],
+                                   a0, a1, a2, a3, b0, b1);
       }
     }
 
 #pragma unroll
     for (int fragment = 0; fragment < kNFragments; ++fragment) {
-      int const output0 =
-          (lane / 4) * DownTileCols + fragment * kMmaN + (lane % 4) * 2;
+      int const output0 = (lane / 4) * DownTileCols + fragment * kMmaN + (lane % 4) * 2;
       int const output1 = output0 + 8 * DownTileCols;
       *reinterpret_cast<float2*>(&accumulator_tiles[warp][output0]) =
           make_float2(d[fragment][0], d[fragment][1]);
@@ -737,33 +697,27 @@ nvfp4_smooth_quantize_lora_down_m537_mixed_sm120_kernel(
     }
   }
   if (warp >= DownWarps || DownWarps == kBlockWarps) {
-    int const quant_thread = kQuantThreads == 0
-                                 ? static_cast<int>(threadIdx.x)
-                                 : static_cast<int>(threadIdx.x) - DownWarps * 32;
+    int const quant_thread = kQuantThreads == 0 ? static_cast<int>(threadIdx.x)
+                                                : static_cast<int>(threadIdx.x) - DownWarps * 32;
     int const row_base = block * RowsPerBlock;
     float const scale = global_scale[0];
     int const quant_warp = quant_thread / 32;
     int const quant_lane = quant_thread % 32;
     int const row = row_base + quant_warp;
     for (int sf_col = quant_lane; sf_col < kSfCols; sf_col += 32) {
-      std::int64_t const sf_offset =
-          quant::get_sf_out_offset_128x4(row, sf_col, kSfCols);
+      std::int64_t const sf_offset = quant::get_sf_out_offset_128x4(row, sf_col, kSfCols);
       if (row < kM) {
-        std::int64_t const vec_offset =
-            static_cast<std::int64_t>(row) * kSfCols + sf_col;
+        std::int64_t const vec_offset = static_cast<std::int64_t>(row) * kSfCols + sf_col;
         quant::Bf16x8 x_lo;
         quant::Bf16x8 x_hi;
         quant::Bf16x8 pqs_lo;
         quant::Bf16x8 pqs_hi;
         quant::loadBf16x8(x + vec_offset * quant::FAST_ELTS_PER_THREAD, x_lo);
-        quant::loadBf16x8(
-            x + vec_offset * quant::FAST_ELTS_PER_THREAD + 8, x_hi);
-        quant::loadBf16x8(
-            pre_quant_scale + sf_col * quant::FAST_ELTS_PER_THREAD, pqs_lo);
-        quant::loadBf16x8(
-            pre_quant_scale + sf_col * quant::FAST_ELTS_PER_THREAD + 8, pqs_hi);
-        xq[vec_offset] = quant::quantizeSmoothed16(
-            x_lo, x_hi, pqs_lo, pqs_hi, scale, sf + sf_offset);
+        quant::loadBf16x8(x + vec_offset * quant::FAST_ELTS_PER_THREAD + 8, x_hi);
+        quant::loadBf16x8(pre_quant_scale + sf_col * quant::FAST_ELTS_PER_THREAD, pqs_lo);
+        quant::loadBf16x8(pre_quant_scale + sf_col * quant::FAST_ELTS_PER_THREAD + 8, pqs_hi);
+        xq[vec_offset] =
+            quant::quantizeSmoothed16(x_lo, x_hi, pqs_lo, pqs_hi, scale, sf + sf_offset);
       } else {
         sf[sf_offset] = 0u;
       }
@@ -771,18 +725,14 @@ nvfp4_smooth_quantize_lora_down_m537_mixed_sm120_kernel(
 
     constexpr int kCoveredRows = kGridBlocks * RowsPerBlock;
     constexpr int kPaddingRows = kPaddedM - kCoveredRows;
-    constexpr std::int64_t kPaddingItems =
-        static_cast<std::int64_t>(kPaddingRows) * kSfCols;
-    for (std::int64_t item =
-             static_cast<std::int64_t>(block) * kActiveQuantThreads + quant_thread;
+    constexpr std::int64_t kPaddingItems = static_cast<std::int64_t>(kPaddingRows) * kSfCols;
+    for (std::int64_t item = static_cast<std::int64_t>(block) * kActiveQuantThreads + quant_thread;
          item < kPaddingItems;
          item += static_cast<std::int64_t>(kGridBlocks) * kActiveQuantThreads) {
       int const padding_row = static_cast<int>(item / kSfCols);
-      int const sf_col =
-          static_cast<int>(item - static_cast<std::int64_t>(padding_row) * kSfCols);
+      int const sf_col = static_cast<int>(item - static_cast<std::int64_t>(padding_row) * kSfCols);
       int const row = kCoveredRows + padding_row;
-      std::int64_t const sf_offset =
-          quant::get_sf_out_offset_128x4(row, sf_col, kSfCols);
+      std::int64_t const sf_offset = quant::get_sf_out_offset_128x4(row, sf_col, kSfCols);
       sf[sf_offset] = 0u;
     }
 
@@ -792,7 +742,7 @@ nvfp4_smooth_quantize_lora_down_m537_mixed_sm120_kernel(
     // down warps continue their independent K reduction.  The launch attribute
     // is enabled only by the admitted PDL wrapper below.
     if (signal_quant_ready) {
-      asm volatile("bar.sync 1, %0;" :: "r"(kQuantThreads) : "memory");
+      asm volatile("bar.sync 1, %0;" ::"r"(kQuantThreads) : "memory");
       cudaTriggerProgrammaticLaunchCompletion();
     }
   }
@@ -820,12 +770,11 @@ nvfp4_smooth_quantize_lora_down_m537_mixed_sm120_kernel(
 #endif
 }
 
-template <int K, int BlockThreads, int DownWarps, int DownTileCols,
-          int RowsPerBlock>
-inline cudaError_t launch_m537_mixed_kernel(
-    void const* x, void const* pre_quant_scale, float const* global_scale,
-    void* xq, void* sf, void const* l2t_smoothed, void* down,
-    cudaStream_t stream, bool signal_quant_ready = false) {
+template <int K, int BlockThreads, int DownWarps, int DownTileCols, int RowsPerBlock>
+inline cudaError_t launch_m537_mixed_kernel(void const* x, void const* pre_quant_scale,
+                                            float const* global_scale, void* xq, void* sf,
+                                            void const* l2t_smoothed, void* down,
+                                            cudaStream_t stream, bool signal_quant_ready = false) {
   constexpr int kGridBlocks = ((537 + 15) / 16) * (kRank / DownTileCols);
   cudaLaunchConfig_t config = {};
   config.gridDim = dim3(kGridBlocks);
@@ -834,25 +783,23 @@ inline cudaError_t launch_m537_mixed_kernel(
   config.stream = stream;
   cudaLaunchAttribute attributes[1];
   attributes[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-  attributes[0].val.programmaticStreamSerializationAllowed =
-      signal_quant_ready ? 1 : 0;
+  attributes[0].val.programmaticStreamSerializationAllowed = signal_quant_ready ? 1 : 0;
   config.attrs = attributes;
   config.numAttrs = 1;
   auto* kernel =
-      &nvfp4_smooth_quantize_lora_down_m537_mixed_sm120_kernel<
-          K, BlockThreads, DownWarps, DownTileCols, RowsPerBlock>;
-  cudaLaunchKernelEx(
-      &config, kernel, static_cast<quant::Type const*>(x),
-      static_cast<quant::Type const*>(pre_quant_scale), global_scale,
-      static_cast<std::uint64_t*>(xq), static_cast<std::uint8_t*>(sf),
-      static_cast<quant::Type const*>(l2t_smoothed),
-      static_cast<quant::Type*>(down), signal_quant_ready);
+      &nvfp4_smooth_quantize_lora_down_m537_mixed_sm120_kernel<K, BlockThreads, DownWarps,
+                                                               DownTileCols, RowsPerBlock>;
+  cudaLaunchKernelEx(&config, kernel, static_cast<quant::Type const*>(x),
+                     static_cast<quant::Type const*>(pre_quant_scale), global_scale,
+                     static_cast<std::uint64_t*>(xq), static_cast<std::uint8_t*>(sf),
+                     static_cast<quant::Type const*>(l2t_smoothed), static_cast<quant::Type*>(down),
+                     signal_quant_ready);
   return cudaGetLastError();
 }
 
 template <int K>
-__global__ __launch_bounds__(1024, 1) void
-nvfp4_smooth_quantize_lora_down_m537_roles110_sm120_kernel(
+__global__
+__launch_bounds__(1024, 1) void nvfp4_smooth_quantize_lora_down_m537_roles110_sm120_kernel(
     quant::Type const* __restrict__ x, quant::Type const* __restrict__ pre_quant_scale,
     float const* __restrict__ global_scale, std::uint64_t* __restrict__ xq,
     std::uint8_t* __restrict__ sf, quant::Type const* __restrict__ l2t_smoothed,
@@ -873,21 +820,18 @@ nvfp4_smooth_quantize_lora_down_m537_roles110_sm120_kernel(
   constexpr int kKSteps = K / 16;
   constexpr int kL2PrefetchLines =
       K * kRank * static_cast<int>(sizeof(quant::Type)) / kL2PrefetchBytes;
-  constexpr int kPrefetchLinesPerBlock =
-      (kL2PrefetchLines + kGridBlocks - 1) / kGridBlocks;
+  constexpr int kPrefetchLinesPerBlock = (kL2PrefetchLines + kGridBlocks - 1) / kGridBlocks;
   static_assert(K == 5120, "the role-separated launch is admitted only for row44");
   static_assert(kDownBlocks == 68 && kQuantBlocks == 42 && kGridBlocks == 110);
   static_assert(K % kBlockWarps == 0 && (K / kBlockWarps) % 16 == 0);
 
   int const block = static_cast<int>(blockIdx.x);
   int const prefetch_begin = block * kPrefetchLinesPerBlock;
-  int const prefetch_end =
-      min(prefetch_begin + kPrefetchLinesPerBlock, kL2PrefetchLines);
-  for (int line = prefetch_begin + static_cast<int>(threadIdx.x);
-       line < prefetch_end; line += kBlockThreads) {
+  int const prefetch_end = min(prefetch_begin + kPrefetchLinesPerBlock, kL2PrefetchLines);
+  for (int line = prefetch_begin + static_cast<int>(threadIdx.x); line < prefetch_end;
+       line += kBlockThreads) {
     std::uint8_t const* prefetch_address =
-        reinterpret_cast<std::uint8_t const*>(l2t_smoothed) +
-        line * kL2PrefetchBytes;
+        reinterpret_cast<std::uint8_t const*>(l2t_smoothed) + line * kL2PrefetchBytes;
     asm volatile("prefetch.global.L2 [%0];" : : "l"(prefetch_address));
   }
 
@@ -895,30 +839,23 @@ nvfp4_smooth_quantize_lora_down_m537_roles110_sm120_kernel(
     int const quant_block = block - kDownBlocks;
     constexpr int kQuantItems = kPaddedM * kSfCols;
     float const scale = global_scale[0];
-    for (int item = quant_block * kBlockThreads + static_cast<int>(threadIdx.x);
-         item < kQuantItems; item += kQuantBlocks * kBlockThreads) {
+    for (int item = quant_block * kBlockThreads + static_cast<int>(threadIdx.x); item < kQuantItems;
+         item += kQuantBlocks * kBlockThreads) {
       int const row = item / kSfCols;
       int const sf_col = item - row * kSfCols;
-      std::int64_t const sf_offset =
-          quant::get_sf_out_offset_128x4(row, sf_col, kSfCols);
+      std::int64_t const sf_offset = quant::get_sf_out_offset_128x4(row, sf_col, kSfCols);
       if (row < kM) {
-        std::int64_t const vec_offset =
-            static_cast<std::int64_t>(row) * kSfCols + sf_col;
+        std::int64_t const vec_offset = static_cast<std::int64_t>(row) * kSfCols + sf_col;
         quant::Bf16x8 x_lo;
         quant::Bf16x8 x_hi;
         quant::Bf16x8 pqs_lo;
         quant::Bf16x8 pqs_hi;
-        quant::loadBf16x8(
-            x + vec_offset * quant::FAST_ELTS_PER_THREAD, x_lo);
-        quant::loadBf16x8(
-            x + vec_offset * quant::FAST_ELTS_PER_THREAD + 8, x_hi);
-        quant::loadBf16x8(
-            pre_quant_scale + sf_col * quant::FAST_ELTS_PER_THREAD, pqs_lo);
-        quant::loadBf16x8(
-            pre_quant_scale + sf_col * quant::FAST_ELTS_PER_THREAD + 8,
-            pqs_hi);
-        xq[vec_offset] = quant::quantizeSmoothed16(
-            x_lo, x_hi, pqs_lo, pqs_hi, scale, sf + sf_offset);
+        quant::loadBf16x8(x + vec_offset * quant::FAST_ELTS_PER_THREAD, x_lo);
+        quant::loadBf16x8(x + vec_offset * quant::FAST_ELTS_PER_THREAD + 8, x_hi);
+        quant::loadBf16x8(pre_quant_scale + sf_col * quant::FAST_ELTS_PER_THREAD, pqs_lo);
+        quant::loadBf16x8(pre_quant_scale + sf_col * quant::FAST_ELTS_PER_THREAD + 8, pqs_hi);
+        xq[vec_offset] =
+            quant::quantizeSmoothed16(x_lo, x_hi, pqs_lo, pqs_hi, scale, sf + sf_offset);
       } else {
         sf[sf_offset] = 0u;
       }
@@ -932,8 +869,7 @@ nvfp4_smooth_quantize_lora_down_m537_roles110_sm120_kernel(
   int const tile_n = block % kDownNTiles;
   int const group = lane / 4;
   int const pair_col = (lane % 4) * 2;
-  __shared__ __align__(8)
-      float accumulator_tiles[kBlockWarps][kDownElements];
+  __shared__ __align__(8) float accumulator_tiles[kBlockWarps][kDownElements];
   float d[kNFragments][4] = {};
 
   int const step_begin = warp * kKSteps / kBlockWarps;
@@ -960,18 +896,15 @@ nvfp4_smooth_quantize_lora_down_m537_roles110_sm120_kernel(
     for (int fragment = 0; fragment < kNFragments; ++fragment) {
       int const logical_tile8 = tile_n * kNFragments + fragment;
       int const packed_index = (step * 4 + logical_tile8) * 32 + lane;
-      uint2 const packed_b =
-          reinterpret_cast<uint2 const*>(l2t_smoothed)[packed_index];
-      base::mma_m16n8k16_row_col(
-          d[fragment][0], d[fragment][1], d[fragment][2], d[fragment][3],
-          a0, a1, a2, a3, packed_b.x, packed_b.y);
+      uint2 const packed_b = reinterpret_cast<uint2 const*>(l2t_smoothed)[packed_index];
+      base::mma_m16n8k16_row_col(d[fragment][0], d[fragment][1], d[fragment][2], d[fragment][3], a0,
+                                 a1, a2, a3, packed_b.x, packed_b.y);
     }
   }
 
 #pragma unroll
   for (int fragment = 0; fragment < kNFragments; ++fragment) {
-    int const output0 =
-        group * kDownTileCols + fragment * kMmaN + pair_col;
+    int const output0 = group * kDownTileCols + fragment * kMmaN + pair_col;
     int const output1 = output0 + 8 * kDownTileCols;
     *reinterpret_cast<float2*>(&accumulator_tiles[warp][output0]) =
         make_float2(d[fragment][0], d[fragment][1]);
@@ -1001,23 +934,20 @@ nvfp4_smooth_quantize_lora_down_m537_roles110_sm120_kernel(
 }
 
 template <int K>
-inline cudaError_t launch_m537_roles110_kernel(
-    void const* x, void const* pre_quant_scale, float const* global_scale,
-    void* xq, void* sf, void const* l2t_smoothed, void* down,
-    cudaStream_t stream) {
-  nvfp4_smooth_quantize_lora_down_m537_roles110_sm120_kernel<K>
-      <<<110, 1024, 0, stream>>>(
-          static_cast<quant::Type const*>(x),
-          static_cast<quant::Type const*>(pre_quant_scale), global_scale,
-          static_cast<std::uint64_t*>(xq), static_cast<std::uint8_t*>(sf),
-          static_cast<quant::Type const*>(l2t_smoothed),
-          static_cast<quant::Type*>(down));
+inline cudaError_t launch_m537_roles110_kernel(void const* x, void const* pre_quant_scale,
+                                               float const* global_scale, void* xq, void* sf,
+                                               void const* l2t_smoothed, void* down,
+                                               cudaStream_t stream) {
+  nvfp4_smooth_quantize_lora_down_m537_roles110_sm120_kernel<K><<<110, 1024, 0, stream>>>(
+      static_cast<quant::Type const*>(x), static_cast<quant::Type const*>(pre_quant_scale),
+      global_scale, static_cast<std::uint64_t*>(xq), static_cast<std::uint8_t*>(sf),
+      static_cast<quant::Type const*>(l2t_smoothed), static_cast<quant::Type*>(down));
   return cudaGetLastError();
 }
 
 template <int K>
-__global__ __launch_bounds__(1024, 1) void
-nvfp4_smooth_quantize_lora_down_m537_hybrid110_sm120_kernel(
+__global__
+__launch_bounds__(1024, 1) void nvfp4_smooth_quantize_lora_down_m537_hybrid110_sm120_kernel(
     quant::Type const* __restrict__ x, quant::Type const* __restrict__ pre_quant_scale,
     float const* __restrict__ global_scale, std::uint64_t* __restrict__ xq,
     std::uint8_t* __restrict__ sf, quant::Type const* __restrict__ l2t_smoothed,
@@ -1055,23 +985,16 @@ nvfp4_smooth_quantize_lora_down_m537_hybrid110_sm120_kernel(
   int const tile_cols = is_double ? kDoubleTileCols : kSingleTileCols;
   int const n_fragments = is_double ? 2 : 1;
   int const down_elements = 16 * tile_cols;
-  int const tile_m = is_double
-                         ? block / (kRank / kDoubleTileCols)
-                         : kDoubleRows +
-                               (block - kDoubleBlocks) /
-                                   (kRank / kSingleTileCols);
-  int const tile_n = is_double
-                         ? block % (kRank / kDoubleTileCols)
-                         : (block - kDoubleBlocks) %
-                               (kRank / kSingleTileCols);
-  __shared__ __align__(8)
-      float accumulator_tiles[kBlockWarps][16 * kDoubleTileCols];
+  int const tile_m = is_double ? block / (kRank / kDoubleTileCols)
+                               : kDoubleRows + (block - kDoubleBlocks) / (kRank / kSingleTileCols);
+  int const tile_n = is_double ? block % (kRank / kDoubleTileCols)
+                               : (block - kDoubleBlocks) % (kRank / kSingleTileCols);
+  __shared__ __align__(8) float accumulator_tiles[kBlockWarps][16 * kDoubleTileCols];
 
-  for (int line = block * kBlockThreads + static_cast<int>(threadIdx.x);
-       line < kL2PrefetchLines; line += kGridBlocks * kBlockThreads) {
+  for (int line = block * kBlockThreads + static_cast<int>(threadIdx.x); line < kL2PrefetchLines;
+       line += kGridBlocks * kBlockThreads) {
     std::uint8_t const* prefetch_address =
-        reinterpret_cast<std::uint8_t const*>(l2t_smoothed) +
-        line * kL2PrefetchBytes;
+        reinterpret_cast<std::uint8_t const*>(l2t_smoothed) + line * kL2PrefetchBytes;
     asm volatile("prefetch.global.L2 [%0];" : : "l"(prefetch_address));
   }
 
@@ -1112,21 +1035,17 @@ nvfp4_smooth_quantize_lora_down_m537_hybrid110_sm120_kernel(
             // so filling all 110 SMs does not restore the scattered loads.
             int const logical_tile8 = tile_n * n_fragments + fragment;
             int const packed_index = (step * 4 + logical_tile8) * 32 + lane;
-            uint2 const packed_b =
-                reinterpret_cast<uint2 const*>(l2t_smoothed)[packed_index];
+            uint2 const packed_b = reinterpret_cast<uint2 const*>(l2t_smoothed)[packed_index];
             b0 = packed_b.x;
             b1 = packed_b.y;
           } else {
-            quant::Type const* b_base =
-                l2t_smoothed + (k_base + pair_col) * kRank + b_col;
+            quant::Type const* b_base = l2t_smoothed + (k_base + pair_col) * kRank + b_col;
             quant::Type const* b_fragment = b_base + fragment * kMmaN;
             b0 = base::pack_bf16_pair(b_fragment, b_fragment + kRank);
-            b1 = base::pack_bf16_pair(
-                b_fragment + 8 * kRank, b_fragment + 9 * kRank);
+            b1 = base::pack_bf16_pair(b_fragment + 8 * kRank, b_fragment + 9 * kRank);
           }
-          base::mma_m16n8k16_row_col(
-              d[fragment][0], d[fragment][1], d[fragment][2],
-              d[fragment][3], a0, a1, a2, a3, b0, b1);
+          base::mma_m16n8k16_row_col(d[fragment][0], d[fragment][1], d[fragment][2], d[fragment][3],
+                                     a0, a1, a2, a3, b0, b1);
         }
       }
     }
@@ -1134,8 +1053,7 @@ nvfp4_smooth_quantize_lora_down_m537_hybrid110_sm120_kernel(
 #pragma unroll
     for (int fragment = 0; fragment < 2; ++fragment) {
       if (fragment < n_fragments) {
-        int const output0 =
-            group * tile_cols + fragment * kMmaN + pair_col;
+        int const output0 = group * tile_cols + fragment * kMmaN + pair_col;
         int const output1 = output0 + 8 * tile_cols;
         *reinterpret_cast<float2*>(&accumulator_tiles[warp][output0]) =
             make_float2(d[fragment][0], d[fragment][1]);
@@ -1147,36 +1065,27 @@ nvfp4_smooth_quantize_lora_down_m537_hybrid110_sm120_kernel(
 
   if (!is_double && warp >= kSingleDownWarps) {
     int const single_block = block - kDoubleBlocks;
-    int const quant_thread =
-        static_cast<int>(threadIdx.x) - kSingleDownWarps * 32;
+    int const quant_thread = static_cast<int>(threadIdx.x) - kSingleDownWarps * 32;
     int const row_base = single_block * kRowsPerQuantBlock;
     constexpr int kWorkItems = kRowsPerQuantBlock * kSfCols;
     float const scale = global_scale[0];
-    for (int item = quant_thread; item < kWorkItems;
-         item += kQuantWarps * 32) {
+    for (int item = quant_thread; item < kWorkItems; item += kQuantWarps * 32) {
       int const row_offset = item / kSfCols;
       int const sf_col = item - row_offset * kSfCols;
       int const row = row_base + row_offset;
-      std::int64_t const sf_offset =
-          quant::get_sf_out_offset_128x4(row, sf_col, kSfCols);
+      std::int64_t const sf_offset = quant::get_sf_out_offset_128x4(row, sf_col, kSfCols);
       if (row < kM) {
-        std::int64_t const vec_offset =
-            static_cast<std::int64_t>(row) * kSfCols + sf_col;
+        std::int64_t const vec_offset = static_cast<std::int64_t>(row) * kSfCols + sf_col;
         quant::Bf16x8 x_lo;
         quant::Bf16x8 x_hi;
         quant::Bf16x8 pqs_lo;
         quant::Bf16x8 pqs_hi;
-        quant::loadBf16x8(
-            x + vec_offset * quant::FAST_ELTS_PER_THREAD, x_lo);
-        quant::loadBf16x8(
-            x + vec_offset * quant::FAST_ELTS_PER_THREAD + 8, x_hi);
-        quant::loadBf16x8(
-            pre_quant_scale + sf_col * quant::FAST_ELTS_PER_THREAD, pqs_lo);
-        quant::loadBf16x8(
-            pre_quant_scale + sf_col * quant::FAST_ELTS_PER_THREAD + 8,
-            pqs_hi);
-        xq[vec_offset] = quant::quantizeSmoothed16(
-            x_lo, x_hi, pqs_lo, pqs_hi, scale, sf + sf_offset);
+        quant::loadBf16x8(x + vec_offset * quant::FAST_ELTS_PER_THREAD, x_lo);
+        quant::loadBf16x8(x + vec_offset * quant::FAST_ELTS_PER_THREAD + 8, x_hi);
+        quant::loadBf16x8(pre_quant_scale + sf_col * quant::FAST_ELTS_PER_THREAD, pqs_lo);
+        quant::loadBf16x8(pre_quant_scale + sf_col * quant::FAST_ELTS_PER_THREAD + 8, pqs_hi);
+        xq[vec_offset] =
+            quant::quantizeSmoothed16(x_lo, x_hi, pqs_lo, pqs_hi, scale, sf + sf_offset);
       } else {
         sf[sf_offset] = 0u;
       }
@@ -1186,16 +1095,13 @@ nvfp4_smooth_quantize_lora_down_m537_hybrid110_sm120_kernel(
     constexpr std::int64_t kPaddingItems =
         static_cast<std::int64_t>(kPaddedM - kCoveredRows) * kSfCols;
     for (std::int64_t item =
-             static_cast<std::int64_t>(single_block) * kQuantWarps * 32 +
-             quant_thread;
+             static_cast<std::int64_t>(single_block) * kQuantWarps * 32 + quant_thread;
          item < kPaddingItems;
          item += static_cast<std::int64_t>(kSingleBlocks) * kQuantWarps * 32) {
       int const padding_row = static_cast<int>(item / kSfCols);
-      int const sf_col = static_cast<int>(
-          item - static_cast<std::int64_t>(padding_row) * kSfCols);
+      int const sf_col = static_cast<int>(item - static_cast<std::int64_t>(padding_row) * kSfCols);
       int const row = kCoveredRows + padding_row;
-      std::int64_t const sf_offset =
-          quant::get_sf_out_offset_128x4(row, sf_col, kSfCols);
+      std::int64_t const sf_offset = quant::get_sf_out_offset_128x4(row, sf_col, kSfCols);
       sf[sf_offset] = 0u;
     }
   }
@@ -1204,8 +1110,7 @@ nvfp4_smooth_quantize_lora_down_m537_hybrid110_sm120_kernel(
   int const element = static_cast<int>(threadIdx.x);
   if (element < down_elements) {
     float accum = 0.0f;
-    for (int source_warp = 0; source_warp < active_down_warps;
-         ++source_warp) {
+    for (int source_warp = 0; source_warp < active_down_warps; ++source_warp) {
       accum += accumulator_tiles[source_warp][element];
     }
     int const row = tile_m * 16 + element / tile_cols;
@@ -1222,23 +1127,20 @@ nvfp4_smooth_quantize_lora_down_m537_hybrid110_sm120_kernel(
 }
 
 template <int K>
-inline cudaError_t launch_m537_hybrid110_kernel(
-    void const* x, void const* pre_quant_scale, float const* global_scale,
-    void* xq, void* sf, void const* l2t_smoothed, void* down,
-    cudaStream_t stream) {
-  nvfp4_smooth_quantize_lora_down_m537_hybrid110_sm120_kernel<K>
-      <<<110, 1024, 0, stream>>>(
-          static_cast<quant::Type const*>(x),
-          static_cast<quant::Type const*>(pre_quant_scale), global_scale,
-          static_cast<std::uint64_t*>(xq), static_cast<std::uint8_t*>(sf),
-          static_cast<quant::Type const*>(l2t_smoothed),
-          static_cast<quant::Type*>(down));
+inline cudaError_t launch_m537_hybrid110_kernel(void const* x, void const* pre_quant_scale,
+                                                float const* global_scale, void* xq, void* sf,
+                                                void const* l2t_smoothed, void* down,
+                                                cudaStream_t stream) {
+  nvfp4_smooth_quantize_lora_down_m537_hybrid110_sm120_kernel<K><<<110, 1024, 0, stream>>>(
+      static_cast<quant::Type const*>(x), static_cast<quant::Type const*>(pre_quant_scale),
+      global_scale, static_cast<std::uint64_t*>(xq), static_cast<std::uint8_t*>(sf),
+      static_cast<quant::Type const*>(l2t_smoothed), static_cast<quant::Type*>(down));
   return cudaGetLastError();
 }
 
 template <int K>
-__global__ __launch_bounds__(1024, 1) void
-nvfp4_smooth_quantize_lora_down_m537_splitk3_fullrank_sm120_kernel(
+__global__
+__launch_bounds__(1024, 1) void nvfp4_smooth_quantize_lora_down_m537_splitk3_fullrank_sm120_kernel(
     quant::Type const* __restrict__ x, quant::Type const* __restrict__ pre_quant_scale,
     float const* __restrict__ global_scale, std::uint64_t* __restrict__ xq,
     std::uint8_t* __restrict__ sf, quant::Type const* __restrict__ l2t_smoothed,
@@ -1272,11 +1174,10 @@ nvfp4_smooth_quantize_lora_down_m537_splitk3_fullrank_sm120_kernel(
   int const lane = static_cast<int>(threadIdx.x) % 32;
   __shared__ __align__(8) float accumulator_tiles[kDownWarps][kDownElements];
 
-  for (int line = block * kBlockThreads + static_cast<int>(threadIdx.x);
-       line < kL2PrefetchLines; line += kGridBlocks * kBlockThreads) {
+  for (int line = block * kBlockThreads + static_cast<int>(threadIdx.x); line < kL2PrefetchLines;
+       line += kGridBlocks * kBlockThreads) {
     std::uint8_t const* prefetch_address =
-        reinterpret_cast<std::uint8_t const*>(l2t_smoothed) +
-        line * kL2PrefetchBytes;
+        reinterpret_cast<std::uint8_t const*>(l2t_smoothed) + line * kL2PrefetchBytes;
     asm volatile("prefetch.global.L2 [%0];" : : "l"(prefetch_address));
   }
 
@@ -1289,10 +1190,8 @@ nvfp4_smooth_quantize_lora_down_m537_splitk3_fullrank_sm120_kernel(
     int const split_step_begin = split * kKSteps / kSplits;
     int const split_step_end = (split + 1) * kKSteps / kSplits;
     int const split_steps = split_step_end - split_step_begin;
-    int const step_begin =
-        split_step_begin + warp * split_steps / kDownWarps;
-    int const step_end =
-        split_step_begin + (warp + 1) * split_steps / kDownWarps;
+    int const step_begin = split_step_begin + warp * split_steps / kDownWarps;
+    int const step_end = split_step_begin + (warp + 1) * split_steps / kDownWarps;
     int const a_row = tile_m * 16 + group;
     int const b_col = tile_n * kDownTileCols + group;
 #pragma unroll 1
@@ -1312,25 +1211,21 @@ nvfp4_smooth_quantize_lora_down_m537_splitk3_fullrank_sm120_kernel(
         a1 = base::load_bf16_pair(a_upper);
         a3 = base::load_bf16_pair(a_upper + 8);
       }
-      quant::Type const* b_base =
-          l2t_smoothed + (k_base + pair_col) * kRank + b_col;
+      quant::Type const* b_base = l2t_smoothed + (k_base + pair_col) * kRank + b_col;
 #pragma unroll
       for (int fragment = 0; fragment < 4; ++fragment) {
         quant::Type const* b_fragment = b_base + fragment * kMmaN;
-        std::uint32_t const b0 =
-            base::pack_bf16_pair(b_fragment, b_fragment + kRank);
-        std::uint32_t const b1 = base::pack_bf16_pair(
-            b_fragment + 8 * kRank, b_fragment + 9 * kRank);
-        base::mma_m16n8k16_row_col(
-            d[fragment][0], d[fragment][1], d[fragment][2], d[fragment][3],
-            a0, a1, a2, a3, b0, b1);
+        std::uint32_t const b0 = base::pack_bf16_pair(b_fragment, b_fragment + kRank);
+        std::uint32_t const b1 =
+            base::pack_bf16_pair(b_fragment + 8 * kRank, b_fragment + 9 * kRank);
+        base::mma_m16n8k16_row_col(d[fragment][0], d[fragment][1], d[fragment][2], d[fragment][3],
+                                   a0, a1, a2, a3, b0, b1);
       }
     }
 
 #pragma unroll
     for (int fragment = 0; fragment < 4; ++fragment) {
-      int const output0 =
-          group * kDownTileCols + fragment * kMmaN + pair_col;
+      int const output0 = group * kDownTileCols + fragment * kMmaN + pair_col;
       int const output1 = output0 + 8 * kDownTileCols;
       *reinterpret_cast<float2*>(&accumulator_tiles[warp][output0]) =
           make_float2(d[fragment][0], d[fragment][1]);
@@ -1340,35 +1235,27 @@ nvfp4_smooth_quantize_lora_down_m537_splitk3_fullrank_sm120_kernel(
   }
 
   if (split == 0 && warp >= kDownWarps) {
-    int const quant_thread =
-        static_cast<int>(threadIdx.x) - kDownWarps * 32;
+    int const quant_thread = static_cast<int>(threadIdx.x) - kDownWarps * 32;
     int const row_base = down_tile * kRowsPerQuantBlock;
     constexpr int kWorkItems = kRowsPerQuantBlock * kSfCols;
     float const scale = global_scale[0];
-    for (int item = quant_thread; item < kWorkItems;
-         item += kQuantWarps * 32) {
+    for (int item = quant_thread; item < kWorkItems; item += kQuantWarps * 32) {
       int const row_offset = item / kSfCols;
       int const sf_col = item - row_offset * kSfCols;
       int const row = row_base + row_offset;
-      std::int64_t const sf_offset =
-          quant::get_sf_out_offset_128x4(row, sf_col, kSfCols);
+      std::int64_t const sf_offset = quant::get_sf_out_offset_128x4(row, sf_col, kSfCols);
       if (row < kM) {
-        std::int64_t const vec_offset =
-            static_cast<std::int64_t>(row) * kSfCols + sf_col;
+        std::int64_t const vec_offset = static_cast<std::int64_t>(row) * kSfCols + sf_col;
         quant::Bf16x8 x_lo;
         quant::Bf16x8 x_hi;
         quant::Bf16x8 pqs_lo;
         quant::Bf16x8 pqs_hi;
-        quant::loadBf16x8(
-            x + vec_offset * quant::FAST_ELTS_PER_THREAD, x_lo);
-        quant::loadBf16x8(
-            x + vec_offset * quant::FAST_ELTS_PER_THREAD + 8, x_hi);
-        quant::loadBf16x8(
-            pre_quant_scale + sf_col * quant::FAST_ELTS_PER_THREAD, pqs_lo);
-        quant::loadBf16x8(
-            pre_quant_scale + sf_col * quant::FAST_ELTS_PER_THREAD + 8, pqs_hi);
-        xq[vec_offset] = quant::quantizeSmoothed16(
-            x_lo, x_hi, pqs_lo, pqs_hi, scale, sf + sf_offset);
+        quant::loadBf16x8(x + vec_offset * quant::FAST_ELTS_PER_THREAD, x_lo);
+        quant::loadBf16x8(x + vec_offset * quant::FAST_ELTS_PER_THREAD + 8, x_hi);
+        quant::loadBf16x8(pre_quant_scale + sf_col * quant::FAST_ELTS_PER_THREAD, pqs_lo);
+        quant::loadBf16x8(pre_quant_scale + sf_col * quant::FAST_ELTS_PER_THREAD + 8, pqs_hi);
+        xq[vec_offset] =
+            quant::quantizeSmoothed16(x_lo, x_hi, pqs_lo, pqs_hi, scale, sf + sf_offset);
       } else {
         sf[sf_offset] = 0u;
       }
@@ -1377,17 +1264,12 @@ nvfp4_smooth_quantize_lora_down_m537_splitk3_fullrank_sm120_kernel(
     constexpr int kCoveredRows = kDownTiles * kRowsPerQuantBlock;
     constexpr std::int64_t kPaddingItems =
         static_cast<std::int64_t>(kPaddedM - kCoveredRows) * kSfCols;
-    for (std::int64_t item =
-             static_cast<std::int64_t>(down_tile) * kQuantWarps * 32 +
-             quant_thread;
-         item < kPaddingItems;
-         item += static_cast<std::int64_t>(kDownTiles) * kQuantWarps * 32) {
+    for (std::int64_t item = static_cast<std::int64_t>(down_tile) * kQuantWarps * 32 + quant_thread;
+         item < kPaddingItems; item += static_cast<std::int64_t>(kDownTiles) * kQuantWarps * 32) {
       int const padding_row = static_cast<int>(item / kSfCols);
-      int const sf_col = static_cast<int>(
-          item - static_cast<std::int64_t>(padding_row) * kSfCols);
+      int const sf_col = static_cast<int>(item - static_cast<std::int64_t>(padding_row) * kSfCols);
       int const row = kCoveredRows + padding_row;
-      std::int64_t const sf_offset =
-          quant::get_sf_out_offset_128x4(row, sf_col, kSfCols);
+      std::int64_t const sf_offset = quant::get_sf_out_offset_128x4(row, sf_col, kSfCols);
       sf[sf_offset] = 0u;
     }
   }
@@ -1396,8 +1278,7 @@ nvfp4_smooth_quantize_lora_down_m537_splitk3_fullrank_sm120_kernel(
   int const element = static_cast<int>(threadIdx.x);
   if (element < kDownElements) {
     float accum = 0.0f;
-    for (int source_warp = 0; source_warp < kDownWarps;
-         ++source_warp) {
+    for (int source_warp = 0; source_warp < kDownWarps; ++source_warp) {
       accum += accumulator_tiles[source_warp][element];
     }
     int const tile_m = down_tile / kDownNTiles;
@@ -1416,30 +1297,27 @@ nvfp4_smooth_quantize_lora_down_m537_splitk3_fullrank_sm120_kernel(
 }
 
 template <int K>
-inline cudaError_t launch_m537_splitk3_fullrank_kernel(
-    void const* x, void const* pre_quant_scale, float const* global_scale,
-    void* xq, void* sf, void const* l2t_smoothed, void* down,
-    cudaStream_t stream) {
+inline cudaError_t launch_m537_splitk3_fullrank_kernel(void const* x, void const* pre_quant_scale,
+                                                       float const* global_scale, void* xq,
+                                                       void* sf, void const* l2t_smoothed,
+                                                       void* down, cudaStream_t stream) {
   constexpr int kM = 537;
   constexpr int kGridBlocks = 102;
-  cudaError_t status =
-      cudaMemsetAsync(down, 0, kM * kRank * sizeof(quant::Type), stream);
+  cudaError_t status = cudaMemsetAsync(down, 0, kM * kRank * sizeof(quant::Type), stream);
   if (status != cudaSuccess) {
     return status;
   }
   nvfp4_smooth_quantize_lora_down_m537_splitk3_fullrank_sm120_kernel<K>
       <<<kGridBlocks, 1024, 0, stream>>>(
-          static_cast<quant::Type const*>(x),
-          static_cast<quant::Type const*>(pre_quant_scale), global_scale,
-          static_cast<std::uint64_t*>(xq), static_cast<std::uint8_t*>(sf),
-          static_cast<quant::Type const*>(l2t_smoothed),
-          static_cast<quant::Type*>(down));
+          static_cast<quant::Type const*>(x), static_cast<quant::Type const*>(pre_quant_scale),
+          global_scale, static_cast<std::uint64_t*>(xq), static_cast<std::uint8_t*>(sf),
+          static_cast<quant::Type const*>(l2t_smoothed), static_cast<quant::Type*>(down));
   return cudaGetLastError();
 }
 
 template <int K>
-__global__ __launch_bounds__(1024, 1) void
-nvfp4_smooth_quantize_lora_down_m537_reuse_a_sm120_kernel(
+__global__
+__launch_bounds__(1024, 1) void nvfp4_smooth_quantize_lora_down_m537_reuse_a_sm120_kernel(
     quant::Type const* __restrict__ x, quant::Type const* __restrict__ pre_quant_scale,
     float const* __restrict__ global_scale, std::uint64_t* __restrict__ xq,
     std::uint8_t* __restrict__ sf, quant::Type const* __restrict__ l2t_smoothed,
@@ -1473,11 +1351,10 @@ nvfp4_smooth_quantize_lora_down_m537_reuse_a_sm120_kernel(
   float const scale = global_scale[0];
   __shared__ __align__(8) float accumulator_tiles[kDownWarps][kDownElements];
 
-  for (int line = block * kBlockThreads + static_cast<int>(threadIdx.x);
-       line < kL2PrefetchLines; line += kGridBlocks * kBlockThreads) {
+  for (int line = block * kBlockThreads + static_cast<int>(threadIdx.x); line < kL2PrefetchLines;
+       line += kGridBlocks * kBlockThreads) {
     std::uint8_t const* prefetch_address =
-        reinterpret_cast<std::uint8_t const*>(l2t_smoothed) +
-        line * kL2PrefetchBytes;
+        reinterpret_cast<std::uint8_t const*>(l2t_smoothed) + line * kL2PrefetchBytes;
     asm volatile("prefetch.global.L2 [%0];" : : "l"(prefetch_address));
   }
 
@@ -1502,18 +1379,14 @@ nvfp4_smooth_quantize_lora_down_m537_reuse_a_sm120_kernel(
       a3 = base::load_bf16_pair(a_upper + 8);
     }
 
-    quant::Type const* b_base =
-        l2t_smoothed + (k_base + pair_col) * kRank + b_col;
+    quant::Type const* b_base = l2t_smoothed + (k_base + pair_col) * kRank + b_col;
 #pragma unroll
     for (int fragment = 0; fragment < 2; ++fragment) {
       quant::Type const* b_fragment = b_base + fragment * kMmaN;
-      std::uint32_t const b0 =
-          base::pack_bf16_pair(b_fragment, b_fragment + kRank);
-      std::uint32_t const b1 = base::pack_bf16_pair(
-          b_fragment + 8 * kRank, b_fragment + 9 * kRank);
-      base::mma_m16n8k16_row_col(
-          d[fragment][0], d[fragment][1], d[fragment][2], d[fragment][3],
-          a0, a1, a2, a3, b0, b1);
+      std::uint32_t const b0 = base::pack_bf16_pair(b_fragment, b_fragment + kRank);
+      std::uint32_t const b1 = base::pack_bf16_pair(b_fragment + 8 * kRank, b_fragment + 9 * kRank);
+      base::mma_m16n8k16_row_col(d[fragment][0], d[fragment][1], d[fragment][2], d[fragment][3], a0,
+                                 a1, a2, a3, b0, b1);
     }
 
     // tile_n==0 uniquely owns this 16x16 A fragment. The four lanes in each
@@ -1527,46 +1400,34 @@ nvfp4_smooth_quantize_lora_down_m537_reuse_a_sm120_kernel(
       quant::Bf16x8 upper_lo;
       quant::Bf16x8 upper_hi;
       lower_lo.bits = make_uint4(
-          __shfl_sync(mask, a0, source_lane),
-          __shfl_sync(mask, a0, source_lane + 1),
-          __shfl_sync(mask, a0, source_lane + 2),
-          __shfl_sync(mask, a0, source_lane + 3));
+          __shfl_sync(mask, a0, source_lane), __shfl_sync(mask, a0, source_lane + 1),
+          __shfl_sync(mask, a0, source_lane + 2), __shfl_sync(mask, a0, source_lane + 3));
       lower_hi.bits = make_uint4(
-          __shfl_sync(mask, a2, source_lane),
-          __shfl_sync(mask, a2, source_lane + 1),
-          __shfl_sync(mask, a2, source_lane + 2),
-          __shfl_sync(mask, a2, source_lane + 3));
+          __shfl_sync(mask, a2, source_lane), __shfl_sync(mask, a2, source_lane + 1),
+          __shfl_sync(mask, a2, source_lane + 2), __shfl_sync(mask, a2, source_lane + 3));
       upper_lo.bits = make_uint4(
-          __shfl_sync(mask, a1, source_lane),
-          __shfl_sync(mask, a1, source_lane + 1),
-          __shfl_sync(mask, a1, source_lane + 2),
-          __shfl_sync(mask, a1, source_lane + 3));
+          __shfl_sync(mask, a1, source_lane), __shfl_sync(mask, a1, source_lane + 1),
+          __shfl_sync(mask, a1, source_lane + 2), __shfl_sync(mask, a1, source_lane + 3));
       upper_hi.bits = make_uint4(
-          __shfl_sync(mask, a3, source_lane),
-          __shfl_sync(mask, a3, source_lane + 1),
-          __shfl_sync(mask, a3, source_lane + 2),
-          __shfl_sync(mask, a3, source_lane + 3));
+          __shfl_sync(mask, a3, source_lane), __shfl_sync(mask, a3, source_lane + 1),
+          __shfl_sync(mask, a3, source_lane + 2), __shfl_sync(mask, a3, source_lane + 3));
       if (lane_in_group == 0) {
         quant::Bf16x8 pqs_lo;
         quant::Bf16x8 pqs_hi;
         quant::loadBf16x8(pre_quant_scale + k_base, pqs_lo);
         quant::loadBf16x8(pre_quant_scale + k_base + 8, pqs_hi);
         if (a_row < kM) {
-          std::int64_t const vec_offset =
-              static_cast<std::int64_t>(a_row) * kSfCols + step;
-          std::int64_t const sf_offset =
-              quant::get_sf_out_offset_128x4(a_row, step, kSfCols);
-          xq[vec_offset] = quant::quantizeSmoothed16(
-              lower_lo, lower_hi, pqs_lo, pqs_hi, scale, sf + sf_offset);
+          std::int64_t const vec_offset = static_cast<std::int64_t>(a_row) * kSfCols + step;
+          std::int64_t const sf_offset = quant::get_sf_out_offset_128x4(a_row, step, kSfCols);
+          xq[vec_offset] =
+              quant::quantizeSmoothed16(lower_lo, lower_hi, pqs_lo, pqs_hi, scale, sf + sf_offset);
         }
         if (a_row + 8 < kM) {
           int const upper_row = a_row + 8;
-          std::int64_t const vec_offset =
-              static_cast<std::int64_t>(upper_row) * kSfCols + step;
-          std::int64_t const sf_offset =
-              quant::get_sf_out_offset_128x4(upper_row, step, kSfCols);
-          xq[vec_offset] = quant::quantizeSmoothed16(
-              upper_lo, upper_hi, pqs_lo, pqs_hi, scale, sf + sf_offset);
+          std::int64_t const vec_offset = static_cast<std::int64_t>(upper_row) * kSfCols + step;
+          std::int64_t const sf_offset = quant::get_sf_out_offset_128x4(upper_row, step, kSfCols);
+          xq[vec_offset] =
+              quant::quantizeSmoothed16(upper_lo, upper_hi, pqs_lo, pqs_hi, scale, sf + sf_offset);
         }
       }
     }
@@ -1574,8 +1435,7 @@ nvfp4_smooth_quantize_lora_down_m537_reuse_a_sm120_kernel(
 
 #pragma unroll
   for (int fragment = 0; fragment < 2; ++fragment) {
-    int const output0 =
-        group * kDownTileCols + fragment * kMmaN + pair_col;
+    int const output0 = group * kDownTileCols + fragment * kMmaN + pair_col;
     int const output1 = output0 + 8 * kDownTileCols;
     *reinterpret_cast<float2*>(&accumulator_tiles[warp][output0]) =
         make_float2(d[fragment][0], d[fragment][1]);
@@ -1598,18 +1458,13 @@ nvfp4_smooth_quantize_lora_down_m537_reuse_a_sm120_kernel(
     }
   }
 
-  constexpr std::int64_t kPaddingItems =
-      static_cast<std::int64_t>(kPaddedM - kM) * kSfCols;
-  for (std::int64_t item =
-           static_cast<std::int64_t>(block) * kBlockThreads + threadIdx.x;
-       item < kPaddingItems;
-       item += static_cast<std::int64_t>(kGridBlocks) * kBlockThreads) {
+  constexpr std::int64_t kPaddingItems = static_cast<std::int64_t>(kPaddedM - kM) * kSfCols;
+  for (std::int64_t item = static_cast<std::int64_t>(block) * kBlockThreads + threadIdx.x;
+       item < kPaddingItems; item += static_cast<std::int64_t>(kGridBlocks) * kBlockThreads) {
     int const padding_row = static_cast<int>(item / kSfCols);
-    int const sf_col =
-        static_cast<int>(item - static_cast<std::int64_t>(padding_row) * kSfCols);
+    int const sf_col = static_cast<int>(item - static_cast<std::int64_t>(padding_row) * kSfCols);
     int const row = kM + padding_row;
-    std::int64_t const sf_offset =
-        quant::get_sf_out_offset_128x4(row, sf_col, kSfCols);
+    std::int64_t const sf_offset = quant::get_sf_out_offset_128x4(row, sf_col, kSfCols);
     sf[sf_offset] = 0u;
   }
 #else
@@ -1620,26 +1475,21 @@ nvfp4_smooth_quantize_lora_down_m537_reuse_a_sm120_kernel(
 }
 
 template <int K>
-inline cudaError_t launch_m537_reuse_a_kernel(
-    void const* x, void const* pre_quant_scale, float const* global_scale,
-    void* xq, void* sf, void const* l2t_smoothed, void* down,
-    cudaStream_t stream) {
-  nvfp4_smooth_quantize_lora_down_m537_reuse_a_sm120_kernel<K>
-      <<<68, 1024, 0, stream>>>(
-          static_cast<quant::Type const*>(x),
-          static_cast<quant::Type const*>(pre_quant_scale), global_scale,
-          static_cast<std::uint64_t*>(xq), static_cast<std::uint8_t*>(sf),
-          static_cast<quant::Type const*>(l2t_smoothed),
-          static_cast<quant::Type*>(down));
+inline cudaError_t launch_m537_reuse_a_kernel(void const* x, void const* pre_quant_scale,
+                                              float const* global_scale, void* xq, void* sf,
+                                              void const* l2t_smoothed, void* down,
+                                              cudaStream_t stream) {
+  nvfp4_smooth_quantize_lora_down_m537_reuse_a_sm120_kernel<K><<<68, 1024, 0, stream>>>(
+      static_cast<quant::Type const*>(x), static_cast<quant::Type const*>(pre_quant_scale),
+      global_scale, static_cast<std::uint64_t*>(xq), static_cast<std::uint8_t*>(sf),
+      static_cast<quant::Type const*>(l2t_smoothed), static_cast<quant::Type*>(down));
   return cudaGetLastError();
 }
 
-template <int M, int K, int BlockThreads, int DownTileCols,
-          int RowsPerQuantBlock>
+template <int M, int K, int BlockThreads, int DownTileCols, int RowsPerQuantBlock>
 struct SmallMLaunchGeometry {
   static constexpr int kPaddedM = (M + 127) / 128 * 128;
-  static constexpr int kQuantBlocks =
-      (M + RowsPerQuantBlock - 1) / RowsPerQuantBlock;
+  static constexpr int kQuantBlocks = (M + RowsPerQuantBlock - 1) / RowsPerQuantBlock;
   static constexpr int kDownWarps = BlockThreads / 32;
   static constexpr int kNFragments = DownTileCols / kMmaN;
   static constexpr int kDownNTiles = kRank / DownTileCols;
@@ -1647,11 +1497,9 @@ struct SmallMLaunchGeometry {
   static constexpr int kDownMBlocks = (M + 15) / 16;
   static constexpr int kDownBlocks = kDownMBlocks * kDownNTiles;
   static constexpr int kGridBlocks = kQuantBlocks + kDownBlocks;
-  static constexpr int kSharedBytes =
-      kDownWarps * kDownElements * static_cast<int>(sizeof(float));
+  static constexpr int kSharedBytes = kDownWarps * kDownElements * static_cast<int>(sizeof(float));
 
-  static_assert(M > 0 && RowsPerQuantBlock > 0 &&
-                kQuantBlocks * RowsPerQuantBlock <= kPaddedM);
+  static_assert(M > 0 && RowsPerQuantBlock > 0 && kQuantBlocks * RowsPerQuantBlock <= kPaddedM);
   static_assert(BlockThreads % 32 == 0 && kDownWarps > 0);
   static_assert(K % kDownWarps == 0 && (K / kDownWarps) % 16 == 0);
   static_assert(K % (4 * quant::SF_VEC_SIZE) == 0);
@@ -1662,30 +1510,24 @@ struct SmallMLaunchGeometry {
   static_assert(kSharedBytes <= 48 * 1024);
 };
 
-template <int M, int K, int BlockThreads, int DownTileCols,
-          int RowsPerQuantBlock = 4>
-inline cudaError_t launch_small_m_kernel(
-    void const* x, void const* pre_quant_scale, float const* global_scale,
-    void* xq, void* sf, void const* l2t_smoothed, void* down,
-    cudaStream_t stream) {
-  using geometry = SmallMLaunchGeometry<
-      M, K, BlockThreads, DownTileCols, RowsPerQuantBlock>;
-  nvfp4_smooth_quantize_lora_down_small_m_sm120_kernel<
-      M, K, BlockThreads, DownTileCols, RowsPerQuantBlock><<<
-      geometry::kGridBlocks, BlockThreads, 0, stream>>>(
-      static_cast<quant::Type const*>(x),
-      static_cast<quant::Type const*>(pre_quant_scale), global_scale,
-      static_cast<std::uint64_t*>(xq), static_cast<std::uint8_t*>(sf),
-      static_cast<quant::Type const*>(l2t_smoothed),
-      static_cast<quant::Type*>(down));
+template <int M, int K, int BlockThreads, int DownTileCols, int RowsPerQuantBlock = 4>
+inline cudaError_t launch_small_m_kernel(void const* x, void const* pre_quant_scale,
+                                         float const* global_scale, void* xq, void* sf,
+                                         void const* l2t_smoothed, void* down,
+                                         cudaStream_t stream) {
+  using geometry = SmallMLaunchGeometry<M, K, BlockThreads, DownTileCols, RowsPerQuantBlock>;
+  nvfp4_smooth_quantize_lora_down_small_m_sm120_kernel<M, K, BlockThreads, DownTileCols,
+                                                       RowsPerQuantBlock>
+      <<<geometry::kGridBlocks, BlockThreads, 0, stream>>>(
+          static_cast<quant::Type const*>(x), static_cast<quant::Type const*>(pre_quant_scale),
+          global_scale, static_cast<std::uint64_t*>(xq), static_cast<std::uint8_t*>(sf),
+          static_cast<quant::Type const*>(l2t_smoothed), static_cast<quant::Type*>(down));
   return cudaGetLastError();
 }
 
-
-
 template <int BlockThreads, int DownTileCols, int RowsPerQuantBlock>
-__global__ __launch_bounds__(BlockThreads) void
-nvfp4_smooth_quantize_lora_down_small_m_dyn_sm120_kernel(
+__global__
+__launch_bounds__(BlockThreads) void nvfp4_smooth_quantize_lora_down_small_m_dyn_sm120_kernel(
     quant::Type const* __restrict__ x, quant::Type const* __restrict__ pre_quant_scale,
     float const* __restrict__ global_scale, std::uint64_t* __restrict__ xq,
     std::uint8_t* __restrict__ sf, quant::Type const* __restrict__ l2t_smoothed,
@@ -1696,48 +1538,40 @@ nvfp4_smooth_quantize_lora_down_small_m_dyn_sm120_kernel(
   constexpr int kDownWarps = BlockThreads / 32;
   int const kSfCols = K / quant::SF_VEC_SIZE;
   int const kDownKPerWarp = K / kDownWarps;
-  int const kL2PrefetchLines =
-      K * kRank * static_cast<int>(sizeof(quant::Type)) / kL2PrefetchBytes;
+  int const kL2PrefetchLines = K * kRank * static_cast<int>(sizeof(quant::Type)) / kL2PrefetchBytes;
   constexpr int kNFragments = DownTileCols / kMmaN;
   constexpr int kDownNTiles = kRank / DownTileCols;
   constexpr int kDownElements = 16 * DownTileCols;
 
   int const block = static_cast<int>(blockIdx.x);
   if (block < kQuantBlocks) {
-    for (int line = block * BlockThreads + static_cast<int>(threadIdx.x);
-         line < kL2PrefetchLines; line += kQuantBlocks * BlockThreads) {
+    for (int line = block * BlockThreads + static_cast<int>(threadIdx.x); line < kL2PrefetchLines;
+         line += kQuantBlocks * BlockThreads) {
       std::uint8_t const* prefetch_address =
-          reinterpret_cast<std::uint8_t const*>(l2t_smoothed) +
-          line * kL2PrefetchBytes;
+          reinterpret_cast<std::uint8_t const*>(l2t_smoothed) + line * kL2PrefetchBytes;
       asm volatile("prefetch.global.L2 [%0];" : : "l"(prefetch_address));
     }
 
     float const scale = global_scale[0];
     int const row_base = block * RowsPerQuantBlock;
     int const kWorkItems = RowsPerQuantBlock * kSfCols;
-    for (int item = static_cast<int>(threadIdx.x); item < kWorkItems;
-         item += BlockThreads) {
+    for (int item = static_cast<int>(threadIdx.x); item < kWorkItems; item += BlockThreads) {
       int const row_offset = item / kSfCols;
       int const sf_col = item - row_offset * kSfCols;
       int const row = row_base + row_offset;
-      std::int64_t const sf_offset =
-          quant::get_sf_out_offset_128x4(row, sf_col, kSfCols);
+      std::int64_t const sf_offset = quant::get_sf_out_offset_128x4(row, sf_col, kSfCols);
       if (row < M) {
-        std::int64_t const vec_offset =
-            static_cast<std::int64_t>(row) * kSfCols + sf_col;
+        std::int64_t const vec_offset = static_cast<std::int64_t>(row) * kSfCols + sf_col;
         quant::Bf16x8 x_lo;
         quant::Bf16x8 x_hi;
         quant::Bf16x8 pqs_lo;
         quant::Bf16x8 pqs_hi;
         quant::loadBf16x8(x + vec_offset * quant::FAST_ELTS_PER_THREAD, x_lo);
-        quant::loadBf16x8(
-            x + vec_offset * quant::FAST_ELTS_PER_THREAD + 8, x_hi);
-        quant::loadBf16x8(
-            pre_quant_scale + sf_col * quant::FAST_ELTS_PER_THREAD, pqs_lo);
-        quant::loadBf16x8(
-            pre_quant_scale + sf_col * quant::FAST_ELTS_PER_THREAD + 8, pqs_hi);
-        xq[vec_offset] = quant::quantizeSmoothed16(
-            x_lo, x_hi, pqs_lo, pqs_hi, scale, sf + sf_offset);
+        quant::loadBf16x8(x + vec_offset * quant::FAST_ELTS_PER_THREAD + 8, x_hi);
+        quant::loadBf16x8(pre_quant_scale + sf_col * quant::FAST_ELTS_PER_THREAD, pqs_lo);
+        quant::loadBf16x8(pre_quant_scale + sf_col * quant::FAST_ELTS_PER_THREAD + 8, pqs_hi);
+        xq[vec_offset] =
+            quant::quantizeSmoothed16(x_lo, x_hi, pqs_lo, pqs_hi, scale, sf + sf_offset);
       } else {
         sf[sf_offset] = 0u;
       }
@@ -1746,16 +1580,13 @@ nvfp4_smooth_quantize_lora_down_small_m_dyn_sm120_kernel(
     int const kRemainingPaddingRows = kPaddedM - kCoveredRows;
     std::int64_t const kRemainingPaddingItems =
         static_cast<std::int64_t>(kRemainingPaddingRows) * kSfCols;
-    for (std::int64_t item =
-             static_cast<std::int64_t>(block) * BlockThreads + threadIdx.x;
+    for (std::int64_t item = static_cast<std::int64_t>(block) * BlockThreads + threadIdx.x;
          item < kRemainingPaddingItems;
          item += static_cast<std::int64_t>(kQuantBlocks) * BlockThreads) {
       int const padding_row = static_cast<int>(item / kSfCols);
-      int const sf_col =
-          static_cast<int>(item - static_cast<std::int64_t>(padding_row) * kSfCols);
+      int const sf_col = static_cast<int>(item - static_cast<std::int64_t>(padding_row) * kSfCols);
       int const row = kCoveredRows + padding_row;
-      std::int64_t const sf_offset =
-          quant::get_sf_out_offset_128x4(row, sf_col, kSfCols);
+      std::int64_t const sf_offset = quant::get_sf_out_offset_128x4(row, sf_col, kSfCols);
       sf[sf_offset] = 0u;
     }
     return;
@@ -1800,25 +1631,20 @@ nvfp4_smooth_quantize_lora_down_small_m_dyn_sm120_kernel(
       a3 = base::load_bf16_pair(a_upper + 8);
     }
 
-    quant::Type const* b_base =
-        l2t_smoothed + (k_base + pair_col) * kRank + b_col;
+    quant::Type const* b_base = l2t_smoothed + (k_base + pair_col) * kRank + b_col;
 #pragma unroll
     for (int fragment = 0; fragment < kNFragments; ++fragment) {
       quant::Type const* b_fragment = b_base + fragment * kMmaN;
-      std::uint32_t const b0 =
-          base::pack_bf16_pair(b_fragment, b_fragment + kRank);
-      std::uint32_t const b1 = base::pack_bf16_pair(
-          b_fragment + 8 * kRank, b_fragment + 9 * kRank);
-      base::mma_m16n8k16_row_col(
-          d[fragment][0], d[fragment][1], d[fragment][2], d[fragment][3],
-          a0, a1, a2, a3, b0, b1);
+      std::uint32_t const b0 = base::pack_bf16_pair(b_fragment, b_fragment + kRank);
+      std::uint32_t const b1 = base::pack_bf16_pair(b_fragment + 8 * kRank, b_fragment + 9 * kRank);
+      base::mma_m16n8k16_row_col(d[fragment][0], d[fragment][1], d[fragment][2], d[fragment][3], a0,
+                                 a1, a2, a3, b0, b1);
     }
   }
 
 #pragma unroll
   for (int fragment = 0; fragment < kNFragments; ++fragment) {
-    int const output0 =
-        group * DownTileCols + fragment * kMmaN + pair_col;
+    int const output0 = group * DownTileCols + fragment * kMmaN + pair_col;
     int const output1 = output0 + 8 * DownTileCols;
     *reinterpret_cast<float2*>(&accumulator_tiles[warp][output0]) =
         make_float2(d[fragment][0], d[fragment][1]);
@@ -1851,14 +1677,15 @@ nvfp4_smooth_quantize_lora_down_small_m_dyn_sm120_kernel(
 // everything derived from it are arguments, so one instantiation per tiling
 // serves every shape whose K divides the warp split.
 template <int BlockThreads, int DownTileCols, int RowsPerQuantBlock>
-inline cudaError_t launch_small_m_dyn_kernel(
-    void const* x, void const* pre_quant_scale, float const* global_scale, void* xq,
-    void* sf, void const* l2t_smoothed, void* down, int m, int k, cudaStream_t stream) {
+inline cudaError_t launch_small_m_dyn_kernel(void const* x, void const* pre_quant_scale,
+                                             float const* global_scale, void* xq, void* sf,
+                                             void const* l2t_smoothed, void* down, int m, int k,
+                                             cudaStream_t stream) {
   constexpr int kDownWarps = BlockThreads / 32;
   constexpr int kNFragments = DownTileCols / kMmaN;
   constexpr int kDownNTiles = kRank / DownTileCols;
-  if constexpr (BlockThreads % 32 || kDownWarps <= 0 || DownTileCols % kMmaN ||
-                kNFragments <= 0 || kDownNTiles * DownTileCols != kRank) {
+  if constexpr (BlockThreads % 32 || kDownWarps <= 0 || DownTileCols % kMmaN || kNFragments <= 0 ||
+                kDownNTiles * DownTileCols != kRank) {
     return cudaErrorInvalidValue;
   } else {
     // What SmallMLaunchGeometry asserted at compile time is a precondition here.
@@ -1869,14 +1696,12 @@ inline cudaError_t launch_small_m_dyn_kernel(
     int const quant_blocks = (m + RowsPerQuantBlock - 1) / RowsPerQuantBlock;
     if (quant_blocks * RowsPerQuantBlock > padded_m) return cudaErrorInvalidValue;
     int const grid_blocks = quant_blocks + ((m + 15) / 16) * kDownNTiles;
-    nvfp4_smooth_quantize_lora_down_small_m_dyn_sm120_kernel<
-        BlockThreads, DownTileCols, RowsPerQuantBlock>
+    nvfp4_smooth_quantize_lora_down_small_m_dyn_sm120_kernel<BlockThreads, DownTileCols,
+                                                             RowsPerQuantBlock>
         <<<grid_blocks, BlockThreads, 0, stream>>>(
-            static_cast<quant::Type const*>(x),
-            static_cast<quant::Type const*>(pre_quant_scale), global_scale,
-            static_cast<std::uint64_t*>(xq), static_cast<std::uint8_t*>(sf),
-            static_cast<quant::Type const*>(l2t_smoothed),
-            static_cast<quant::Type*>(down), m, k);
+            static_cast<quant::Type const*>(x), static_cast<quant::Type const*>(pre_quant_scale),
+            global_scale, static_cast<std::uint64_t*>(xq), static_cast<std::uint8_t*>(sf),
+            static_cast<quant::Type const*>(l2t_smoothed), static_cast<quant::Type*>(down), m, k);
     return cudaGetLastError();
   }
 }
@@ -1896,24 +1721,17 @@ constexpr int kQuantThreads = kBlockThreads - kDownWarps * 32;
 
 __device__ __forceinline__ std::uint64_t make_l2_evict_first_policy() {
   std::uint64_t policy;
-  asm volatile(
-      "createpolicy.fractional.L2::evict_first.b64 %0, 1.0;\n"
-      : "=l"(policy));
+  asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;\n" : "=l"(policy));
   return policy;
 }
 
-
-
 template <bool UsePackedStore>
-__device__ __forceinline__ void store_down_pair(
-    quant::Type* destination, float low, float high) {
+__device__ __forceinline__ void store_down_pair(quant::Type* destination, float low, float high) {
   if constexpr (UsePackedStore) {
     __nv_bfloat162_raw const packed =
-        static_cast<__nv_bfloat162_raw>(
-            __floats2bfloat162_rn(low, high));
+        static_cast<__nv_bfloat162_raw>(__floats2bfloat162_rn(low, high));
     *reinterpret_cast<std::uint32_t*>(destination) =
-        static_cast<std::uint32_t>(packed.x) |
-        (static_cast<std::uint32_t>(packed.y) << 16);
+        static_cast<std::uint32_t>(packed.x) | (static_cast<std::uint32_t>(packed.y) << 16);
   } else {
     destination[0] = __float2bfloat16_rn(low);
     destination[1] = __float2bfloat16_rn(high);
@@ -1921,31 +1739,24 @@ __device__ __forceinline__ void store_down_pair(
 }
 
 template <int M, int K, int BlockThreads = kBlockThreads,
-          int KernelTileM = (K >= 8192 ? 80 : kTileM),
-          int KernelTileK = 128>
-__device__ __forceinline__ void copy_x_tile_async(
-    quant::Type const* __restrict__ x, quant::Type* __restrict__ x_tile,
-    int row_base, int tile_k, int thread, std::uint64_t l2_policy) {
+          int KernelTileM = (K >= 8192 ? 80 : kTileM), int KernelTileK = 128>
+__device__ __forceinline__ void copy_x_tile_async(quant::Type const* __restrict__ x,
+                                                  quant::Type* __restrict__ x_tile, int row_base,
+                                                  int tile_k, int thread, std::uint64_t l2_policy) {
   constexpr int kKernelTileM = KernelTileM;
   constexpr bool kUseStreamingX = K >= 8192;
-  constexpr int kKernelQuantThreads =
-      BlockThreads - kDownWarps * 32;
-  constexpr int kLoadThreads = K >= 8192
-                                   ? kKernelQuantThreads
-                                   : BlockThreads;
+  constexpr int kKernelQuantThreads = BlockThreads - kDownWarps * 32;
+  constexpr int kLoadThreads = K >= 8192 ? kKernelQuantThreads : BlockThreads;
   constexpr int kTileK = KernelTileK;
   constexpr int kTileStride = kTileK + 8;
   constexpr int kLoadItems = kKernelTileM * kTileK / 8;
-  int const load_thread =
-      K >= 8192 ? thread - kDownWarps * 32 : thread;
-  for (int item = load_thread; item >= 0 && item < kLoadItems;
-       item += kLoadThreads) {
+  int const load_thread = K >= 8192 ? thread - kDownWarps * 32 : thread;
+  for (int item = load_thread; item >= 0 && item < kLoadItems; item += kLoadThreads) {
     int const load_row = item / (kTileK / 8);
     int const load_col = (item % (kTileK / 8)) * 8;
     int const global_row = row_base + load_row;
     quant::Type const* source =
-        x + static_cast<std::int64_t>(global_row < M ? global_row : 0) * K +
-        tile_k + load_col;
+        x + static_cast<std::int64_t>(global_row < M ? global_row : 0) * K + tile_k + load_col;
     quant::Type* destination = x_tile + load_row * kTileStride + load_col;
     std::uint32_t const shared_address =
         static_cast<std::uint32_t>(__cvta_generic_to_shared(destination));
@@ -1955,35 +1766,30 @@ __device__ __forceinline__ void copy_x_tile_async(
           "cp.async.cg.shared.global.L2::cache_hint "
           "[%0], [%1], 16, %2, %3;\n"
           :
-          : "r"(shared_address), "l"(source), "r"(source_bytes),
-            "l"(l2_policy));
+          : "r"(shared_address), "l"(source), "r"(source_bytes), "l"(l2_policy));
     } else {
-      asm volatile(
-          "cp.async.cg.shared.global [%0], [%1], 16, %2;\n"
-          :
-          : "r"(shared_address), "l"(source), "r"(source_bytes));
+      asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n"
+                   :
+                   : "r"(shared_address), "l"(source), "r"(source_bytes));
     }
   }
 }
 
 template <int K, int KernelTileK = 128>
 __device__ __forceinline__ void copy_pre_quant_scale_tile_async(
-    quant::Type const* __restrict__ pre_quant_scale,
-    quant::Type* __restrict__ scale_tile, int tile_k, int thread) {
+    quant::Type const* __restrict__ pre_quant_scale, quant::Type* __restrict__ scale_tile,
+    int tile_k, int thread) {
   constexpr int kTileK = KernelTileK;
   constexpr int kLoadItems = kTileK / 8;
-  int const load_thread =
-      K >= 8192 ? thread - kDownWarps * 32 : thread;
+  int const load_thread = K >= 8192 ? thread - kDownWarps * 32 : thread;
   if (load_thread >= 0 && load_thread < kLoadItems) {
-    quant::Type const* source =
-        pre_quant_scale + tile_k + load_thread * 8;
+    quant::Type const* source = pre_quant_scale + tile_k + load_thread * 8;
     quant::Type* destination = scale_tile + load_thread * 8;
     std::uint32_t const shared_address =
         static_cast<std::uint32_t>(__cvta_generic_to_shared(destination));
-    asm volatile(
-        "cp.async.cg.shared.global [%0], [%1], 16;\n"
-        :
-        : "r"(shared_address), "l"(source));
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n"
+                 :
+                 : "r"(shared_address), "l"(source));
   }
 }
 
@@ -1996,10 +1802,9 @@ __device__ __forceinline__ void wait_x_tile_async() {
 }
 
 template <int M, int K, int BlockThreads = kBlockThreads,
-          int KernelTileM = (K >= 8192 ? 80 : kTileM),
-          int KernelTileK = 128>
-__global__ __launch_bounds__(BlockThreads) void
-nvfp4_smooth_quantize_lora_down_large_m_sm120_kernel(
+          int KernelTileM = (K >= 8192 ? 80 : kTileM), int KernelTileK = 128>
+__global__
+__launch_bounds__(BlockThreads) void nvfp4_smooth_quantize_lora_down_large_m_sm120_kernel(
     quant::Type const* __restrict__ x, quant::Type const* __restrict__ pre_quant_scale,
     float const* __restrict__ global_scale, std::uint64_t* __restrict__ xq,
     std::uint8_t* __restrict__ sf, quant::Type const* __restrict__ l2t_smoothed,
@@ -2007,21 +1812,17 @@ nvfp4_smooth_quantize_lora_down_large_m_sm120_kernel(
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1200)
   constexpr int kKernelTileM = KernelTileM;
   constexpr bool kUseStreamingX = K >= 8192;
-  constexpr int kKernelQuantThreads =
-      BlockThreads - kDownWarps * 32;
+  constexpr int kKernelQuantThreads = BlockThreads - kDownWarps * 32;
   constexpr int kTileK = KernelTileK;
   constexpr int kTileStride = kTileK + 8;
   constexpr int kSfColsPerTile = kTileK / quant::SF_VEC_SIZE;
   constexpr int kPaddedM = (M + 127) / 128 * 128;
   static_assert(K % kTileK == 0);
-  static_assert(
-      (kKernelTileM * kSfColsPerTile) % kKernelQuantThreads == 0);
+  static_assert((kKernelTileM * kSfColsPerTile) % kKernelQuantThreads == 0);
   constexpr int kSfCols = K / quant::SF_VEC_SIZE;
-  __shared__ __align__(16) quant::Type
-      x_tiles[2][kKernelTileM * kTileStride];
+  __shared__ __align__(16) quant::Type x_tiles[2][kKernelTileM * kTileStride];
   __shared__ __align__(16) quant::Type scale_tiles[2][kTileK];
-  __shared__ __align__(4) std::uint8_t
-      sf_tiles[2][K >= 8192 ? kKernelTileM * kSfColsPerTile : 1];
+  __shared__ __align__(4) std::uint8_t sf_tiles[2][K >= 8192 ? kKernelTileM * kSfColsPerTile : 1];
 
   int const thread = static_cast<int>(threadIdx.x);
   int const warp = thread / 32;
@@ -2038,12 +1839,10 @@ nvfp4_smooth_quantize_lora_down_large_m_sm120_kernel(
     constexpr int kL2Bytes = K * kRank * sizeof(quant::Type);
     constexpr int kL2PrefetchLines = kL2Bytes / kL2PrefetchBytes;
     static_assert(kL2Bytes % kL2PrefetchBytes == 0);
-    int const prefetch_line =
-        static_cast<int>(blockIdx.x) * BlockThreads + thread;
+    int const prefetch_line = static_cast<int>(blockIdx.x) * BlockThreads + thread;
     if (prefetch_line < kL2PrefetchLines) {
       std::uint8_t const* prefetch_address =
-          reinterpret_cast<std::uint8_t const*>(l2t_smoothed) +
-          prefetch_line * kL2PrefetchBytes;
+          reinterpret_cast<std::uint8_t const*>(l2t_smoothed) + prefetch_line * kL2PrefetchBytes;
       asm volatile("prefetch.global.L2 [%0];" : : "l"(prefetch_address));
     }
   }
@@ -2071,10 +1870,9 @@ nvfp4_smooth_quantize_lora_down_large_m_sm120_kernel(
   float d18 = 0.0f;
   float d19 = 0.0f;
 
-  copy_x_tile_async<M, K, BlockThreads, KernelTileM, KernelTileK>(
-      x, x_tiles[0], row_base, 0, thread, l2_evict_first_policy);
-  copy_pre_quant_scale_tile_async<K, KernelTileK>(
-      pre_quant_scale, scale_tiles[0], 0, thread);
+  copy_x_tile_async<M, K, BlockThreads, KernelTileM, KernelTileK>(x, x_tiles[0], row_base, 0,
+                                                                  thread, l2_evict_first_policy);
+  copy_pre_quant_scale_tile_async<K, KernelTileK>(pre_quant_scale, scale_tiles[0], 0, thread);
   commit_x_tile_async();
   wait_x_tile_async();
   __syncthreads();
@@ -2086,10 +1884,9 @@ nvfp4_smooth_quantize_lora_down_large_m_sm120_kernel(
     int const next_buffer = tile_buffer ^ 1;
     if (next_tile_k < K) {
       copy_x_tile_async<M, K, BlockThreads, KernelTileM, KernelTileK>(
-          x, x_tiles[next_buffer], row_base, next_tile_k, thread,
-          l2_evict_first_policy);
-      copy_pre_quant_scale_tile_async<K, KernelTileK>(
-          pre_quant_scale, scale_tiles[next_buffer], next_tile_k, thread);
+          x, x_tiles[next_buffer], row_base, next_tile_k, thread, l2_evict_first_policy);
+      copy_pre_quant_scale_tile_async<K, KernelTileK>(pre_quant_scale, scale_tiles[next_buffer],
+                                                      next_tile_k, thread);
       commit_x_tile_async();
     }
     quant::Type const* x_tile = x_tiles[tile_buffer];
@@ -2099,116 +1896,86 @@ nvfp4_smooth_quantize_lora_down_large_m_sm120_kernel(
     if (warp < kDownWarps) {
 #pragma unroll
       for (int local_k = 0; local_k < kTileK; local_k += 16) {
-        quant::Type const* a_base =
-            x_tile + group * kTileStride + local_k + pair_col;
+        quant::Type const* a_base = x_tile + group * kTileStride + local_k + pair_col;
         std::uint32_t const a0 = base::load_bf16_pair(a_base);
         std::uint32_t const a1 = base::load_bf16_pair(a_base + 8 * kTileStride);
         std::uint32_t const a2 = base::load_bf16_pair(a_base + 8);
-        std::uint32_t const a3 =
-            base::load_bf16_pair(a_base + 8 * kTileStride + 8);
+        std::uint32_t const a3 = base::load_bf16_pair(a_base + 8 * kTileStride + 8);
 
         int const b_col = warp * 8 + group;
         int const b_row = tile_k + local_k + pair_col;
-        quant::Type const* b_base =
-            l2t_smoothed + b_row * kRank + b_col;
-        std::uint32_t const b0 =
-            base::pack_bf16_pair(b_base, b_base + kRank);
-        std::uint32_t const b1 =
-            base::pack_bf16_pair(b_base + 8 * kRank, b_base + 9 * kRank);
-        base::mma_m16n8k16_row_col(
-            d0, d1, d2, d3, a0, a1, a2, a3, b0, b1);
+        quant::Type const* b_base = l2t_smoothed + b_row * kRank + b_col;
+        std::uint32_t const b0 = base::pack_bf16_pair(b_base, b_base + kRank);
+        std::uint32_t const b1 = base::pack_bf16_pair(b_base + 8 * kRank, b_base + 9 * kRank);
+        base::mma_m16n8k16_row_col(d0, d1, d2, d3, a0, a1, a2, a3, b0, b1);
         if constexpr (kKernelTileM >= 32) {
           quant::Type const* a_upper = a_base + 16 * kTileStride;
           std::uint32_t const a4 = base::load_bf16_pair(a_upper);
-          std::uint32_t const a5 =
-              base::load_bf16_pair(a_upper + 8 * kTileStride);
+          std::uint32_t const a5 = base::load_bf16_pair(a_upper + 8 * kTileStride);
           std::uint32_t const a6 = base::load_bf16_pair(a_upper + 8);
-          std::uint32_t const a7 =
-              base::load_bf16_pair(a_upper + 8 * kTileStride + 8);
-          base::mma_m16n8k16_row_col(
-              d4, d5, d6, d7, a4, a5, a6, a7, b0, b1);
+          std::uint32_t const a7 = base::load_bf16_pair(a_upper + 8 * kTileStride + 8);
+          base::mma_m16n8k16_row_col(d4, d5, d6, d7, a4, a5, a6, a7, b0, b1);
         }
         if constexpr (kKernelTileM >= 48) {
           quant::Type const* a_lower = a_base + 32 * kTileStride;
           std::uint32_t const a8 = base::load_bf16_pair(a_lower);
-          std::uint32_t const a9 =
-              base::load_bf16_pair(a_lower + 8 * kTileStride);
+          std::uint32_t const a9 = base::load_bf16_pair(a_lower + 8 * kTileStride);
           std::uint32_t const a10 = base::load_bf16_pair(a_lower + 8);
-          std::uint32_t const a11 =
-              base::load_bf16_pair(a_lower + 8 * kTileStride + 8);
-          base::mma_m16n8k16_row_col(
-              d8, d9, d10, d11, a8, a9, a10, a11, b0, b1);
+          std::uint32_t const a11 = base::load_bf16_pair(a_lower + 8 * kTileStride + 8);
+          base::mma_m16n8k16_row_col(d8, d9, d10, d11, a8, a9, a10, a11, b0, b1);
         }
         if constexpr (kKernelTileM >= 64) {
           quant::Type const* a_bottom = a_base + 48 * kTileStride;
           std::uint32_t const a12 = base::load_bf16_pair(a_bottom);
-          std::uint32_t const a13 =
-              base::load_bf16_pair(a_bottom + 8 * kTileStride);
+          std::uint32_t const a13 = base::load_bf16_pair(a_bottom + 8 * kTileStride);
           std::uint32_t const a14 = base::load_bf16_pair(a_bottom + 8);
-          std::uint32_t const a15 =
-              base::load_bf16_pair(a_bottom + 8 * kTileStride + 8);
-          base::mma_m16n8k16_row_col(
-              d12, d13, d14, d15, a12, a13, a14, a15, b0, b1);
+          std::uint32_t const a15 = base::load_bf16_pair(a_bottom + 8 * kTileStride + 8);
+          base::mma_m16n8k16_row_col(d12, d13, d14, d15, a12, a13, a14, a15, b0, b1);
         }
         if constexpr (kKernelTileM >= 80) {
           quant::Type const* a_tail = a_base + 64 * kTileStride;
           std::uint32_t const a16 = base::load_bf16_pair(a_tail);
-          std::uint32_t const a17 =
-              base::load_bf16_pair(a_tail + 8 * kTileStride);
+          std::uint32_t const a17 = base::load_bf16_pair(a_tail + 8 * kTileStride);
           std::uint32_t const a18 = base::load_bf16_pair(a_tail + 8);
-          std::uint32_t const a19 =
-              base::load_bf16_pair(a_tail + 8 * kTileStride + 8);
-          base::mma_m16n8k16_row_col(
-              d16, d17, d18, d19, a16, a17, a18, a19, b0, b1);
+          std::uint32_t const a19 = base::load_bf16_pair(a_tail + 8 * kTileStride + 8);
+          base::mma_m16n8k16_row_col(d16, d17, d18, d19, a16, a17, a18, a19, b0, b1);
         }
       }
     } else {
       constexpr int kQuantItems = kKernelTileM * kSfColsPerTile;
-      for (int quant_item = thread - kDownWarps * 32;
-           quant_item < kQuantItems;
+      for (int quant_item = thread - kDownWarps * 32; quant_item < kQuantItems;
            quant_item += kKernelQuantThreads) {
         int const row_offset = quant_item / kSfColsPerTile;
-        int const sf_in_tile =
-            quant_item - row_offset * kSfColsPerTile;
+        int const sf_in_tile = quant_item - row_offset * kSfColsPerTile;
         int const row = row_base + row_offset;
-        int const sf_col =
-            tile_k / quant::SF_VEC_SIZE + sf_in_tile;
+        int const sf_col = tile_k / quant::SF_VEC_SIZE + sf_in_tile;
         if (row < M) {
           quant::Bf16x8 x_lo;
           quant::Bf16x8 x_hi;
           quant::Bf16x8 pqs_lo;
           quant::Bf16x8 pqs_hi;
           quant::Type const* tile_ptr =
-              x_tile + row_offset * kTileStride +
-              sf_in_tile * quant::FAST_ELTS_PER_THREAD;
+              x_tile + row_offset * kTileStride + sf_in_tile * quant::FAST_ELTS_PER_THREAD;
           quant::loadBf16x8(tile_ptr, x_lo);
           quant::loadBf16x8(tile_ptr + 8, x_hi);
-          quant::Type const* pqs_ptr =
-              scale_tile + sf_in_tile * quant::FAST_ELTS_PER_THREAD;
+          quant::Type const* pqs_ptr = scale_tile + sf_in_tile * quant::FAST_ELTS_PER_THREAD;
           quant::loadBf16x8(pqs_ptr, pqs_lo);
           quant::loadBf16x8(pqs_ptr + 8, pqs_hi);
-          std::int64_t const vec_offset =
-              static_cast<std::int64_t>(row) * kSfCols + sf_col;
+          std::int64_t const vec_offset = static_cast<std::int64_t>(row) * kSfCols + sf_col;
           if constexpr (K >= 8192) {
-            xq[vec_offset] = quant::quantizeSmoothed16(
-                x_lo, x_hi, pqs_lo, pqs_hi, scale,
-                sf_tile + quant_item);
+            xq[vec_offset] =
+                quant::quantizeSmoothed16(x_lo, x_hi, pqs_lo, pqs_hi, scale, sf_tile + quant_item);
           } else {
-            std::int64_t const sf_offset =
-                quant::get_sf_out_offset_128x4(
-                    row, sf_col, kSfCols);
-            std::uint64_t const quantized = quant::quantizeSmoothed16(
-                x_lo, x_hi, pqs_lo, pqs_hi, scale,
-                sf + sf_offset);
+            std::int64_t const sf_offset = quant::get_sf_out_offset_128x4(row, sf_col, kSfCols);
+            std::uint64_t const quantized =
+                quant::quantizeSmoothed16(x_lo, x_hi, pqs_lo, pqs_hi, scale, sf + sf_offset);
             xq[vec_offset] = quantized;
           }
         } else if (row < kPaddedM) {
           if constexpr (K >= 8192) {
             sf_tile[quant_item] = 0u;
           } else {
-            std::int64_t const sf_offset =
-                quant::get_sf_out_offset_128x4(
-                    row, sf_col, kSfCols);
+            std::int64_t const sf_offset = quant::get_sf_out_offset_128x4(row, sf_col, kSfCols);
             sf[sf_offset] = 0u;
           }
         }
@@ -2220,25 +1987,18 @@ nvfp4_smooth_quantize_lora_down_large_m_sm120_kernel(
     if constexpr (K >= 8192) {
       __syncthreads();
       constexpr int kSfGroupsPerTile = kSfColsPerTile / 4;
-      constexpr int kSfStoresPerTile =
-          kKernelTileM * kSfGroupsPerTile;
-      for (int sf_store = thread - kDownWarps * 32;
-           sf_store >= 0 && sf_store < kSfStoresPerTile;
+      constexpr int kSfStoresPerTile = kKernelTileM * kSfGroupsPerTile;
+      for (int sf_store = thread - kDownWarps * 32; sf_store >= 0 && sf_store < kSfStoresPerTile;
            sf_store += kKernelQuantThreads) {
-        int const row_offset =
-            sf_store / kSfGroupsPerTile;
-        int const sf_group =
-            sf_store - row_offset * kSfGroupsPerTile;
+        int const row_offset = sf_store / kSfGroupsPerTile;
+        int const sf_group = sf_store - row_offset * kSfGroupsPerTile;
         int const row = row_base + row_offset;
-        int const sf_col =
-            tile_k / quant::SF_VEC_SIZE + sf_group * 4;
+        int const sf_col = tile_k / quant::SF_VEC_SIZE + sf_group * 4;
         if (row < kPaddedM) {
-          std::int64_t const sf_offset =
-              quant::get_sf_out_offset_128x4(
-                  row, sf_col, kSfCols);
+          std::int64_t const sf_offset = quant::get_sf_out_offset_128x4(row, sf_col, kSfCols);
           *reinterpret_cast<std::uint32_t*>(sf + sf_offset) =
-              *reinterpret_cast<std::uint32_t const*>(
-                  sf_tile + row_offset * kSfColsPerTile + sf_group * 4);
+              *reinterpret_cast<std::uint32_t const*>(sf_tile + row_offset * kSfColsPerTile +
+                                                      sf_group * 4);
         }
       }
       if (next_tile_k < K) {
@@ -2256,59 +2016,49 @@ nvfp4_smooth_quantize_lora_down_large_m_sm120_kernel(
     int const row1 = row0 + 8;
     int const col = warp * 8 + pair_col;
     if (row0 < M) {
-      store_down_pair<kUsePackedDownStore>(
-          down + row0 * kRank + col, d0, d1);
+      store_down_pair<kUsePackedDownStore>(down + row0 * kRank + col, d0, d1);
     }
     if (row1 < M) {
-      store_down_pair<kUsePackedDownStore>(
-          down + row1 * kRank + col, d2, d3);
+      store_down_pair<kUsePackedDownStore>(down + row1 * kRank + col, d2, d3);
     }
     if constexpr (kKernelTileM >= 32) {
       int const row2 = row0 + 16;
       int const row3 = row0 + 24;
       if (row2 < M) {
-        store_down_pair<kUsePackedDownStore>(
-            down + row2 * kRank + col, d4, d5);
+        store_down_pair<kUsePackedDownStore>(down + row2 * kRank + col, d4, d5);
       }
       if (row3 < M) {
-        store_down_pair<kUsePackedDownStore>(
-            down + row3 * kRank + col, d6, d7);
+        store_down_pair<kUsePackedDownStore>(down + row3 * kRank + col, d6, d7);
       }
     }
     if constexpr (kKernelTileM >= 48) {
       int const row4 = row0 + 32;
       int const row5 = row0 + 40;
       if (row4 < M) {
-        store_down_pair<kUsePackedDownStore>(
-            down + row4 * kRank + col, d8, d9);
+        store_down_pair<kUsePackedDownStore>(down + row4 * kRank + col, d8, d9);
       }
       if (row5 < M) {
-        store_down_pair<kUsePackedDownStore>(
-            down + row5 * kRank + col, d10, d11);
+        store_down_pair<kUsePackedDownStore>(down + row5 * kRank + col, d10, d11);
       }
     }
     if constexpr (kKernelTileM >= 64) {
       int const row6 = row0 + 48;
       int const row7 = row0 + 56;
       if (row6 < M) {
-        store_down_pair<kUsePackedDownStore>(
-            down + row6 * kRank + col, d12, d13);
+        store_down_pair<kUsePackedDownStore>(down + row6 * kRank + col, d12, d13);
       }
       if (row7 < M) {
-        store_down_pair<kUsePackedDownStore>(
-            down + row7 * kRank + col, d14, d15);
+        store_down_pair<kUsePackedDownStore>(down + row7 * kRank + col, d14, d15);
       }
     }
     if constexpr (kKernelTileM >= 80) {
       int const row8 = row0 + 64;
       int const row9 = row0 + 72;
       if (row8 < M) {
-        store_down_pair<kUsePackedDownStore>(
-            down + row8 * kRank + col, d16, d17);
+        store_down_pair<kUsePackedDownStore>(down + row8 * kRank + col, d16, d17);
       }
       if (row9 < M) {
-        store_down_pair<kUsePackedDownStore>(
-            down + row9 * kRank + col, d18, d19);
+        store_down_pair<kUsePackedDownStore>(down + row9 * kRank + col, d18, d19);
       }
     }
   }
@@ -2371,10 +2121,9 @@ constexpr bool geometry_is_valid(int M, int K, int BlockThreads, int TileM, int 
   int const grid_blocks = (padded_m + TileM - 1) / TileM;
   int const prefetch_lines = K * kRank * static_cast<int>(sizeof(quant::Type)) / 128;
   if (!(K < 8192 || grid_blocks * BlockThreads >= prefetch_lines)) return false;
-  int const shared_bytes =
-      2 * TileM * (TileK + 8) * static_cast<int>(sizeof(quant::Type)) +
-      2 * TileK * static_cast<int>(sizeof(quant::Type)) +
-      2 * (K >= 8192 ? TileM * sf_cols_per_tile : 1);
+  int const shared_bytes = 2 * TileM * (TileK + 8) * static_cast<int>(sizeof(quant::Type)) +
+                           2 * TileK * static_cast<int>(sizeof(quant::Type)) +
+                           2 * (K >= 8192 ? TileM * sf_cols_per_tile : 1);
   return shared_bytes <= 48 * 1024;
 }
 
@@ -2393,8 +2142,7 @@ struct KernelLaunchGeometry {
   static constexpr int kSfColsPerTile = TileK / quant::SF_VEC_SIZE;
   static constexpr int kPaddedM = (M + 127) / 128 * 128;
   static constexpr int kGridBlocks = (kPaddedM + TileM - 1) / TileM;
-  static constexpr int kL2PrefetchLines =
-      K * kRank * static_cast<int>(sizeof(quant::Type)) / 128;
+  static constexpr int kL2PrefetchLines = K * kRank * static_cast<int>(sizeof(quant::Type)) / 128;
   static constexpr int kSharedBytes =
       2 * TileM * (TileK + 8) * static_cast<int>(sizeof(quant::Type)) +
       2 * TileK * static_cast<int>(sizeof(quant::Type)) +
@@ -2438,8 +2186,7 @@ constexpr int geometry_variant_count(int M, int K, ProducerGeometry pinned) {
 // axis still runs exactly what it ran before when nothing selects a variant.
 // The rest follow the ladder's order, skipping the pinned entry and anything
 // this shape cannot legally instantiate.
-constexpr ProducerGeometry geometry_for_variant(int M, int K, ProducerGeometry pinned,
-                                                int index) {
+constexpr ProducerGeometry geometry_for_variant(int M, int K, ProducerGeometry pinned, int index) {
   if (index <= 0) return pinned;
   int seen = 0;
   for (int i = 0; i < kGeometryLadderSize; ++i) {
@@ -2465,16 +2212,13 @@ inline cudaError_t launch_large_m_kernel(void const* x, void const* pre_quant_sc
                                          cudaStream_t stream) {
   using geometry = KernelLaunchGeometry<M, K, BlockThreads, TileM, TileK>;
   nvfp4_smooth_quantize_lora_down_large_m_sm120_kernel<
-      geometry::kM, geometry::kK, geometry::kBlockThreads, geometry::kKernelTileM,
-      geometry::kTileK><<<geometry::kGridBlocks, geometry::kBlockThreads, 0, stream>>>(
-      static_cast<quant::Type const*>(x), static_cast<quant::Type const*>(pre_quant_scale),
-      global_scale, static_cast<std::uint64_t*>(xq), static_cast<std::uint8_t*>(sf),
-      static_cast<quant::Type const*>(l2t_smoothed), static_cast<quant::Type*>(down));
+      geometry::kM, geometry::kK, geometry::kBlockThreads, geometry::kKernelTileM, geometry::kTileK>
+      <<<geometry::kGridBlocks, geometry::kBlockThreads, 0, stream>>>(
+          static_cast<quant::Type const*>(x), static_cast<quant::Type const*>(pre_quant_scale),
+          global_scale, static_cast<std::uint64_t*>(xq), static_cast<std::uint8_t*>(sf),
+          static_cast<quant::Type const*>(l2t_smoothed), static_cast<quant::Type*>(down));
   return cudaGetLastError();
 }
-
-
-
 
 // ---------------------------------------------------------------------------
 // Runtime-M/K variant, built to measure what pinning M and K into the
@@ -2491,13 +2235,13 @@ enum class DynAddress { kRecompute, kAccumulate };
 
 template <int BlockThreads, bool LongK, int KernelTileM, int KernelTileK = 128,
           DynAddress Policy = DynAddress::kRecompute>
-__device__ __forceinline__ void copy_x_tile_async_dyn(
-    quant::Type const* __restrict__ x, quant::Type* __restrict__ x_tile,
-    int row_base, int tile_k, int thread, std::uint64_t l2_policy, int M, int K) {
+__device__ __forceinline__ void copy_x_tile_async_dyn(quant::Type const* __restrict__ x,
+                                                      quant::Type* __restrict__ x_tile,
+                                                      int row_base, int tile_k, int thread,
+                                                      std::uint64_t l2_policy, int M, int K) {
   constexpr int kKernelTileM = KernelTileM;
   constexpr bool kUseStreamingX = LongK;
-  constexpr int kKernelQuantThreads =
-      BlockThreads - kDownWarps * 32;
+  constexpr int kKernelQuantThreads = BlockThreads - kDownWarps * 32;
   constexpr int kLoadThreads = LongK ? kKernelQuantThreads : BlockThreads;
   constexpr int kTileK = KernelTileK;
   constexpr int kTileStride = kTileK + 8;
@@ -2515,10 +2259,8 @@ __device__ __forceinline__ void copy_x_tile_async_dyn(
     int global_row = row_base + load_row;
     std::int64_t row_offset = static_cast<std::int64_t>(global_row) * k64;
     std::int64_t const row_step = static_cast<std::int64_t>(kRowsPerStep) * k64;
-    for (int item = load_thread; item >= 0 && item < kLoadItems;
-         item += kLoadThreads) {
-      quant::Type const* source =
-          x + (global_row < M ? row_offset : 0) + tile_k + load_col;
+    for (int item = load_thread; item >= 0 && item < kLoadItems; item += kLoadThreads) {
+      quant::Type const* source = x + (global_row < M ? row_offset : 0) + tile_k + load_col;
       quant::Type* destination = x_tile + load_row * kTileStride + load_col;
       std::uint32_t const shared_address =
           static_cast<std::uint32_t>(__cvta_generic_to_shared(destination));
@@ -2528,13 +2270,11 @@ __device__ __forceinline__ void copy_x_tile_async_dyn(
             "cp.async.cg.shared.global.L2::cache_hint "
             "[%0], [%1], 16, %2, %3;\n"
             :
-            : "r"(shared_address), "l"(source), "r"(source_bytes),
-              "l"(l2_policy));
+            : "r"(shared_address), "l"(source), "r"(source_bytes), "l"(l2_policy));
       } else {
-        asm volatile(
-            "cp.async.cg.shared.global [%0], [%1], 16, %2;\n"
-            :
-            : "r"(shared_address), "l"(source), "r"(source_bytes));
+        asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n"
+                     :
+                     : "r"(shared_address), "l"(source), "r"(source_bytes));
       }
       load_row += kRowsPerStep;
       global_row += kRowsPerStep;
@@ -2542,14 +2282,12 @@ __device__ __forceinline__ void copy_x_tile_async_dyn(
     }
     return;
   }
-  for (int item = load_thread; item >= 0 && item < kLoadItems;
-       item += kLoadThreads) {
+  for (int item = load_thread; item >= 0 && item < kLoadItems; item += kLoadThreads) {
     int const load_row = item / kColsPerRow;
     int const load_col = (item % kColsPerRow) * 8;
     int const global_row = row_base + load_row;
     quant::Type const* source =
-        x + static_cast<std::int64_t>(global_row < M ? global_row : 0) * k64 +
-        tile_k + load_col;
+        x + static_cast<std::int64_t>(global_row < M ? global_row : 0) * k64 + tile_k + load_col;
     quant::Type* destination = x_tile + load_row * kTileStride + load_col;
     std::uint32_t const shared_address =
         static_cast<std::uint32_t>(__cvta_generic_to_shared(destination));
@@ -2559,41 +2297,37 @@ __device__ __forceinline__ void copy_x_tile_async_dyn(
           "cp.async.cg.shared.global.L2::cache_hint "
           "[%0], [%1], 16, %2, %3;\n"
           :
-          : "r"(shared_address), "l"(source), "r"(source_bytes),
-            "l"(l2_policy));
+          : "r"(shared_address), "l"(source), "r"(source_bytes), "l"(l2_policy));
     } else {
-      asm volatile(
-          "cp.async.cg.shared.global [%0], [%1], 16, %2;\n"
-          :
-          : "r"(shared_address), "l"(source), "r"(source_bytes));
+      asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n"
+                   :
+                   : "r"(shared_address), "l"(source), "r"(source_bytes));
     }
   }
 }
 
 template <bool LongK, int KernelTileK = 128>
 __device__ __forceinline__ void copy_pre_quant_scale_tile_async_dyn(
-    quant::Type const* __restrict__ pre_quant_scale,
-    quant::Type* __restrict__ scale_tile, int tile_k, int thread) {
+    quant::Type const* __restrict__ pre_quant_scale, quant::Type* __restrict__ scale_tile,
+    int tile_k, int thread) {
   constexpr int kTileK = KernelTileK;
   constexpr int kLoadItems = kTileK / 8;
   int const load_thread = LongK ? thread - kDownWarps * 32 : thread;
   if (load_thread >= 0 && load_thread < kLoadItems) {
-    quant::Type const* source =
-        pre_quant_scale + tile_k + load_thread * 8;
+    quant::Type const* source = pre_quant_scale + tile_k + load_thread * 8;
     quant::Type* destination = scale_tile + load_thread * 8;
     std::uint32_t const shared_address =
         static_cast<std::uint32_t>(__cvta_generic_to_shared(destination));
-    asm volatile(
-        "cp.async.cg.shared.global [%0], [%1], 16;\n"
-        :
-        : "r"(shared_address), "l"(source));
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n"
+                 :
+                 : "r"(shared_address), "l"(source));
   }
 }
 
 template <int BlockThreads, bool LongK, int KernelTileM, int KernelTileK = 128,
           DynAddress Policy = DynAddress::kRecompute>
-__global__ __launch_bounds__(BlockThreads) void
-nvfp4_smooth_quantize_lora_down_large_m_dyn_sm120_kernel(
+__global__
+__launch_bounds__(BlockThreads) void nvfp4_smooth_quantize_lora_down_large_m_dyn_sm120_kernel(
     quant::Type const* __restrict__ x, quant::Type const* __restrict__ pre_quant_scale,
     float const* __restrict__ global_scale, std::uint64_t* __restrict__ xq,
     std::uint8_t* __restrict__ sf, quant::Type const* __restrict__ l2t_smoothed,
@@ -2601,20 +2335,16 @@ nvfp4_smooth_quantize_lora_down_large_m_dyn_sm120_kernel(
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1200)
   constexpr int kKernelTileM = KernelTileM;
   constexpr bool kUseStreamingX = LongK;
-  constexpr int kKernelQuantThreads =
-      BlockThreads - kDownWarps * 32;
+  constexpr int kKernelQuantThreads = BlockThreads - kDownWarps * 32;
   constexpr int kTileK = KernelTileK;
   constexpr int kTileStride = kTileK + 8;
   constexpr int kSfColsPerTile = kTileK / quant::SF_VEC_SIZE;
   int const kPaddedM = (M + 127) / 128 * 128;
-  static_assert(
-      (kKernelTileM * kSfColsPerTile) % kKernelQuantThreads == 0);
+  static_assert((kKernelTileM * kSfColsPerTile) % kKernelQuantThreads == 0);
   int const kSfCols = K / quant::SF_VEC_SIZE;
-  __shared__ __align__(16) quant::Type
-      x_tiles[2][kKernelTileM * kTileStride];
+  __shared__ __align__(16) quant::Type x_tiles[2][kKernelTileM * kTileStride];
   __shared__ __align__(16) quant::Type scale_tiles[2][kTileK];
-  __shared__ __align__(4) std::uint8_t
-      sf_tiles[2][LongK ? kKernelTileM * kSfColsPerTile : 1];
+  __shared__ __align__(4) std::uint8_t sf_tiles[2][LongK ? kKernelTileM * kSfColsPerTile : 1];
 
   int const thread = static_cast<int>(threadIdx.x);
   int const warp = thread / 32;
@@ -2630,12 +2360,10 @@ nvfp4_smooth_quantize_lora_down_large_m_dyn_sm120_kernel(
     constexpr int kL2PrefetchBytes = 128;
     int const kL2Bytes = K * kRank * static_cast<int>(sizeof(quant::Type));
     int const kL2PrefetchLines = kL2Bytes / kL2PrefetchBytes;
-    int const prefetch_line =
-        static_cast<int>(blockIdx.x) * BlockThreads + thread;
+    int const prefetch_line = static_cast<int>(blockIdx.x) * BlockThreads + thread;
     if (prefetch_line < kL2PrefetchLines) {
       std::uint8_t const* prefetch_address =
-          reinterpret_cast<std::uint8_t const*>(l2t_smoothed) +
-          prefetch_line * kL2PrefetchBytes;
+          reinterpret_cast<std::uint8_t const*>(l2t_smoothed) + prefetch_line * kL2PrefetchBytes;
       asm volatile("prefetch.global.L2 [%0];" : : "l"(prefetch_address));
     }
   }
@@ -2665,8 +2393,8 @@ nvfp4_smooth_quantize_lora_down_large_m_dyn_sm120_kernel(
 
   copy_x_tile_async_dyn<BlockThreads, LongK, KernelTileM, KernelTileK, Policy>(
       x, x_tiles[0], row_base, 0, thread, l2_evict_first_policy, M, K);
-  copy_pre_quant_scale_tile_async_dyn<LongK, KernelTileK>(
-      pre_quant_scale, scale_tiles[0], 0, thread);
+  copy_pre_quant_scale_tile_async_dyn<LongK, KernelTileK>(pre_quant_scale, scale_tiles[0], 0,
+                                                          thread);
   commit_x_tile_async();
   wait_x_tile_async();
   __syncthreads();
@@ -2678,8 +2406,7 @@ nvfp4_smooth_quantize_lora_down_large_m_dyn_sm120_kernel(
     int const next_buffer = tile_buffer ^ 1;
     if (next_tile_k < K) {
       copy_x_tile_async_dyn<BlockThreads, LongK, KernelTileM, KernelTileK, Policy>(
-          x, x_tiles[next_buffer], row_base, next_tile_k, thread,
-          l2_evict_first_policy, M, K);
+          x, x_tiles[next_buffer], row_base, next_tile_k, thread, l2_evict_first_policy, M, K);
       copy_pre_quant_scale_tile_async_dyn<LongK, KernelTileK>(
           pre_quant_scale, scale_tiles[next_buffer], next_tile_k, thread);
       commit_x_tile_async();
@@ -2691,116 +2418,86 @@ nvfp4_smooth_quantize_lora_down_large_m_dyn_sm120_kernel(
     if (warp < kDownWarps) {
 #pragma unroll
       for (int local_k = 0; local_k < kTileK; local_k += 16) {
-        quant::Type const* a_base =
-            x_tile + group * kTileStride + local_k + pair_col;
+        quant::Type const* a_base = x_tile + group * kTileStride + local_k + pair_col;
         std::uint32_t const a0 = base::load_bf16_pair(a_base);
         std::uint32_t const a1 = base::load_bf16_pair(a_base + 8 * kTileStride);
         std::uint32_t const a2 = base::load_bf16_pair(a_base + 8);
-        std::uint32_t const a3 =
-            base::load_bf16_pair(a_base + 8 * kTileStride + 8);
+        std::uint32_t const a3 = base::load_bf16_pair(a_base + 8 * kTileStride + 8);
 
         int const b_col = warp * 8 + group;
         int const b_row = tile_k + local_k + pair_col;
-        quant::Type const* b_base =
-            l2t_smoothed + b_row * kRank + b_col;
-        std::uint32_t const b0 =
-            base::pack_bf16_pair(b_base, b_base + kRank);
-        std::uint32_t const b1 =
-            base::pack_bf16_pair(b_base + 8 * kRank, b_base + 9 * kRank);
-        base::mma_m16n8k16_row_col(
-            d0, d1, d2, d3, a0, a1, a2, a3, b0, b1);
+        quant::Type const* b_base = l2t_smoothed + b_row * kRank + b_col;
+        std::uint32_t const b0 = base::pack_bf16_pair(b_base, b_base + kRank);
+        std::uint32_t const b1 = base::pack_bf16_pair(b_base + 8 * kRank, b_base + 9 * kRank);
+        base::mma_m16n8k16_row_col(d0, d1, d2, d3, a0, a1, a2, a3, b0, b1);
         if constexpr (kKernelTileM >= 32) {
           quant::Type const* a_upper = a_base + 16 * kTileStride;
           std::uint32_t const a4 = base::load_bf16_pair(a_upper);
-          std::uint32_t const a5 =
-              base::load_bf16_pair(a_upper + 8 * kTileStride);
+          std::uint32_t const a5 = base::load_bf16_pair(a_upper + 8 * kTileStride);
           std::uint32_t const a6 = base::load_bf16_pair(a_upper + 8);
-          std::uint32_t const a7 =
-              base::load_bf16_pair(a_upper + 8 * kTileStride + 8);
-          base::mma_m16n8k16_row_col(
-              d4, d5, d6, d7, a4, a5, a6, a7, b0, b1);
+          std::uint32_t const a7 = base::load_bf16_pair(a_upper + 8 * kTileStride + 8);
+          base::mma_m16n8k16_row_col(d4, d5, d6, d7, a4, a5, a6, a7, b0, b1);
         }
         if constexpr (kKernelTileM >= 48) {
           quant::Type const* a_lower = a_base + 32 * kTileStride;
           std::uint32_t const a8 = base::load_bf16_pair(a_lower);
-          std::uint32_t const a9 =
-              base::load_bf16_pair(a_lower + 8 * kTileStride);
+          std::uint32_t const a9 = base::load_bf16_pair(a_lower + 8 * kTileStride);
           std::uint32_t const a10 = base::load_bf16_pair(a_lower + 8);
-          std::uint32_t const a11 =
-              base::load_bf16_pair(a_lower + 8 * kTileStride + 8);
-          base::mma_m16n8k16_row_col(
-              d8, d9, d10, d11, a8, a9, a10, a11, b0, b1);
+          std::uint32_t const a11 = base::load_bf16_pair(a_lower + 8 * kTileStride + 8);
+          base::mma_m16n8k16_row_col(d8, d9, d10, d11, a8, a9, a10, a11, b0, b1);
         }
         if constexpr (kKernelTileM >= 64) {
           quant::Type const* a_bottom = a_base + 48 * kTileStride;
           std::uint32_t const a12 = base::load_bf16_pair(a_bottom);
-          std::uint32_t const a13 =
-              base::load_bf16_pair(a_bottom + 8 * kTileStride);
+          std::uint32_t const a13 = base::load_bf16_pair(a_bottom + 8 * kTileStride);
           std::uint32_t const a14 = base::load_bf16_pair(a_bottom + 8);
-          std::uint32_t const a15 =
-              base::load_bf16_pair(a_bottom + 8 * kTileStride + 8);
-          base::mma_m16n8k16_row_col(
-              d12, d13, d14, d15, a12, a13, a14, a15, b0, b1);
+          std::uint32_t const a15 = base::load_bf16_pair(a_bottom + 8 * kTileStride + 8);
+          base::mma_m16n8k16_row_col(d12, d13, d14, d15, a12, a13, a14, a15, b0, b1);
         }
         if constexpr (kKernelTileM >= 80) {
           quant::Type const* a_tail = a_base + 64 * kTileStride;
           std::uint32_t const a16 = base::load_bf16_pair(a_tail);
-          std::uint32_t const a17 =
-              base::load_bf16_pair(a_tail + 8 * kTileStride);
+          std::uint32_t const a17 = base::load_bf16_pair(a_tail + 8 * kTileStride);
           std::uint32_t const a18 = base::load_bf16_pair(a_tail + 8);
-          std::uint32_t const a19 =
-              base::load_bf16_pair(a_tail + 8 * kTileStride + 8);
-          base::mma_m16n8k16_row_col(
-              d16, d17, d18, d19, a16, a17, a18, a19, b0, b1);
+          std::uint32_t const a19 = base::load_bf16_pair(a_tail + 8 * kTileStride + 8);
+          base::mma_m16n8k16_row_col(d16, d17, d18, d19, a16, a17, a18, a19, b0, b1);
         }
       }
     } else {
       constexpr int kQuantItems = kKernelTileM * kSfColsPerTile;
-      for (int quant_item = thread - kDownWarps * 32;
-           quant_item < kQuantItems;
+      for (int quant_item = thread - kDownWarps * 32; quant_item < kQuantItems;
            quant_item += kKernelQuantThreads) {
         int const row_offset = quant_item / kSfColsPerTile;
-        int const sf_in_tile =
-            quant_item - row_offset * kSfColsPerTile;
+        int const sf_in_tile = quant_item - row_offset * kSfColsPerTile;
         int const row = row_base + row_offset;
-        int const sf_col =
-            tile_k / quant::SF_VEC_SIZE + sf_in_tile;
+        int const sf_col = tile_k / quant::SF_VEC_SIZE + sf_in_tile;
         if (row < M) {
           quant::Bf16x8 x_lo;
           quant::Bf16x8 x_hi;
           quant::Bf16x8 pqs_lo;
           quant::Bf16x8 pqs_hi;
           quant::Type const* tile_ptr =
-              x_tile + row_offset * kTileStride +
-              sf_in_tile * quant::FAST_ELTS_PER_THREAD;
+              x_tile + row_offset * kTileStride + sf_in_tile * quant::FAST_ELTS_PER_THREAD;
           quant::loadBf16x8(tile_ptr, x_lo);
           quant::loadBf16x8(tile_ptr + 8, x_hi);
-          quant::Type const* pqs_ptr =
-              scale_tile + sf_in_tile * quant::FAST_ELTS_PER_THREAD;
+          quant::Type const* pqs_ptr = scale_tile + sf_in_tile * quant::FAST_ELTS_PER_THREAD;
           quant::loadBf16x8(pqs_ptr, pqs_lo);
           quant::loadBf16x8(pqs_ptr + 8, pqs_hi);
-          std::int64_t const vec_offset =
-              static_cast<std::int64_t>(row) * kSfCols + sf_col;
+          std::int64_t const vec_offset = static_cast<std::int64_t>(row) * kSfCols + sf_col;
           if constexpr (LongK) {
-            xq[vec_offset] = quant::quantizeSmoothed16(
-                x_lo, x_hi, pqs_lo, pqs_hi, scale,
-                sf_tile + quant_item);
+            xq[vec_offset] =
+                quant::quantizeSmoothed16(x_lo, x_hi, pqs_lo, pqs_hi, scale, sf_tile + quant_item);
           } else {
-            std::int64_t const sf_offset =
-                quant::get_sf_out_offset_128x4(
-                    row, sf_col, kSfCols);
-            std::uint64_t const quantized = quant::quantizeSmoothed16(
-                x_lo, x_hi, pqs_lo, pqs_hi, scale,
-                sf + sf_offset);
+            std::int64_t const sf_offset = quant::get_sf_out_offset_128x4(row, sf_col, kSfCols);
+            std::uint64_t const quantized =
+                quant::quantizeSmoothed16(x_lo, x_hi, pqs_lo, pqs_hi, scale, sf + sf_offset);
             xq[vec_offset] = quantized;
           }
         } else if (row < kPaddedM) {
           if constexpr (LongK) {
             sf_tile[quant_item] = 0u;
           } else {
-            std::int64_t const sf_offset =
-                quant::get_sf_out_offset_128x4(
-                    row, sf_col, kSfCols);
+            std::int64_t const sf_offset = quant::get_sf_out_offset_128x4(row, sf_col, kSfCols);
             sf[sf_offset] = 0u;
           }
         }
@@ -2812,25 +2509,18 @@ nvfp4_smooth_quantize_lora_down_large_m_dyn_sm120_kernel(
     if constexpr (LongK) {
       __syncthreads();
       constexpr int kSfGroupsPerTile = kSfColsPerTile / 4;
-      constexpr int kSfStoresPerTile =
-          kKernelTileM * kSfGroupsPerTile;
-      for (int sf_store = thread - kDownWarps * 32;
-           sf_store >= 0 && sf_store < kSfStoresPerTile;
+      constexpr int kSfStoresPerTile = kKernelTileM * kSfGroupsPerTile;
+      for (int sf_store = thread - kDownWarps * 32; sf_store >= 0 && sf_store < kSfStoresPerTile;
            sf_store += kKernelQuantThreads) {
-        int const row_offset =
-            sf_store / kSfGroupsPerTile;
-        int const sf_group =
-            sf_store - row_offset * kSfGroupsPerTile;
+        int const row_offset = sf_store / kSfGroupsPerTile;
+        int const sf_group = sf_store - row_offset * kSfGroupsPerTile;
         int const row = row_base + row_offset;
-        int const sf_col =
-            tile_k / quant::SF_VEC_SIZE + sf_group * 4;
+        int const sf_col = tile_k / quant::SF_VEC_SIZE + sf_group * 4;
         if (row < kPaddedM) {
-          std::int64_t const sf_offset =
-              quant::get_sf_out_offset_128x4(
-                  row, sf_col, kSfCols);
+          std::int64_t const sf_offset = quant::get_sf_out_offset_128x4(row, sf_col, kSfCols);
           *reinterpret_cast<std::uint32_t*>(sf + sf_offset) =
-              *reinterpret_cast<std::uint32_t const*>(
-                  sf_tile + row_offset * kSfColsPerTile + sf_group * 4);
+              *reinterpret_cast<std::uint32_t const*>(sf_tile + row_offset * kSfColsPerTile +
+                                                      sf_group * 4);
         }
       }
       if (next_tile_k < K) {
@@ -2848,59 +2538,49 @@ nvfp4_smooth_quantize_lora_down_large_m_dyn_sm120_kernel(
     int const row1 = row0 + 8;
     int const col = warp * 8 + pair_col;
     if (row0 < M) {
-      store_down_pair<kUsePackedDownStore>(
-          down + row0 * kRank + col, d0, d1);
+      store_down_pair<kUsePackedDownStore>(down + row0 * kRank + col, d0, d1);
     }
     if (row1 < M) {
-      store_down_pair<kUsePackedDownStore>(
-          down + row1 * kRank + col, d2, d3);
+      store_down_pair<kUsePackedDownStore>(down + row1 * kRank + col, d2, d3);
     }
     if constexpr (kKernelTileM >= 32) {
       int const row2 = row0 + 16;
       int const row3 = row0 + 24;
       if (row2 < M) {
-        store_down_pair<kUsePackedDownStore>(
-            down + row2 * kRank + col, d4, d5);
+        store_down_pair<kUsePackedDownStore>(down + row2 * kRank + col, d4, d5);
       }
       if (row3 < M) {
-        store_down_pair<kUsePackedDownStore>(
-            down + row3 * kRank + col, d6, d7);
+        store_down_pair<kUsePackedDownStore>(down + row3 * kRank + col, d6, d7);
       }
     }
     if constexpr (kKernelTileM >= 48) {
       int const row4 = row0 + 32;
       int const row5 = row0 + 40;
       if (row4 < M) {
-        store_down_pair<kUsePackedDownStore>(
-            down + row4 * kRank + col, d8, d9);
+        store_down_pair<kUsePackedDownStore>(down + row4 * kRank + col, d8, d9);
       }
       if (row5 < M) {
-        store_down_pair<kUsePackedDownStore>(
-            down + row5 * kRank + col, d10, d11);
+        store_down_pair<kUsePackedDownStore>(down + row5 * kRank + col, d10, d11);
       }
     }
     if constexpr (kKernelTileM >= 64) {
       int const row6 = row0 + 48;
       int const row7 = row0 + 56;
       if (row6 < M) {
-        store_down_pair<kUsePackedDownStore>(
-            down + row6 * kRank + col, d12, d13);
+        store_down_pair<kUsePackedDownStore>(down + row6 * kRank + col, d12, d13);
       }
       if (row7 < M) {
-        store_down_pair<kUsePackedDownStore>(
-            down + row7 * kRank + col, d14, d15);
+        store_down_pair<kUsePackedDownStore>(down + row7 * kRank + col, d14, d15);
       }
     }
     if constexpr (kKernelTileM >= 80) {
       int const row8 = row0 + 64;
       int const row9 = row0 + 72;
       if (row8 < M) {
-        store_down_pair<kUsePackedDownStore>(
-            down + row8 * kRank + col, d16, d17);
+        store_down_pair<kUsePackedDownStore>(down + row8 * kRank + col, d16, d17);
       }
       if (row9 < M) {
-        store_down_pair<kUsePackedDownStore>(
-            down + row9 * kRank + col, d18, d19);
+        store_down_pair<kUsePackedDownStore>(down + row9 * kRank + col, d18, d19);
       }
     }
   }
@@ -2911,15 +2591,14 @@ nvfp4_smooth_quantize_lora_down_large_m_dyn_sm120_kernel(
 #endif
 }
 
-
 // Runtime-M/K launch. The geometry stays a template parameter -- shared memory
 // and every unroll constant come from it -- while M and K become arguments, so
 // one instantiation serves every shape whose K divides the tile.
 template <int BlockThreads, bool LongK, int TileM, int TileK, DynAddress Policy>
 inline cudaError_t launch_large_m_dyn_kernel(void const* x, void const* pre_quant_scale,
                                              float const* global_scale, void* xq, void* sf,
-                                             void const* l2t_smoothed, void* down,
-                                             int m, int k, cudaStream_t stream) {
+                                             void const* l2t_smoothed, void* down, int m, int k,
+                                             cudaStream_t stream) {
   // KernelLaunchGeometry passes TileM straight through; the kernel's default
   // template argument (K >= 8192 ? 80 : kTileM) is never what the launcher uses.
   constexpr int kKernelTileM = TileM;
@@ -2933,8 +2612,7 @@ inline cudaError_t launch_large_m_dyn_kernel(void const* x, void const* pre_quan
       2 * kKernelTileM * (TileK + 8) * static_cast<int>(sizeof(quant::Type)) +
       2 * TileK * static_cast<int>(sizeof(quant::Type)) +
       2 * (LongK ? kKernelTileM * kSfColsPerTile : 1);
-  if constexpr ((kKernelTileM * kSfColsPerTile) % kQuantThreads != 0 ||
-                kSharedBytes > 48 * 1024) {
+  if constexpr ((kKernelTileM * kSfColsPerTile) % kQuantThreads != 0 || kSharedBytes > 48 * 1024) {
     return cudaErrorInvalidValue;
   } else {
     // What the templated kernel asserted at compile time is a precondition here.
@@ -2946,12 +2624,12 @@ inline cudaError_t launch_large_m_dyn_kernel(void const* x, void const* pre_quan
       int const l2_lines = k * kRank * static_cast<int>(sizeof(quant::Type)) / 128;
       if (grid_blocks * BlockThreads < l2_lines) return cudaErrorInvalidValue;
     }
-    nvfp4_smooth_quantize_lora_down_large_m_dyn_sm120_kernel<
-        BlockThreads, LongK, kKernelTileM, TileK, Policy>
+    nvfp4_smooth_quantize_lora_down_large_m_dyn_sm120_kernel<BlockThreads, LongK, kKernelTileM,
+                                                             TileK, Policy>
         <<<grid_blocks, BlockThreads, 0, stream>>>(
-        static_cast<quant::Type const*>(x), static_cast<quant::Type const*>(pre_quant_scale),
-        global_scale, static_cast<std::uint64_t*>(xq), static_cast<std::uint8_t*>(sf),
-        static_cast<quant::Type const*>(l2t_smoothed), static_cast<quant::Type*>(down), m, k);
+            static_cast<quant::Type const*>(x), static_cast<quant::Type const*>(pre_quant_scale),
+            global_scale, static_cast<std::uint64_t*>(xq), static_cast<std::uint8_t*>(sf),
+            static_cast<quant::Type const*>(l2t_smoothed), static_cast<quant::Type*>(down), m, k);
     return cudaGetLastError();
   }
 }
@@ -2965,9 +2643,8 @@ inline cudaError_t launch_large_m_dyn_kernel(void const* x, void const* pre_quan
 // variants must still run something correct after the cap or the ladder moves.
 template <int M, int K, int PinBlockThreads, int PinTileM, int PinTileK, int Index = 0>
 inline cudaError_t launch_large_m_variant(int geometry_variant, void const* x,
-                                          void const* pre_quant_scale,
-                                          float const* global_scale, void* xq, void* sf,
-                                          void const* l2t_smoothed, void* down,
+                                          void const* pre_quant_scale, float const* global_scale,
+                                          void* xq, void* sf, void const* l2t_smoothed, void* down,
                                           cudaStream_t stream) {
   constexpr ProducerGeometry pinned{PinBlockThreads, PinTileM, PinTileK};
   if constexpr (Index < geometry_variant_count(M, K, pinned)) {
@@ -2977,17 +2654,16 @@ inline cudaError_t launch_large_m_variant(int geometry_variant, void const* x,
       // is still resolved here, from the pin; what changed is that the kernel
       // is no longer built for this M and K, so one instantiation per geometry
       // serves every shape that selects it.
-      return launch_large_m_dyn_kernel<g.block_threads, (K >= 8192), g.tile_m,
-                                       g.tile_k, DynAddress::kRecompute>(
+      return launch_large_m_dyn_kernel<g.block_threads, (K >= 8192), g.tile_m, g.tile_k,
+                                       DynAddress::kRecompute>(
           x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, M, K, stream);
     }
     return launch_large_m_variant<M, K, PinBlockThreads, PinTileM, PinTileK, Index + 1>(
-        geometry_variant, x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down,
-        stream);
+        geometry_variant, x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, stream);
   } else {
     return launch_large_m_dyn_kernel<PinBlockThreads, (K >= 8192), PinTileM, PinTileK,
-                                     DynAddress::kRecompute>(
-        x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, M, K, stream);
+                                     DynAddress::kRecompute>(x, pre_quant_scale, global_scale, xq,
+                                                             sf, l2t_smoothed, down, M, K, stream);
   }
 }
 
@@ -2997,35 +2673,28 @@ inline cudaError_t launch_large_m_variant(int geometry_variant, void const* x,
 // every unroll constant come from it -- so this switch is over the ladder, not
 // over shapes. One instantiation per (geometry, LongK) serves every shape.
 inline cudaError_t nvfp4_smooth_quantize_lora_down_dyn_sm120(
-    void const* x, void const* pre_quant_scale, float const* global_scale, void* xq,
-    void* sf, void const* l2t_smoothed, void* down, int m, int k, int block_threads,
-    int tile_m, int tile_k, cudaStream_t stream, int address_policy = 0) {
+    void const* x, void const* pre_quant_scale, float const* global_scale, void* xq, void* sf,
+    void const* l2t_smoothed, void* down, int m, int k, int block_threads, int tile_m, int tile_k,
+    cudaStream_t stream, int address_policy = 0) {
   namespace large_m = smooth_quantize_lora_down_large_m_sm120_detail;
   using large_m::DynAddress;
   bool const long_k = k >= 8192;
   bool const accumulate = address_policy == 1;
-#define FI_SVDQ_DYN_CASE(BT, TM, TK)                                                    \
-  if (block_threads == (BT) && tile_m == (TM) && tile_k == (TK)) {                      \
-    if (long_k) {                                                                        \
-      return accumulate                                                                  \
-          ? large_m::launch_large_m_dyn_kernel<BT, true, TM, TK,                          \
-                                               DynAddress::kAccumulate>(                 \
-                x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, m, k,       \
-                stream)                                                                  \
-          : large_m::launch_large_m_dyn_kernel<BT, true, TM, TK,                          \
-                                               DynAddress::kRecompute>(                  \
-                x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, m, k,       \
-                stream);                                                                 \
-    }                                                                                    \
-    return accumulate                                                                    \
-        ? large_m::launch_large_m_dyn_kernel<BT, false, TM, TK,                           \
-                                             DynAddress::kAccumulate>(                   \
-              x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, m, k,         \
-              stream)                                                                    \
-        : large_m::launch_large_m_dyn_kernel<BT, false, TM, TK,                           \
-                                             DynAddress::kRecompute>(                    \
-              x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, m, k,         \
-              stream);                                                                   \
+#define FI_SVDQ_DYN_CASE(BT, TM, TK)                                                               \
+  if (block_threads == (BT) && tile_m == (TM) && tile_k == (TK)) {                                 \
+    if (long_k) {                                                                                  \
+      return accumulate                                                                            \
+                 ? large_m::launch_large_m_dyn_kernel<BT, true, TM, TK, DynAddress::kAccumulate>(  \
+                       x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, m, k, stream) \
+                 : large_m::launch_large_m_dyn_kernel<BT, true, TM, TK, DynAddress::kRecompute>(   \
+                       x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, m, k,         \
+                       stream);                                                                    \
+    }                                                                                              \
+    return accumulate                                                                              \
+               ? large_m::launch_large_m_dyn_kernel<BT, false, TM, TK, DynAddress::kAccumulate>(   \
+                     x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, m, k, stream)   \
+               : large_m::launch_large_m_dyn_kernel<BT, false, TM, TK, DynAddress::kRecompute>(    \
+                     x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, m, k, stream);  \
   }
   FI_SVDQ_DYN_CASE(192, 16, 512)
   FI_SVDQ_DYN_CASE(192, 32, 128)
@@ -3046,9 +2715,9 @@ inline cudaError_t nvfp4_smooth_quantize_lora_down_dyn_sm120(
 //   family 0 large-M (geometry a, b, c = block threads, tile M, tile K)
 //   family 1 small-M (tiling  a, b, c = block threads, down tile cols, rows/quant block)
 inline cudaError_t nvfp4_smooth_quantize_lora_down_family_sm120(
-    void const* x, void const* pre_quant_scale, float const* global_scale, void* xq,
-    void* sf, void const* l2t_smoothed, void* down, int m, int k, int family, int a,
-    int b, int c, int address_policy, cudaStream_t stream) {
+    void const* x, void const* pre_quant_scale, float const* global_scale, void* xq, void* sf,
+    void const* l2t_smoothed, void* down, int m, int k, int family, int a, int b, int c,
+    int address_policy, cudaStream_t stream) {
   namespace large_m = smooth_quantize_lora_down_large_m_sm120_detail;
   namespace small_m = smooth_quantize_lora_down_small_m_sm120_detail;
   using large_m::DynAddress;
@@ -3071,11 +2740,11 @@ inline cudaError_t nvfp4_smooth_quantize_lora_down_family_sm120(
     return cudaErrorInvalidValue;
   }
   if (family == 1) {
-#define FI_SVDQ_SMALL_CASE(BT, DTC, RPQB)                                             \
-    if (a == (BT) && b == (DTC) && c == (RPQB)) {                                     \
-      return small_m::launch_small_m_dyn_kernel<BT, DTC, RPQB>(                       \
-          x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, m, k, stream); \
-    }
+#define FI_SVDQ_SMALL_CASE(BT, DTC, RPQB)                                            \
+  if (a == (BT) && b == (DTC) && c == (RPQB)) {                                      \
+    return small_m::launch_small_m_dyn_kernel<BT, DTC, RPQB>(                        \
+        x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, m, k, stream); \
+  }
     FI_SVDQ_SMALL_CASE(256, 16, 4)
     FI_SVDQ_SMALL_CASE(768, 8, 8)
     FI_SVDQ_SMALL_CASE(768, 16, 16)
@@ -3087,11 +2756,10 @@ inline cudaError_t nvfp4_smooth_quantize_lora_down_family_sm120(
 #undef FI_SVDQ_SMALL_CASE
     return cudaErrorInvalidValue;
   }
-  return nvfp4_smooth_quantize_lora_down_dyn_sm120(
-      x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, m, k, a, b, c,
-      stream, address_policy);
+  return nvfp4_smooth_quantize_lora_down_dyn_sm120(x, pre_quant_scale, global_scale, xq, sf,
+                                                   l2t_smoothed, down, m, k, a, b, c, stream,
+                                                   address_policy);
 }
-
 
 inline cudaError_t nvfp4_smooth_quantize_lora_down_sm120(
     void const* x, void const* pre_quant_scale, float const* global_scale, void* xq, void* sf,
@@ -3115,8 +2783,8 @@ inline cudaError_t nvfp4_smooth_quantize_lora_down_sm120(
       // The two-fragment N tile was accepted on the shared rows 0/28 producer:
       // row28 crossed the complete-route Nsys kernel-sum gate, while row0 also
       // improved and therefore does not require an N-aware routing seam.
-      return m512::launch_m512_kernel<3072, 256, 16>(
-          x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, stream);
+      return m512::launch_m512_kernel<3072, 256, 16>(x, pre_quant_scale, global_scale, xq, sf,
+                                                     l2t_smoothed, down, stream);
     }
   }
 
@@ -3137,24 +2805,21 @@ inline cudaError_t nvfp4_smooth_quantize_lora_down_sm120(
       constexpr int tile_k = 128;
       int const grid_blocks = (padded_m + tile_m - 1) / tile_m;
       large_m::launch_large_m_dyn_kernel<block_threads, false, tile_m, tile_k,
-          large_m::DynAddress::kRecompute>(
-          x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down,
-          7800, 5120, stream);
+                                         large_m::DynAddress::kRecompute>(
+          x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, 7800, 5120, stream);
     } else if (m == 32760) {
       constexpr int block_threads = 256;
       constexpr int tile_m = 32;
       constexpr int tile_k = 256;
       int const grid_blocks = (padded_m + tile_m - 1) / tile_m;
       large_m::launch_large_m_dyn_kernel<block_threads, false, tile_m, tile_k,
-          large_m::DynAddress::kRecompute>(
-          x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down,
-          32760, 5120, stream);
+                                         large_m::DynAddress::kRecompute>(
+          x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, 32760, 5120, stream);
     } else {
       int const grid_blocks = padded_m / large_m::kTileM;
       large_m::launch_large_m_dyn_kernel<large_m::kBlockThreads, false, large_m::kTileM, 128,
-          large_m::DynAddress::kRecompute>(
-          x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down,
-          75600, 5120, stream);
+                                         large_m::DynAddress::kRecompute>(
+          x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, 75600, 5120, stream);
     }
     return cudaGetLastError();
   }
@@ -3164,9 +2829,8 @@ inline cudaError_t nvfp4_smooth_quantize_lora_down_sm120(
     constexpr int tile_m = 80;
     int const grid_blocks = (padded_m + tile_m - 1) / tile_m;
     large_m::launch_large_m_dyn_kernel<large_m::kBlockThreads, true, large_m::kTileM, 128,
-          large_m::DynAddress::kRecompute>(
-          x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down,
-          7800, 8960, stream);
+                                       large_m::DynAddress::kRecompute>(
+        x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, 7800, 8960, stream);
     return cudaGetLastError();
   }
 
@@ -3175,9 +2839,8 @@ inline cudaError_t nvfp4_smooth_quantize_lora_down_sm120(
     constexpr int tile_m = 80;
     int const grid_blocks = (padded_m + tile_m - 1) / tile_m;
     large_m::launch_large_m_dyn_kernel<large_m::kBlockThreads, true, large_m::kTileM, 128,
-          large_m::DynAddress::kRecompute>(
-          x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down,
-          32760, 8960, stream);
+                                       large_m::DynAddress::kRecompute>(
+        x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, 32760, 8960, stream);
     return cudaGetLastError();
   }
 
@@ -3185,10 +2848,8 @@ inline cudaError_t nvfp4_smooth_quantize_lora_down_sm120(
     int const padded_m = (m + 127) / 128 * 128;
     constexpr int tile_m = 80;
     int const grid_blocks = (padded_m + tile_m - 1) / tile_m;
-    large_m::launch_large_m_dyn_kernel<288, true, 80, 128,
-                                       large_m::DynAddress::kRecompute>(
-        x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, 7800, 13824,
-        stream);
+    large_m::launch_large_m_dyn_kernel<288, true, 80, 128, large_m::DynAddress::kRecompute>(
+        x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, 7800, 13824, stream);
     return cudaGetLastError();
   }
 
@@ -3197,9 +2858,8 @@ inline cudaError_t nvfp4_smooth_quantize_lora_down_sm120(
     constexpr int tile_m = 80;
     int const grid_blocks = (padded_m + tile_m - 1) / tile_m;
     large_m::launch_large_m_dyn_kernel<large_m::kBlockThreads, true, large_m::kTileM, 128,
-          large_m::DynAddress::kRecompute>(
-          x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down,
-          32760, 13824, stream);
+                                       large_m::DynAddress::kRecompute>(
+        x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, 32760, 13824, stream);
     return cudaGetLastError();
   }
 
@@ -3208,9 +2868,8 @@ inline cudaError_t nvfp4_smooth_quantize_lora_down_sm120(
     constexpr int tile_m = 80;
     int const grid_blocks = (padded_m + tile_m - 1) / tile_m;
     large_m::launch_large_m_dyn_kernel<large_m::kBlockThreads, true, large_m::kTileM, 128,
-          large_m::DynAddress::kRecompute>(
-          x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down,
-          75600, 13824, stream);
+                                       large_m::DynAddress::kRecompute>(
+        x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, 75600, 13824, stream);
     return cudaGetLastError();
   }
 
@@ -3220,19 +2879,17 @@ inline cudaError_t nvfp4_smooth_quantize_lora_down_sm120(
       constexpr int case6_tile_m = 32;
       constexpr int case6_tile_k = 256;
       constexpr int case6_block_threads = 256;
-      int const grid_blocks =
-          (padded_m + case6_tile_m - 1) / case6_tile_m;
-      large_m::launch_large_m_dyn_kernel<case6_block_threads, false, case6_tile_m,
-                                         case6_tile_k, large_m::DynAddress::kRecompute>(
+      int const grid_blocks = (padded_m + case6_tile_m - 1) / case6_tile_m;
+      large_m::launch_large_m_dyn_kernel<case6_block_threads, false, case6_tile_m, case6_tile_k,
+                                         large_m::DynAddress::kRecompute>(
           x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, 27280, 3072, stream);
     } else {
       constexpr int case7_tile_m = 32;
       constexpr int case7_tile_k = 256;
       constexpr int case7_block_threads = 384;
-      int const grid_blocks =
-          (padded_m + case7_tile_m - 1) / case7_tile_m;
-      large_m::launch_large_m_dyn_kernel<case7_block_threads, true, case7_tile_m,
-                                         case7_tile_k, large_m::DynAddress::kRecompute>(
+      int const grid_blocks = (padded_m + case7_tile_m - 1) / case7_tile_m;
+      large_m::launch_large_m_dyn_kernel<case7_block_threads, true, case7_tile_m, case7_tile_k,
+                                         large_m::DynAddress::kRecompute>(
           x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, 27280, 14336, stream);
     }
     return cudaGetLastError();
@@ -3418,8 +3075,8 @@ inline cudaError_t nvfp4_smooth_quantize_lora_down_sm120(
 
   if (k == 3072) {
     if (m == 256) {
-      return small_m::launch_small_m_dyn_kernel<768, 8, 8>(
-          x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, 256, 3072, stream);
+      return small_m::launch_small_m_dyn_kernel<768, 8, 8>(x, pre_quant_scale, global_scale, xq, sf,
+                                                           l2t_smoothed, down, 256, 3072, stream);
     }
     if (m == 6889) {
       return large_m::launch_large_m_variant<6889, 3072, 224, 48, 128>(
@@ -3488,17 +3145,17 @@ inline cudaError_t nvfp4_smooth_quantize_lora_down_sm120(
 
   if (m == 512 && k == 5120) {
     return small_m::launch_small_m_dyn_kernel<1024, 16, 16>(
-          x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, 512, 5120, stream);
+        x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, 512, 5120, stream);
   }
 
   if (m == 537 && k == 14336) {
-    return small_m::launch_small_m_dyn_kernel<896, 16, 16>(
-          x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, 537, 14336, stream);
+    return small_m::launch_small_m_dyn_kernel<896, 16, 16>(x, pre_quant_scale, global_scale, xq, sf,
+                                                           l2t_smoothed, down, 537, 14336, stream);
   }
 
   if (m == 1935 && k == 5376) {
-    return small_m::launch_small_m_dyn_kernel<896, 16, 16>(
-          x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, 1935, 5376, stream);
+    return small_m::launch_small_m_dyn_kernel<896, 16, 16>(x, pre_quant_scale, global_scale, xq, sf,
+                                                           l2t_smoothed, down, 1935, 5376, stream);
   }
 
   return cudaErrorInvalidValue;
@@ -3558,8 +3215,8 @@ inline cudaError_t nvfp4_smooth_quantize_lora_down_m512_k3072_n16_experimental_s
   // Two fused m16n8k16 N fragments per LoRA-down block. Keep the literal 16 in
   // this diagnostic seam so source review can match it to promoted production
   // without relying on a derived constant name.
-  return m512::launch_m512_kernel<3072, 256, 16>(
-      x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, stream);
+  return m512::launch_m512_kernel<3072, 256, 16>(x, pre_quant_scale, global_scale, xq, sf,
+                                                 l2t_smoothed, down, stream);
 }
 
 }  // namespace flashinfer::gemm

@@ -213,9 +213,15 @@ def gen_gemm_sm120_module_cutlass_nvfp4_svdquant(
             "requires the production tuning defaults"
         )
     row80_lora_side_slot = production_defaults and not any(
-        (row80_lora_byte_exact, lora_every_split, lora_dedicated,
-         lora_neutral_barrier, lora_smem_swizzle, stock_parity_kstep,
-         lora_ladder and not production_ladder)
+        (
+            row80_lora_byte_exact,
+            lora_every_split,
+            lora_dedicated,
+            lora_neutral_barrier,
+            lora_smem_swizzle,
+            stock_parity_kstep,
+            lora_ladder and not production_ladder,
+        )
     )
     variant = (
         ("_lora_every_split" if lora_every_split else "")
@@ -237,21 +243,26 @@ def gen_gemm_sm120_module_cutlass_nvfp4_svdquant(
         variant += "_serial_tail"
     if not variant and not lora_epi_overlap:
         variant = "_lora_serial_tail"
-    variant += "".join(_selected_items((
-        (lora_smem_swizzle, "_lora_smem_swizzle"),
-        # Rank 32 stays un-suffixed so the production module keeps its identity
-        # and its tuned cache; another rank is a separate build, the way the
-        # upstream cute-dsl path compiles one specialization per rank.
-        (lora_rank != 32, f"_rank{lora_rank}"),
-        (bool(row80_stages), f"_row80_stages{row80_stages}"),
-        (static_sched, "_static_sched"),
-        (bias_coalesced, "_bias_coalesced"),
-        # Keep the probe build cache-distinct so the production module is
-        # byte-identical to a build that never saw this flag.
-        (diagnostic_probe, "_diagnostic_probe"),
-    )))
+    variant += "".join(
+        _selected_items(
+            (
+                (lora_smem_swizzle, "_lora_smem_swizzle"),
+                # Rank 32 stays un-suffixed so the production module keeps its identity
+                # and its tuned cache; another rank is a separate build, the way the
+                # upstream cute-dsl path compiles one specialization per rank.
+                (lora_rank != 32, f"_rank{lora_rank}"),
+                (bool(row80_stages), f"_row80_stages{row80_stages}"),
+                (static_sched, "_static_sched"),
+                (bias_coalesced, "_bias_coalesced"),
+                # Keep the probe build cache-distinct so the production module is
+                # byte-identical to a build that never saw this flag.
+                (diagnostic_probe, "_diagnostic_probe"),
+            )
+        )
+    )
     gen_directory = (
-        jit_env.FLASHINFER_GEN_SRC_DIR / f"gen_gemm_sm120_cutlass_nvfp4_svdquant{variant}"
+        jit_env.FLASHINFER_GEN_SRC_DIR
+        / f"gen_gemm_sm120_cutlass_nvfp4_svdquant{variant}"
     )
     os.makedirs(gen_directory, exist_ok=True)
     source_paths = [
@@ -279,20 +290,22 @@ def gen_gemm_sm120_module_cutlass_nvfp4_svdquant(
         "production_transfer": "-DSVDQ_SM120_LORA_LADDER_TRANSFER_ONLY",
     }
     ladder_flag = ladder_flags.get(lora_ladder)
-    variant_flags = _selected_items((
-        (lora_every_split, "-DSVDQ_SM120_LORA_EVERY_SPLIT"),
-        (lora_dedicated, "-DSVDQ_SM120_LORA_DEDICATED"),
-        (bool(ladder_flag), ladder_flag or ""),
-        (production_ladder, "-DSVDQ_SM120_ROW80_PRODUCTION_PARITY"),
-        (lora_neutral_barrier, "-DSVDQ_SM120_LORA_NEUTRAL_BARRIER"),
-        (lora_epi_overlap, "-DSVDQ_SM120_LORA_EPI_OVERLAP"),
-        (static_sched, "-DSVDQ_SM120_STATIC_SCHED"),
-        (bias_coalesced, "-DSVDQ_SM120_BIAS_COALESCED"),
-        (lora_true_rank_tail, "-DSVDQ_SM120_LORA_TRUE_RANK_TAIL"),
-        (lora_smem_swizzle, "-DSVDQ_SM120_LORA_SMEM_SWIZZLE"),
-        (row80_lora_side_slot, "-DSVDQ_SM120_ROW80_LORA_SIDE_SLOT"),
-        (diagnostic_probe, "-DFLASHINFER_ENABLE_SVDQ_SM120_DIAGNOSTIC_PROBE"),
-    ))
+    variant_flags = _selected_items(
+        (
+            (lora_every_split, "-DSVDQ_SM120_LORA_EVERY_SPLIT"),
+            (lora_dedicated, "-DSVDQ_SM120_LORA_DEDICATED"),
+            (bool(ladder_flag), ladder_flag or ""),
+            (production_ladder, "-DSVDQ_SM120_ROW80_PRODUCTION_PARITY"),
+            (lora_neutral_barrier, "-DSVDQ_SM120_LORA_NEUTRAL_BARRIER"),
+            (lora_epi_overlap, "-DSVDQ_SM120_LORA_EPI_OVERLAP"),
+            (static_sched, "-DSVDQ_SM120_STATIC_SCHED"),
+            (bias_coalesced, "-DSVDQ_SM120_BIAS_COALESCED"),
+            (lora_true_rank_tail, "-DSVDQ_SM120_LORA_TRUE_RANK_TAIL"),
+            (lora_smem_swizzle, "-DSVDQ_SM120_LORA_SMEM_SWIZZLE"),
+            (row80_lora_side_slot, "-DSVDQ_SM120_ROW80_LORA_SIDE_SLOT"),
+            (diagnostic_probe, "-DFLASHINFER_ENABLE_SVDQ_SM120_DIAGNOSTIC_PROBE"),
+        )
+    )
     if row80_stages:
         variant_flags.append(f"-DSVDQ_SM120_ROW80_STAGES={row80_stages}")
     if stock_parity_kstep:

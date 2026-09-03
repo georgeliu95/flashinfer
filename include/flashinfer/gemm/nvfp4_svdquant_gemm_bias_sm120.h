@@ -38,16 +38,15 @@
 
 #pragma once
 
+#include "cute/tensor.hpp"
 #include "cutlass/cutlass.h"
 #include "cutlass/epilogue/dispatch_policy.hpp"
 #include "cutlass/epilogue/fusion/callbacks.hpp"
 #include "cutlass/epilogue/fusion/operations.hpp"
 #include "cutlass/epilogue/fusion/sm90_callbacks_tma_warpspecialized.hpp"
-#include "cutlass/epilogue/fusion/sm90_visitor_tma_warpspecialized.hpp"
 #include "cutlass/epilogue/fusion/sm90_visitor_load_tma_warpspecialized.hpp"
+#include "cutlass/epilogue/fusion/sm90_visitor_tma_warpspecialized.hpp"
 #include "cutlass/numeric_conversion.h"
-
-#include "cute/tensor.hpp"
 
 namespace cutlass {
 namespace epilogue {
@@ -58,29 +57,28 @@ using namespace cute;
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
 // Column vector broadcast staged through shared memory.
-template<
-  int Stages,
-  class CtaTileShapeMNK,
-  class ElementInput_,
-  class ElementCompute = cute::remove_pointer_t<ElementInput_>,
-  class StrideMNL_ = Stride<_1,_0,_0>,
-  int Alignment = 128 / sizeof_bits_v<cute::remove_pointer_t<ElementInput_>>,
-  bool EnableNullptr = true // Fallback scalar broadcast for nullptr params
->
+template <int Stages, class CtaTileShapeMNK, class ElementInput_,
+          class ElementCompute = cute::remove_pointer_t<ElementInput_>,
+          class StrideMNL_ = Stride<_1, _0, _0>,
+          int Alignment = 128 / sizeof_bits_v<cute::remove_pointer_t<ElementInput_>>,
+          bool EnableNullptr = true  // Fallback scalar broadcast for nullptr params
+          >
 struct Sm120StagedColBroadcast {
   using StrideMNL = StrideMNL_;
   using ElementInput = cute::remove_pointer_t<ElementInput_>;
   static constexpr bool IsArrayOfPointers = is_same_v<ElementInput*, ElementInput_>;
-  static constexpr bool IsDynamicBroadcast = is_same_v<remove_cvref_t<decltype(get<0>(StrideMNL{}))>, bool>;
+  static constexpr bool IsDynamicBroadcast =
+      is_same_v<remove_cvref_t<decltype(get<0>(StrideMNL{}))>, bool>;
   // The staging copy below is written for the plain static column-vector case only;
   // grouped/scalar-dynamic variants keep the upstream visitor.
   static_assert(!IsArrayOfPointers, "staged column broadcast supports a single bias pointer only");
-  static_assert(!IsDynamicBroadcast, "staged column broadcast supports a static column-vector stride only");
+  static_assert(!IsDynamicBroadcast,
+                "staged column broadcast supports a static column-vector stride only");
   using PtrColType = ElementInput const*;
 
   static_assert(Stages == 0, "Column broadcast doesn't support smem pipelining");
-  static_assert(is_static_v<decltype(take<0,2>(StrideMNL{}))>);
-  static_assert(take<0,2>(StrideMNL{}) == Stride<_1,_0>{});
+  static_assert(is_static_v<decltype(take<0, 2>(StrideMNL{}))>);
+  static_assert(take<0, 2>(StrideMNL{}) == Stride<_1, _0>{});
 
   // One tile row's worth of bias elements, filled cooperatively in begin().
   struct SharedStorage {
@@ -100,51 +98,42 @@ struct Sm120StagedColBroadcast {
   };
 
   template <class ProblemShape>
-  static constexpr Params
-  to_underlying_arguments(ProblemShape const& problem_shape, Arguments const& args, void* workspace) {
+  static constexpr Params to_underlying_arguments(ProblemShape const& problem_shape,
+                                                  Arguments const& args, void* workspace) {
     return {args.ptr_col, ElementCompute(args.null_default), args.dCol};
   }
 
   template <class ProblemShape>
-  static bool
-  can_implement(ProblemShape const& problem_shape, Arguments const& args) {
+  static bool can_implement(ProblemShape const& problem_shape, Arguments const& args) {
     return true;
   }
 
   template <class ProblemShape>
-  static size_t
-  get_workspace_size(ProblemShape const& problem_shape, Arguments const& args) {
+  static size_t get_workspace_size(ProblemShape const& problem_shape, Arguments const& args) {
     return 0;
   }
 
   template <class ProblemShape>
-  static cutlass::Status
-  initialize_workspace(ProblemShape const& problem_shape, Arguments const& args, void* workspace, cudaStream_t stream,
-    CudaHostAdapter* cuda_adapter = nullptr) {
+  static cutlass::Status initialize_workspace(ProblemShape const& problem_shape,
+                                              Arguments const& args, void* workspace,
+                                              cudaStream_t stream,
+                                              CudaHostAdapter* cuda_adapter = nullptr) {
     return cutlass::Status::kSuccess;
   }
 
-  CUTLASS_DEVICE bool
-  is_producer_load_needed() const {
-    return false;
-  }
+  CUTLASS_DEVICE bool is_producer_load_needed() const { return false; }
 
-  CUTLASS_DEVICE bool
-  is_C_load_needed() const {
-    return false;
-  }
+  CUTLASS_DEVICE bool is_C_load_needed() const { return false; }
 
-  CUTLASS_DEVICE bool
-  is_zero() const {
-    return is_zero_;
-  }
+  CUTLASS_DEVICE bool is_zero() const { return is_zero_; }
 
   CUTLASS_HOST_DEVICE
-  Sm120StagedColBroadcast() { }
+  Sm120StagedColBroadcast() {}
 
   CUTLASS_HOST_DEVICE
   Sm120StagedColBroadcast(Params const& params, SharedStorage const& shared_storage)
-      : params(params), is_zero_(false),
+      : params(params),
+        is_zero_(false),
         smem(const_cast<ElementInput*>(shared_storage.smem.data())) {
     if (EnableNullptr && params.ptr_col == nullptr) {
       is_zero_ = params.null_default == ElementCompute(0);
@@ -153,46 +142,44 @@ struct Sm120StagedColBroadcast {
 
   Params params;
   bool is_zero_ = false;
-  ElementInput *smem = nullptr;
+  ElementInput* smem = nullptr;
 
   template <class... Args>
-  CUTLASS_DEVICE auto
-  get_producer_load_callbacks(ProducerLoadArgs<Args...> const& args) {
+  CUTLASS_DEVICE auto get_producer_load_callbacks(ProducerLoadArgs<Args...> const& args) {
     return EmptyProducerLoadCallbacks{};
   }
 
-  template <class GS_GTensor, class GS_STensor, class GS_CTensor, class SR_STensor, class RTensor, class Residue>
+  template <class GS_GTensor, class GS_STensor, class GS_CTensor, class SR_STensor, class RTensor,
+            class Residue>
   struct ConsumerStoreCallbacks : EmptyConsumerStoreCallbacks {
     CUTLASS_DEVICE
-    ConsumerStoreCallbacks(
-        GS_GTensor tGS_gCol_, GS_STensor tGS_sCol_, GS_CTensor tGS_cCol_,
-        SR_STensor tSR_sCol_, RTensor tCrCol_,
-        Residue residue_cCol_, Params const& params_)
-      : tGS_gCol(tGS_gCol_)
-      , tGS_sCol(tGS_sCol_)
-      , tGS_cCol(tGS_cCol_)
-      , tSR_sCol(tSR_sCol_)
-      , tCrCol(tCrCol_)
-      , residue_cCol(residue_cCol_)
-      , params(params_) {
+    ConsumerStoreCallbacks(GS_GTensor tGS_gCol_, GS_STensor tGS_sCol_, GS_CTensor tGS_cCol_,
+                           SR_STensor tSR_sCol_, RTensor tCrCol_, Residue residue_cCol_,
+                           Params const& params_)
+        : tGS_gCol(tGS_gCol_),
+          tGS_sCol(tGS_sCol_),
+          tGS_cCol(tGS_cCol_),
+          tSR_sCol(tSR_sCol_),
+          tCrCol(tCrCol_),
+          residue_cCol(residue_cCol_),
+          params(params_) {
       if (EnableNullptr && params.ptr_col == nullptr) {
         fill(tCrCol, params.null_default);
       }
     }
 
-    GS_GTensor tGS_gCol;                                                         // (CPY,CPY_M,CPY_N)
-    GS_STensor tGS_sCol;                                                         // (CPY,CPY_M,CPY_N)
-    GS_CTensor tGS_cCol;                                                         // (CPY,CPY_M,CPY_N)
+    GS_GTensor tGS_gCol;  // (CPY,CPY_M,CPY_N)
+    GS_STensor tGS_sCol;  // (CPY,CPY_M,CPY_N)
+    GS_CTensor tGS_cCol;  // (CPY,CPY_M,CPY_N)
 
-    SR_STensor tSR_sCol;                                                         // (CPY,CPY_M,CPY_N,EPI_M,EPI_N)
-    RTensor tCrCol;                                                              // (CPY,CPY_M,CPY_N,EPI_M,EPI_N)
+    SR_STensor tSR_sCol;  // (CPY,CPY_M,CPY_N,EPI_M,EPI_N)
+    RTensor tCrCol;       // (CPY,CPY_M,CPY_N,EPI_M,EPI_N)
 
-    Residue residue_cCol;                                                        // (m, n)
+    Residue residue_cCol;  // (m, n)
     Params const& params;
     bool filled = false;
 
-    CUTLASS_DEVICE void
-    begin() {
+    CUTLASS_DEVICE void begin() {
       if (EnableNullptr && params.ptr_col == nullptr) {
         return;
       }
@@ -203,12 +190,11 @@ struct Sm120StagedColBroadcast {
 
       for (int i = 0; i < size(tGS_gCol_flt); ++i) {
         if (get<0>(tGS_cCol_flt(i)) >= size<0>(CtaTileShapeMNK{})) {
-          continue; // OOB of SMEM
+          continue;  // OOB of SMEM
         }
         if (elem_less(tGS_cCol_flt(i), residue_cCol)) {
-          tGS_sCol_flt(i) = tGS_gCol_flt(i); // issue async gmem to smem load
-        }
-        else {
+          tGS_sCol_flt(i) = tGS_gCol_flt(i);  // issue async gmem to smem load
+        } else {
           // fill OOB values so smem to RF load can issue without predication; the input-typed
           // cast is required (Params keeps null_default compute-typed for the nullptr register
           // fill) and only lands on residue lanes the store never writes
@@ -217,15 +203,13 @@ struct Sm120StagedColBroadcast {
       }
     }
 
-    CUTLASS_DEVICE bool
-    begin_sync_needed() const {
+    CUTLASS_DEVICE bool begin_sync_needed() const {
       // Ensure visibility of the cooperative gmem-to-smem fill; the nullptr fallback
       // never touches smem, so it does not pay the barrier.
       return !(EnableNullptr && params.ptr_col == nullptr);
     }
 
-    CUTLASS_DEVICE void
-    begin_loop(int epi_m, int epi_n) {
+    CUTLASS_DEVICE void begin_loop(int epi_m, int epi_n) {
       // The column fragment covers every epilogue subtile at once (upstream fills it in
       // begin(); here the fill must wait for the smem barrier). Keyed on a flag rather
       // than (epi_m, epi_n) == (0, 0) because the store loop may visit a filtered
@@ -252,10 +236,10 @@ struct Sm120StagedColBroadcast {
     }
 
     template <typename ElementAccumulator, int FragmentSize>
-    CUTLASS_DEVICE Array<ElementCompute, FragmentSize>
-    visit(Array<ElementAccumulator, FragmentSize> const& frg_acc, int epi_v, int epi_m, int epi_n) {
+    CUTLASS_DEVICE Array<ElementCompute, FragmentSize> visit(
+        Array<ElementAccumulator, FragmentSize> const& frg_acc, int epi_v, int epi_m, int epi_n) {
       Array<ElementCompute, FragmentSize> frg_col;
-      Tensor tCrCol_mn = tCrCol(_,_,_,epi_m,epi_n);
+      Tensor tCrCol_mn = tCrCol(_, _, _, epi_m, epi_n);
 
       CUTLASS_PRAGMA_UNROLL
       for (int i = 0; i < FragmentSize; ++i) {
@@ -264,15 +248,12 @@ struct Sm120StagedColBroadcast {
 
       return frg_col;
     }
-
   };
 
-  template <
-    bool ReferenceSrc, // do register tensors reference the src or dst layout of the tiled copy
-    class... Args
-  >
-  CUTLASS_DEVICE auto
-  get_consumer_store_callbacks(ConsumerStoreArgs<Args...> const& args) {
+  template <bool ReferenceSrc,  // do register tensors reference the src or dst layout of the tiled
+                                // copy
+            class... Args>
+  CUTLASS_DEVICE auto get_consumer_store_callbacks(ConsumerStoreArgs<Args...> const& args) {
     auto [M, N, K, L] = args.problem_shape_mnkl;
     auto [m, n, k, l] = args.tile_coord_mnkl;
     using ThreadCount = decltype(size(args.tiled_copy));
@@ -280,16 +261,18 @@ struct Sm120StagedColBroadcast {
     auto layout_M = make_layout(M);
     auto layout_N = make_layout(N, repeat_like(N, _0{}));
     auto layout_L = make_layout(L, get<2>(params.dCol));
-    Tensor mCol = make_tensor(make_gmem_ptr(params.ptr_col), make_layout(layout_M,layout_N,layout_L));
-    Tensor gCol = local_tile(mCol(_,_,l), take<0,2>(args.tile_shape_mnk), make_coord(m, n));      // (CTA_M, CTA_N)
+    Tensor mCol =
+        make_tensor(make_gmem_ptr(params.ptr_col), make_layout(layout_M, layout_N, layout_L));
+    Tensor gCol = local_tile(mCol(_, _, l), take<0, 2>(args.tile_shape_mnk),
+                             make_coord(m, n));  // (CTA_M, CTA_N)
     Tensor sCol = make_tensor(make_smem_ptr(smem),
-        make_shape(size<0>(CtaTileShapeMNK{}), size<1>(CtaTileShapeMNK{})), make_shape(_1{}, _0{})); // (CTA_M, CTA_N)
+                              make_shape(size<0>(CtaTileShapeMNK{}), size<1>(CtaTileShapeMNK{})),
+                              make_shape(_1{}, _0{}));  // (CTA_M, CTA_N)
 
     //// G2S: Gmem to Smem, threads along M so the loads coalesce
-    auto tiled_g2s = make_tiled_copy(Copy_Atom<DefaultCopy, ElementInput>{},
-                                     Layout< Shape<ThreadCount, _1>,
-                                            Stride<         _1, _0>>{},
-                                     Layout<_1>{});
+    auto tiled_g2s =
+        make_tiled_copy(Copy_Atom<DefaultCopy, ElementInput>{},
+                        Layout<Shape<ThreadCount, _1>, Stride<_1, _0>>{}, Layout<_1>{});
     auto thr_g2s = tiled_g2s.get_slice(args.thread_idx);
     Tensor tGS_gCol = thr_g2s.partition_S(gCol);
     Tensor tGS_sCol = thr_g2s.partition_D(sCol);
@@ -299,23 +282,19 @@ struct Sm120StagedColBroadcast {
 
     //// S2R: Smem to Reg
     Tensor tSR_sCol = detail::sm90_partition_for_epilogue<ReferenceSrc>(
-      sCol, args.epi_tile, args.tiled_copy, args.thread_idx);                    // (CPY,CPY_M,CPY_N,EPI_M,EPI_N)
+        sCol, args.epi_tile, args.tiled_copy, args.thread_idx);  // (CPY,CPY_M,CPY_N,EPI_M,EPI_N)
 
     // Register fragment identical to the upstream direct-gmem visitor: partition the
     // (M,N,L) column tensor the same way, so make_tensor_like preserves the zero-stride
     // N modes and one register holds each unique column element.
-    Tensor tCgCol = detail::sm90_partition_for_epilogue<ReferenceSrc>(           // (CPY,CPY_M,CPY_N,EPI_M,EPI_N)
-      mCol, args.tile_shape_mnk, args.tile_coord_mnkl, args.epi_tile, args.tiled_copy, args.thread_idx);
-    Tensor tCrCol = make_tensor_like<ElementCompute>(tCgCol);                    // (CPY,CPY_M,CPY_N,EPI_M,EPI_N)
+    Tensor tCgCol =
+        detail::sm90_partition_for_epilogue<ReferenceSrc>(  // (CPY,CPY_M,CPY_N,EPI_M,EPI_N)
+            mCol, args.tile_shape_mnk, args.tile_coord_mnkl, args.epi_tile, args.tiled_copy,
+            args.thread_idx);
+    Tensor tCrCol = make_tensor_like<ElementCompute>(tCgCol);  // (CPY,CPY_M,CPY_N,EPI_M,EPI_N)
 
-    return ConsumerStoreCallbacks(
-      tGS_gCol,
-      tGS_sCol,
-      tGS_cCol,
-      tSR_sCol,
-      tCrCol,
-      args.residue_cD,
-      params);
+    return ConsumerStoreCallbacks(tGS_gCol, tGS_sCol, tGS_cCol, tSR_sCol, tCrCol, args.residue_cD,
+                                  params);
   }
 };
 
@@ -324,71 +303,53 @@ struct Sm120StagedColBroadcast {
 // D = alpha * acc + beta * C + per-row bias, bias staged through shared memory.
 // Same semantics (and Arguments) as LinCombPerRowBias; a distinct type so FusionCallbacks
 // can key the smem-staged EVT without touching the upstream operation.
-template<
-  class ElementOutput,
-  class ElementCompute,
-  class ElementBias = ElementOutput,
-  class ElementSource = ElementOutput,
-  class ElementScalar = ElementCompute,
-  int AlignmentBias = 128 / sizeof_bits_v<ElementBias>,
-  FloatRoundStyle RoundStyle = FloatRoundStyle::round_to_nearest
->
+template <class ElementOutput, class ElementCompute, class ElementBias = ElementOutput,
+          class ElementSource = ElementOutput, class ElementScalar = ElementCompute,
+          int AlignmentBias = 128 / sizeof_bits_v<ElementBias>,
+          FloatRoundStyle RoundStyle = FloatRoundStyle::round_to_nearest>
 struct LinCombPerRowBiasStaged
-    : LinCombPerRowBias<ElementOutput, ElementCompute, ElementBias, ElementSource,
-                        ElementScalar, AlignmentBias, RoundStyle> {};
+    : LinCombPerRowBias<ElementOutput, ElementCompute, ElementBias, ElementSource, ElementScalar,
+                        AlignmentBias, RoundStyle> {};
 
 // Upstream Sm90LinCombPerRowBias with the bias leaf swapped for the staged visitor.
-template<
-  class CtaTileShapeMNK,
-  class ElementOutput,
-  class ElementCompute,
-  class ElementBias = ElementOutput,
-  class ElementSource = ElementOutput,
-  class ElementScalar = ElementCompute,
-  int AlignmentBias = 128 / sizeof_bits_v<ElementBias>,
-  FloatRoundStyle RoundStyle = FloatRoundStyle::round_to_nearest
->
+template <class CtaTileShapeMNK, class ElementOutput, class ElementCompute,
+          class ElementBias = ElementOutput, class ElementSource = ElementOutput,
+          class ElementScalar = ElementCompute,
+          int AlignmentBias = 128 / sizeof_bits_v<ElementBias>,
+          FloatRoundStyle RoundStyle = FloatRoundStyle::round_to_nearest>
 using Sm120LinCombPerRowBiasStaged =
-  Sm90EVT<Sm90Compute<homogeneous_multiply_add, ElementOutput, ElementCompute, RoundStyle>, // beta * C + (alpha * acc + bias)
-    Sm90ScalarBroadcast<ElementScalar, Stride<_0,_0,int64_t>>, // beta
-    Sm90SrcFetch<ElementSource>, // C
-    Sm90EVT<Sm90Compute<homogeneous_multiply_add, ElementCompute, ElementCompute, RoundStyle>, // alpha * acc + bias
-      Sm90ScalarBroadcast<ElementScalar, Stride<_0,_0,int64_t>>, // alpha
-      Sm90AccFetch, // acc
-      Sm120StagedColBroadcast<0, CtaTileShapeMNK, ElementBias, ElementCompute, Stride<_1,_0,int64_t>, AlignmentBias> // bias
-    >
-  >;
+    Sm90EVT<Sm90Compute<homogeneous_multiply_add, ElementOutput, ElementCompute,
+                        RoundStyle>,  // beta * C + (alpha * acc + bias)
+            Sm90ScalarBroadcast<ElementScalar, Stride<_0, _0, int64_t>>,  // beta
+            Sm90SrcFetch<ElementSource>,                                  // C
+            Sm90EVT<Sm90Compute<homogeneous_multiply_add, ElementCompute, ElementCompute,
+                                RoundStyle>,  // alpha * acc + bias
+                    Sm90ScalarBroadcast<ElementScalar, Stride<_0, _0, int64_t>>,  // alpha
+                    Sm90AccFetch,                                                 // acc
+                    Sm120StagedColBroadcast<0, CtaTileShapeMNK, ElementBias, ElementCompute,
+                                            Stride<_1, _0, int64_t>, AlignmentBias>  // bias
+                    >>;
 
 // Keyed on the Sm90 policy exactly like the upstream per-row-bias callbacks; the generic
 // Sm120TmaWarpSpecialized-to-Sm90TmaWarpSpecialized forwarder routes the SM120 builder
 // here. Arguments is field-for-field the upstream LinCombPerRowBias Arguments.
-template <
-  int StagesC,
-  int StagesD,
-  int FragmentSize,
-  bool ReuseSmemC,
-  bool DelayTmaStore,
-  class ElementOutput,
-  class ElementCompute,
-  class ElementBias,
-  class ElementSource,
-  class ElementScalar,
-  int AlignmentBias,
-  FloatRoundStyle RoundStyle,
-  class CtaTileShapeMNK,
-  class EpilogueTile
->
+template <int StagesC, int StagesD, int FragmentSize, bool ReuseSmemC, bool DelayTmaStore,
+          class ElementOutput, class ElementCompute, class ElementBias, class ElementSource,
+          class ElementScalar, int AlignmentBias, FloatRoundStyle RoundStyle, class CtaTileShapeMNK,
+          class EpilogueTile>
 struct FusionCallbacks<
     epilogue::Sm90TmaWarpSpecialized<StagesC, StagesD, FragmentSize, ReuseSmemC, DelayTmaStore>,
-    fusion::LinCombPerRowBiasStaged<ElementOutput, ElementCompute, ElementBias, ElementSource, ElementScalar, AlignmentBias, RoundStyle>,
-    CtaTileShapeMNK,
-    EpilogueTile
-> : Sm120LinCombPerRowBiasStaged<
-      CtaTileShapeMNK, ElementOutput, ElementCompute, ElementBias, ElementSource, ElementScalar, AlignmentBias, RoundStyle> {
-  using Impl = Sm120LinCombPerRowBiasStaged<
-    CtaTileShapeMNK, ElementOutput, ElementCompute, ElementBias, ElementSource, ElementScalar, AlignmentBias, RoundStyle>;
-  using Operation = fusion::LinCombPerRowBiasStaged<
-    ElementOutput, ElementCompute, ElementBias, ElementSource, ElementScalar, AlignmentBias, RoundStyle>;
+    fusion::LinCombPerRowBiasStaged<ElementOutput, ElementCompute, ElementBias, ElementSource,
+                                    ElementScalar, AlignmentBias, RoundStyle>,
+    CtaTileShapeMNK, EpilogueTile>
+    : Sm120LinCombPerRowBiasStaged<CtaTileShapeMNK, ElementOutput, ElementCompute, ElementBias,
+                                   ElementSource, ElementScalar, AlignmentBias, RoundStyle> {
+  using Impl =
+      Sm120LinCombPerRowBiasStaged<CtaTileShapeMNK, ElementOutput, ElementCompute, ElementBias,
+                                   ElementSource, ElementScalar, AlignmentBias, RoundStyle>;
+  using Operation =
+      fusion::LinCombPerRowBiasStaged<ElementOutput, ElementCompute, ElementBias, ElementSource,
+                                      ElementScalar, AlignmentBias, RoundStyle>;
 
   struct Arguments {
     ElementScalar alpha = ElementScalar(1);
@@ -396,28 +357,29 @@ struct FusionCallbacks<
     ElementScalar const* alpha_ptr = nullptr;
     ElementScalar const* beta_ptr = nullptr;
 
-    using StrideAlpha = Stride<_0,_0,int64_t>;
-    using StrideBeta  = Stride<_0,_0,int64_t>;
+    using StrideAlpha = Stride<_0, _0, int64_t>;
+    using StrideBeta = Stride<_0, _0, int64_t>;
     StrideAlpha dAlpha = {_0{}, _0{}, 0};
-    StrideBeta  dBeta  = {_0{}, _0{}, 0};
+    StrideBeta dBeta = {_0{}, _0{}, 0};
 
-    using StrideBias = Stride<_1,_0,int64_t>;
+    using StrideBias = Stride<_1, _0, int64_t>;
     ElementBias const* bias_ptr = nullptr;
     StrideBias dBias = {};
 
     operator typename Impl::Arguments() const {
-      return
-        {     // ternary op : beta * C + (alpha * acc + bias)
-          {{beta}, {beta_ptr}, {dBeta}}, // leaf args : beta
-          {},                   // leaf args : C
-          {                     // ternary op : alpha * acc + bias
-            {{alpha}, {alpha_ptr}, {dAlpha}}, // leaf args : alpha
-            {},                     // leaf args : acc
-            {bias_ptr, ElementBias(0), dBias}, // leaf args : bias
-            {}                  // ternary args : multiply_add
-          },                    // end ternary op
-          {} // ternary args : multiply_add
-        };   // end ternary op
+      return {
+          // ternary op : beta * C + (alpha * acc + bias)
+          {{beta}, {beta_ptr}, {dBeta}},  // leaf args : beta
+          {},                             // leaf args : C
+          {
+              // ternary op : alpha * acc + bias
+              {{alpha}, {alpha_ptr}, {dAlpha}},   // leaf args : alpha
+              {},                                 // leaf args : acc
+              {bias_ptr, ElementBias(0), dBias},  // leaf args : bias
+              {}                                  // ternary args : multiply_add
+          },                                      // end ternary op
+          {}                                      // ternary args : multiply_add
+      };  // end ternary op
     }
   };
 

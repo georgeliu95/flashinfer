@@ -87,13 +87,10 @@ _SM120_LINEAR_ROUTE_V9_MKR = _sm120_routes.SM120_LINEAR_ROUTE_V9_MKR
 _SM120_TACTIC_ABI_VERSION = _sm120_routes.SM120_TACTIC_ABI_VERSION
 
 
-_sm120_fused_prefix_uses_packed_l2t = (
-    _sm120_routes.sm120_fused_prefix_uses_packed_l2t
-)
+_sm120_fused_prefix_uses_packed_l2t = _sm120_routes.sm120_fused_prefix_uses_packed_l2t
 
 
 _sm120_linear_route_abi_version = _sm120_routes.sm120_linear_route_abi_version
-
 
 
 _sm120_tactic_abi_version = _sm120_routes.sm120_tactic_abi_version
@@ -204,10 +201,7 @@ def _cached_sm120_m537_l2t(
         packed,
     )
     _SM120_M537_PACKED_L2T_CACHE.move_to_end(source_id)
-    while (
-        len(_SM120_M537_PACKED_L2T_CACHE)
-        > _SM120_M537_PACKED_L2T_CACHE_CAPACITY
-    ):
+    while len(_SM120_M537_PACKED_L2T_CACHE) > _SM120_M537_PACKED_L2T_CACHE_CAPACITY:
         _SM120_M537_PACKED_L2T_CACHE.popitem(last=False)
     return packed
 
@@ -253,14 +247,6 @@ def _sm120_fused_linear_supported(m: int, k: int, rank: int) -> bool:
     if rank != SVDQUANT_LORA_RANK_GRANULARITY:
         return False
     return bool(_sm120_producer_variants(m, k))
-
-
-
-
-
-
-
-
 
 
 def _svdquant_op_name(
@@ -376,8 +362,6 @@ def _nvfp4_svdquant_valid_tactics(
     return [min(tactics, key=lambda t: int(workspace_size(m, n, k, t)))]
 
 
-
-
 def _nvfp4_svdquant_gemm_runners(
     enable_pdl: bool,
     device: torch.device,
@@ -388,8 +372,6 @@ def _nvfp4_svdquant_gemm_runners(
 ) -> List[TunableRunner]:
     """Build the per-shape candidate set; first runner is the eager fallback."""
     return [_nvfp4_svdquant_gemm_runner(enable_pdl, device, rank)]
-
-
 
 
 def _sm120_linear_tactics(module, inputs: List[torch.Tensor]) -> List[int]:
@@ -591,12 +573,6 @@ def _sm120_run_cutlass_linear(
     return out
 
 
-
-
-
-
-
-
 def _sm120_linear_runners(
     enable_pdl: bool,
     device: torch.device,
@@ -674,10 +650,6 @@ _NVFP4_SVDQUANT_GEMM_TUNING_CONFIG_EXACT = TuningConfig(
 )
 
 
-
-
-
-
 _SM120_LINEAR_TUNING_CONFIG_COLD = TuningConfig(
     use_cuda_graph=False,
     use_cold_l2_cache=True,
@@ -689,8 +661,6 @@ _SM120_LINEAR_TUNING_CONFIG_COLD = TuningConfig(
         ),
     ),
 )
-
-
 
 
 def _sm120_linear_op_name(m: int, k: int, rank: int, *, enable_pdl: bool) -> str:
@@ -717,8 +687,6 @@ def _sm120_linear_op_name(m: int, k: int, rank: int, *, enable_pdl: bool) -> str
 _SM120_LINEAR_DISPATCH_CACHE: dict[tuple, tuple[int, int]] = {}
 
 
-
-
 _SM120_TUNING_BUDGET_US: Final = 20_000.0
 
 
@@ -734,21 +702,7 @@ _SM120_TUNING_LAUNCH_FLOOR_US: Final = 15.0
 _SM120_TUNING_FLOP_PER_US: Final = 8.0e8
 
 
-
-
 _SM120_SELECT_ROUNDS: Final = 3
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 _SM120_SELECT_FINALISTS: Final = 6
@@ -758,32 +712,6 @@ _SM120_SELECT_FINALIST_MARGIN: Final = 0.05
 
 
 _SM120_SELECT_CAPTURE_WARMUP: Final = 3
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 def _choose_sm120_linear_runner(
@@ -835,16 +763,12 @@ def _choose_sm120_linear_runner(
     return runner, tactic
 
 
-
-
 def _svdquant_tuning_config(backend_key: str) -> TuningConfig:
     return (
         _NVFP4_SVDQUANT_GEMM_TUNING_CONFIG_EXACT
         if backend_key == "sm120"
         else _NVFP4_SVDQUANT_GEMM_TUNING_CONFIG
     )
-
-
 
 
 _SM120_WORKSPACE_BYTES_CACHE: dict = {}
@@ -866,7 +790,8 @@ def _sm120_max_workspace_bytes(
 
 
 def _nvfp4_svdquant_gemm_runner(
-    enable_pdl: bool, device: torch.device,
+    enable_pdl: bool,
+    device: torch.device,
     lora_rank: int = SVDQUANT_LORA_RANK_GRANULARITY,
 ):
     module = _get_nvfp4_svdquant_module_for_device(device, lora_rank)
