@@ -20,7 +20,6 @@ is injected.
 
 from types import SimpleNamespace
 
-from flashinfer.gemm import gemm_svdquant
 
 from flashinfer.gemm import svdquant_sm120_cutlass
 from flashinfer.testing.svdq_model_shapes import MODEL_SHAPE_CASES
@@ -219,7 +218,7 @@ def test_sm120_h3_shapes_match_the_frozen_registry():
     safe while they still agree with the shared registry.
     """
     assert len(_H3_SHAPES) == 27
-    assert _H3_SHAPES <= set(MODEL_SHAPE_CASES)
+    assert set(MODEL_SHAPE_CASES) >= _H3_SHAPES
     for shape in [(73984, 28672, 5376), (82752, 21504, 5376), (82752, 28672, 5376)]:
         assert shape in _H3_SHAPES, "the three route-autotuner OOM rows"
 

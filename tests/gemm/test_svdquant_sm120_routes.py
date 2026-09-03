@@ -18,7 +18,6 @@ import pytest
 from flashinfer.gemm.svdquant_sm120_routes import (
     sm120_producer_variants,
     PREFIX_ROUTE_OVERRIDE_ENV,
-    SM120_TACTIC_ABI_VERSION,
     SM120_FUSED_LINEAR_MK,
     SM120_LINEAR_ROUTE_ABI_OVERRIDES,
     SM120_LINEAR_ROUTE_V6_MKR,
@@ -28,7 +27,6 @@ from flashinfer.gemm.svdquant_sm120_routes import (
     sm120_fused_prefix_uses_packed_l2t,
     sm120_linear_route_abi_version,
     sm120_prefix_route_overrides,
-    sm120_tactic_abi_version,
 )
 
 

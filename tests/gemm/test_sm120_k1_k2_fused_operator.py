@@ -12,7 +12,6 @@ import torch
 from flashinfer.gemm import svdquant_sm120_routes as _sm120_routes
 from flashinfer.gemm.svdquant_sm120_routes import SM120_FUSED_LINEAR_MK
 from flashinfer.gemm.svdquant_sm120_routes import sm120_fused_prefix_route
-from flashinfer.gemm import gemm_svdquant
 from flashinfer.gemm import svdquant_sm120_cutlass
 from flashinfer.gemm.gemm_svdquant import nvfp4_quantize_smooth, svdquant_linear
 from flashinfer.gemm.svdquant_sm120_cutlass import get_nvfp4_svdquant_sm120_module
@@ -509,7 +508,7 @@ def test_sm120_combined_k12_k3_matches_separate_launches(m: int, n: int, k: int,
     )
 
     torch.cuda.synchronize()
-    for separate_output, combined_output in zip(separate, combined):
+    for separate_output, combined_output in zip(separate, combined, strict=False):
         assert torch.equal(separate_output, combined_output)
 
     public_output = svdquant_linear(
@@ -823,7 +822,7 @@ def test_sm120_k12288_large_m_combined_k12_k3_matches_separate_launches(
         ("combined full output", combined[3]),
     ):
         assert bool(torch.isfinite(output).all()), f"{name} is incomplete"
-    for separate_output, combined_output in zip(separate, combined):
+    for separate_output, combined_output in zip(separate, combined, strict=False):
         assert torch.equal(separate_output, combined_output)
 
     # Independent generic prefix: the same K3 tactic driven by the generic
@@ -913,15 +912,6 @@ def _production_ffi_body(csrc: str) -> str:
 
 
 def test_sm120_m32760_k1536_has_exact_production_admission() -> None:
-    header = _read_repo_source(
-        "include/flashinfer/gemm/nvfp4_smooth_quantize_lora_down_sm120.cuh"
-    )
-    production_entry = "inline cudaError_t nvfp4_smooth_quantize_lora_down_sm120("
-    production_dispatch = header[
-        header.index(production_entry) : header.index(
-            f"inline cudaError_t {_N16_HOST_ENTRY}("
-        )
-    ]
     retained_launch = "launch_large_m_kernel<32760, 1536, 256, 32, 256>"
     # The dispatcher used to carry an "m == 32760 && k == 1536" branch and this
     # shape's own template. Both were per-shape structures the runtime-M/K
@@ -942,8 +932,6 @@ def test_sm120_m32760_k1536_has_exact_production_admission() -> None:
         assert svdquant_sm120_cutlass._sm120_fused_linear_supported(own_m, 1536, 32)
         assert _sm120_routes.sm120_producer_variants(own_m, 1536)
 
-    csrc = _read_repo_source("csrc/nvfp4_smooth_quantize_sm100.cu")
-    production_ffi = _production_ffi_body(csrc)
     # The K1536 clause used to name its three admitted M values in the FFI
     # source. Admission is a predicate now, so it is asked directly -- and the
     # "and nothing else" half is kept by checking a neighbour is refused.
@@ -1343,7 +1331,7 @@ def test_sm120_m512_k3072_public_rows0_and_28_keep_the_production_producer() -> 
         workspace = torch.empty((workspace_bytes,), dtype=torch.uint8, device="cuda")
         row = "row 0" if n == _N16_ROW0_N else "row 28"
 
-        for lora_weight, reference in zip((l2t_smoothed, perturbed_l2t), references):
+        for lora_weight, reference in zip((l2t_smoothed, perturbed_l2t), references, strict=False):
             combined_xq, combined_sf, combined_down = _n16_producer_outputs()
             combined_output = torch.full(
                 (_N16_M, n), float("nan"), dtype=torch.bfloat16, device="cuda"
@@ -1632,7 +1620,7 @@ def test_sm120_h3_routes_bump_abi_only_where_the_runner_set_changed() -> None:
 
     # Scoped, not global: the base version every other shape keys on is untouched.
     assert svdquant_sm120_cutlass._SM120_LINEAR_ROUTE_ABI_VERSION == 5
-    assert svdquant_sm120_cutlass._SM120_LINEAR_ROUTE_V6_MKR == frozenset(
+    assert frozenset(
         {
             (_H3_ROW52_M, _H3_ROW52_K, _H3_ROW52_RANK),
             (_H3_ROW52_M, _H3_ROW50_K, _H3_ROW52_RANK),
@@ -1641,7 +1629,7 @@ def test_sm120_h3_routes_bump_abi_only_where_the_runner_set_changed() -> None:
             (_H3_ROW70_M, _H3_ROW52_K, _H3_ROW52_RANK),
             (_H3_ROW70_M, _H3_ROW68_K, _H3_ROW52_RANK),
         }
-    ), "only the six H3 routes with a screened producer may carry the bump"
+    ) == svdquant_sm120_cutlass._SM120_LINEAR_ROUTE_V6_MKR, "only the six H3 routes with a screened producer may carry the bump"
     assert svdquant_sm120_cutlass._SM120_TACTIC_ABI_VERSION == 3
 
 
@@ -1696,22 +1684,10 @@ def test_sm120_h3_remaining_batch4_routes_are_exact() -> None:
         (m, k, _H3_ROW52_RANK)
         for m, k, _ in _H3_REMAINING_BATCH4_CANDIDATES
     )
-    assert svdquant_sm120_cutlass._SM120_LINEAR_ROUTE_V7_MKR == expected_mkr
+    assert expected_mkr == svdquant_sm120_cutlass._SM120_LINEAR_ROUTE_V7_MKR
 
-    header = _read_repo_source(
-        "include/flashinfer/gemm/nvfp4_smooth_quantize_lora_down_sm120.cuh"
-    )
-    production_entry = "inline cudaError_t nvfp4_smooth_quantize_lora_down_sm120("
-    production_dispatch = header[
-        header.index(production_entry) : header.index(
-            f"inline cudaError_t {_N16_HOST_ENTRY}("
-        )
-    ]
-    csrc = _read_repo_source("csrc/nvfp4_smooth_quantize_sm100.cu")
-    production_ffi = _production_ffi_body(csrc)
 
     for m, k, launch in _H3_REMAINING_BATCH4_CANDIDATES:
-        n = 28672 if k == 5376 else 5376
         assert svdquant_sm120_cutlass._sm120_fused_linear_supported(
             m, k, _H3_ROW52_RANK
         )
@@ -1745,8 +1721,8 @@ def test_sm120_h3_remaining_batch4_routes_are_exact() -> None:
 
 def test_sm120_batch4_gap_closure_routes_are_exact() -> None:
     """Case 4 uses only its screened cuBLASLt prefix."""
-    m, n, k, rank = (537, 5376, 14336, 32)
-    assert svdquant_sm120_cutlass._SM120_LINEAR_ROUTE_V9_MKR == frozenset({(m, k, rank)})
+    m, _n, k, rank = (537, 5376, 14336, 32)
+    assert frozenset({(m, k, rank)}) == svdquant_sm120_cutlass._SM120_LINEAR_ROUTE_V9_MKR
     assert svdquant_sm120_cutlass._sm120_linear_route_abi_version(m, k, rank) == 9
     assert svdquant_sm120_cutlass._sm120_linear_op_name(
         m, k, rank, enable_pdl=False
@@ -1779,7 +1755,7 @@ def test_sm120_batch4_k5376_fused_routes_are_exact() -> None:
         (82752, 21504, 5376, 32),
         (82752, 28672, 5376, 32),
     )
-    assert svdquant_sm120_cutlass._SM120_LINEAR_ROUTE_V8_MKR == frozenset(
+    assert frozenset(
         {
             (1935, 5376, 32),
             (6913, 5376, 32),
@@ -1787,7 +1763,7 @@ def test_sm120_batch4_k5376_fused_routes_are_exact() -> None:
             (61056, 5376, 32),
             (82752, 5376, 32),
         }
-    )
+    ) == svdquant_sm120_cutlass._SM120_LINEAR_ROUTE_V8_MKR
     for m, _, k, rank in expected:
         assert svdquant_sm120_cutlass._sm120_fused_linear_supported(m, k, rank)
         _assert_admission_tracks_the_ladder(m + 1, k, rank)
@@ -2151,7 +2127,7 @@ def test_sm120_h3_combined_k12_k3_matches_separate_at_a_fixed_k3_tactic(
         ("combined full output", combined[3]),
     ):
         assert bool(torch.isfinite(output).all()), f"{name} is incomplete"
-    for separate_output, combined_output in zip(separate, combined):
+    for separate_output, combined_output in zip(separate, combined, strict=False):
         assert torch.equal(separate_output, combined_output)
 
     # Independent generic prefix: the same fixed K3 tactic driven by the generic
