@@ -598,3 +598,31 @@ def test_sm120_true_rank_tail_bitwise_vs_storage_fallback(mode, tactic):
         f"negative-zero lane count diverged: {negz_default} vs {negz_fallback}")
     assert torch.equal(iv_default, iv_fallback), (
         f"bit-pattern mismatch vs storage fallback (mode={mode}, tactic={tactic})")
+
+
+@pytest.mark.parametrize("rank", [32, 64])
+@pytest.mark.parametrize("m,n,k", [(4096, 3072, 3072), (512, 5120, 5120)])
+def test_public_entry_serves_rank_64(m, n, k, rank):
+    """The rank reaches the module through the public API, not a private getter.
+
+    The collective takes its LoRA rank as a build parameter, so serving rank 64
+    means mm_nvfp4_svdquant reading d.shape[1] and getting the module compiled
+    for it. A caller should not have to reach for
+    get_nvfp4_svdquant_sm120_module(64) by hand.
+
+    Rank 32 rides along as the control: it must keep using the module it always
+    did, which is the same object the production build produces.
+    """
+    _skip_unless_svdquant_supported()
+    if not _is_sm120():
+        pytest.skip("requires SM120")
+    torch.manual_seed(3)
+    p = _make_gemm_problem(m, n, k, rank=rank)
+    out = mm_nvfp4_svdquant(
+        p["xq"], p["wq"], p["x_sf_flat"], p["w_sf_flat"], p["alpha"],
+        p["d"], p["l1_scaled"], bias=None, out=None, backend="cutlass-sm120",
+    )
+    assert _sqnr_db(p["ref"], out.float()) > 40.0
+
+    module = _get_nvfp4_svdquant_module_for_device(torch.device("cuda"), rank)
+    assert module.nvfp4_svdquant_gemm_lora_rank() == rank

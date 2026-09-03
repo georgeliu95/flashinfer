@@ -48,6 +48,7 @@ def gen_gemm_sm120_module_cutlass_nvfp4_svdquant(
     row80_stages: int = 0,
     stock_parity_kstep: int = 0,
     diagnostic_probe: bool = False,
+    lora_rank: int = 32,
 ) -> JitSpec:
     """SM120 SVDQuant fused NVFP4 GEMM + smooth quantization JIT module.
 
@@ -137,6 +138,10 @@ def gen_gemm_sm120_module_cutlass_nvfp4_svdquant(
     if row80_stages not in (0, 4, 5):
         raise SvdquantSm120VariantError(
             f"row80_stages must be 0, 4, or 5; got {row80_stages!r}"
+        )
+    if lora_rank <= 0 or lora_rank % 32:
+        raise ValueError(
+            f"lora_rank must be a positive multiple of 32; got {lora_rank!r}"
         )
     production_defaults = (
         lora_epi_overlap
@@ -234,6 +239,10 @@ def gen_gemm_sm120_module_cutlass_nvfp4_svdquant(
         variant = "_lora_serial_tail"
     variant += "".join(_selected_items((
         (lora_smem_swizzle, "_lora_smem_swizzle"),
+        # Rank 32 stays un-suffixed so the production module keeps its identity
+        # and its tuned cache; another rank is a separate build, the way the
+        # upstream cute-dsl path compiles one specialization per rank.
+        (lora_rank != 32, f"_rank{lora_rank}"),
         (bool(row80_stages), f"_row80_stages{row80_stages}"),
         (static_sched, "_static_sched"),
         (bias_coalesced, "_bias_coalesced"),
@@ -288,6 +297,8 @@ def gen_gemm_sm120_module_cutlass_nvfp4_svdquant(
         variant_flags.append(f"-DSVDQ_SM120_ROW80_STAGES={row80_stages}")
     if stock_parity_kstep:
         variant_flags.append(f"-DSVDQ_SM120_STOCK_PARITY_KSTEP={stock_parity_kstep}")
+    if lora_rank != 32:
+        variant_flags.append(f"-DSVDQ_SM120_LORA_RANK={lora_rank}")
     return gen_jit_spec(
         f"nvfp4_svdquant_gemm_cutlass_sm120{variant}",
         source_paths,

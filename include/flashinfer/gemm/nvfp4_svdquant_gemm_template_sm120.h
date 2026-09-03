@@ -34,6 +34,7 @@
 #include <cstddef>
 #include <cstdlib>
 #include <stdexcept>
+#include <string>
 #include <type_traits>
 
 #include "cutlass/arch/arch.h"
@@ -99,6 +100,20 @@ inline constexpr cutlass::gemm::collective::Sm120LoRaPath kBuildWideLoRaPathSm12
     cutlass::gemm::collective::Sm120LoRaPath::kByteExactMainloop;
 #endif
 
+// The LoRA rank this module was compiled for. One module serves one rank, the way
+// the upstream cute-dsl path compiles a specialization per rank; a different rank
+// is a separate JIT build under its own cache name (see gen_gemm_sm120_module_
+// cutlass_nvfp4_svdquant's lora_rank). Rank 32 leaves the define unset so the
+// production module keeps its historical identity byte for byte.
+inline constexpr int kSvdqSm120ModuleLoRaRank =
+#if defined(SVDQ_SM120_LORA_RANK)
+    SVDQ_SM120_LORA_RANK;
+#else
+    32;
+#endif
+static_assert(kSvdqSm120ModuleLoRaRank > 0 && kSvdqSm120ModuleLoRaRank % 32 == 0,
+              "SVDQ_SM120_LORA_RANK must be a positive multiple of 32");
+
 // swap_ab=false: out[M,N] row-major, per-column bias[N] (matches SM100).
 // swap_ab=true: the launcher computes out^T[N,M] = B@A^T + L1@D^T; the output is written
 // column-major over the same row-major [M,N] buffer and bias[N] becomes a per-row vector of
@@ -144,6 +159,22 @@ struct SvdquantGemmConfigSm120 {
   static constexpr cutlass::gemm::collective::Sm120LoRaPath LoRaPathSm120 =
       IsRow80SideSlot ? cutlass::gemm::collective::Sm120LoRaPath::kDedicatedTma
                       : kBuildWideLoRaPathSm120;
+
+  // LoRA rank this config can stage. The byte-exact and neutral-barrier paths
+  // overlay the rank tile on a residual stage, and one stage spans TileK/4 bf16
+  // columns -- 32 for a K128 tile, 64 for K256, where columns 32..63 are TMA
+  // zero-filled today precisely because the rank is only 32.
+  //
+  // A module built for a rank a config cannot stage still compiles that config
+  // at rank 32; it is simply never selected, because the collective's own
+  // can_implement rejects a mismatched args.lora_rank. Keeping the config
+  // compiled rather than dropping it is what keeps kernel ids stable, since the
+  // KernelShapeSm120 enum and SVDQ_SM120_DISPATCH are written out by hand and
+  // would otherwise have to be regenerated per rank.
+  static constexpr int kLoRaStageCapacity = cute::size<2>(MmaTileShape{}) / 4;
+  static constexpr int LoRaRank = kSvdqSm120ModuleLoRaRank <= kLoRaStageCapacity
+                                     ? kSvdqSm120ModuleLoRaRank
+                                     : 32;
   static_assert(!IsRow80SideSlot || IsRow80,
                 "the production side slot is row80-only");
 #if defined(SVDQ_SM120_ROW80_LORA_SIDE_SLOT)
@@ -309,7 +340,7 @@ struct SvdquantGemmConfigSm120 {
       typename CollectiveMainloopBase::GmemTiledCopyPairB,
       typename CollectiveMainloopBase::SmemLayoutAtomsB,
       typename CollectiveMainloopBase::SmemCopyAtomsB, typename CollectiveMainloopBase::TransformB,
-      LoRaPathSm120, IsProductionRow80, CompileInlineDown>;
+      LoRaPathSm120, IsProductionRow80, CompileInlineDown, LoRaRank>;
   using CollectiveMainloop = CollectiveMainloopT<true>;
   using CollectiveMainloopNoInlineDown = CollectiveMainloopT<false>;
 
@@ -770,8 +801,12 @@ void run_tactic_impl(RuntimeTacticSm120 const& rt, void* out, void const* A,
   typename Gemm::Arguments args{};
   args.mode = cutlass::gemm::GemmUniversalMode::kGemm;
 
-  if (lora_rank != 32)
-    throw std::invalid_argument("nvfp4_svdquant_gemm (sm120): lora_rank must be exactly 32");
+  // This config stages Config::LoRaRank; a launcher that hands it anything else
+  // would read the D/L1 tiles at the wrong extent rather than fail, so refuse.
+  if (lora_rank != Config::LoRaRank)
+    throw std::invalid_argument(
+        "nvfp4_svdquant_gemm (sm120): this tactic stages LoRA rank " +
+        std::to_string(Config::LoRaRank) + ", got " + std::to_string(lora_rank));
   int64_t const r = lora_rank;
 
   if constexpr (Config::SwapAB) {
