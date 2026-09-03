@@ -70,10 +70,6 @@ def test_route_abi_override_manifest_has_no_base_version_entries() -> None:
     assert override_versions == {6, 7, 8, 9}
 
 
-
-
-
-
 @pytest.mark.parametrize(
     "m,k,rank,expected",
     [
@@ -96,14 +92,6 @@ def test_packed_l2t_is_a_fused_prefix_specific_contract(
     assert uses_packed_l2t is expected
 
 
-
-
-
-
-
-
-
-
 def test_default_prefix_routes_reproduce_the_measured_gate(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -112,7 +100,9 @@ def test_default_prefix_routes_reproduce_the_measured_gate(
     # Then: exactly the seven recorded cuBLASLt shapes still take that prefix.
     monkeypatch.delenv(PREFIX_ROUTE_OVERRIDE_ENV, raising=False)
     cublaslt_shapes = {
-        key for key in SM120_PREFIX_ROUTE_LADDER if sm120_fused_prefix_route(*key) == "cublaslt"
+        key
+        for key in SM120_PREFIX_ROUTE_LADDER
+        if sm120_fused_prefix_route(*key) == "cublaslt"
     }
     assert cublaslt_shapes == {
         (512, 5120),
@@ -164,8 +154,15 @@ def test_refuted_rungs_are_measurable_again_without_moving_a_default(
     # When: each refuted native rung is requested explicitly.
     # Then: it is accepted, and the default is unchanged, so re-measuring costs
     # an environment variable while shipping the loser still costs a code edit.
-    for m, k in ((537, 5120), (537, 7168), (537, 14336),
-                 (1935, 5120), (1935, 7168), (1935, 5376), (512, 5120)):
+    for m, k in (
+        (537, 5120),
+        (537, 7168),
+        (537, 14336),
+        (1935, 5120),
+        (1935, 7168),
+        (1935, 5376),
+        (512, 5120),
+    ):
         monkeypatch.setenv(PREFIX_ROUTE_OVERRIDE_ENV, f"{m}:{k}=native")
         assert sm120_fused_prefix_route(m, k) == "native"
         monkeypatch.delenv(PREFIX_ROUTE_OVERRIDE_ENV)
@@ -270,8 +267,9 @@ def _m537_mixed_producer_shapes(header: str) -> set[tuple[int, int]]:
     prepacked L2T layout. M=537 now carries two producer families, so which
     layout a shape needs can no longer be inferred from its M."""
     body = header[
-        header.index("inline cudaError_t nvfp4_smooth_quantize_lora_down_sm120(") :
-        header.index("// Direct-only n16 diagnostic entry")
+        header.index(
+            "inline cudaError_t nvfp4_smooth_quantize_lora_down_sm120("
+        ) : header.index("// Direct-only n16 diagnostic entry")
     ]
     return {
         (537, int(match.group(1)))
@@ -380,7 +378,6 @@ def test_no_module_ships_a_shape_keyed_tactic_table() -> None:
     )
 
 
-
 def _has_native_producer(m: int, k: int) -> bool:
     """Can the producer actually launch this (M, K)?
 
@@ -398,6 +395,7 @@ def _has_native_producer(m: int, k: int) -> bool:
     """
     return bool(sm120_producer_variants(m, k))
 
+
 def _native_producer_shapes(header: str) -> set[tuple[int, int]]:
     """Every exact (M, K) the C++ producer dispatcher can actually launch.
 
@@ -406,8 +404,9 @@ def _native_producer_shapes(header: str) -> set[tuple[int, int]]:
     template arguments carry M and K directly.
     """
     body = header[
-        header.index("inline cudaError_t nvfp4_smooth_quantize_lora_down_sm120(") :
-        header.index("// Direct-only n16 diagnostic entry")
+        header.index(
+            "inline cudaError_t nvfp4_smooth_quantize_lora_down_sm120("
+        ) : header.index("// Direct-only n16 diagnostic entry")
     ]
     shapes: set[tuple[int, int]] = set()
     for pattern in (
@@ -449,7 +448,13 @@ def _ffi_guard_shapes() -> set[tuple[int, int]]:
     """
     root = Path(__file__).resolve().parents[2]
     source = (root / "csrc" / "nvfp4_smooth_quantize_sm100.cu").read_text()
-    start = source.index("TVM_FFI_ICHECK(((m ==")
+    # Anchored on a whitespace-tolerant pattern rather than a literal slice of
+    # the expression: where this condition wraps is clang-format's decision, not
+    # a contract, and it moved once already when the file was first formatted.
+    # What the test is actually about is which shapes the guard names.
+    head = re.search(r"TVM_FFI_ICHECK\(\s*\(\(m\s*==", source)
+    assert head is not None, "the SM120 K12 shape guard is no longer in the FFI source"
+    start = head.start()
     end = source.index('<< "x must be one of the measured SM120 K12 shapes";', start)
     guard = source[start:end]
     shapes: set[tuple[int, int]] = set()
@@ -473,9 +478,7 @@ def test_the_ffi_guard_admits_exactly_the_compiled_producers() -> None:
     # failed (artifacts/producer-gap-20260822).
     guard = _ffi_guard_shapes()
     unbacked = sorted(shape for shape in guard if not _has_native_producer(*shape))
-    assert unbacked == [], (
-        f"{unbacked} pass the FFI check but have no producer"
-    )
+    assert unbacked == [], f"{unbacked} pass the FFI check but have no producer"
     # The other direction. It used to read as "we compiled a producer for a
     # shape the FFI will not admit", which was a real waste when producers were
     # per-shape templates. Every legal (M, K) computes a geometry now, so that
@@ -484,13 +487,13 @@ def test_the_ffi_guard_admits_exactly_the_compiled_producers() -> None:
     # guarded against is still a thing worth refusing.
     claimed = set(SM120_FUSED_LINEAR_MK)
     unreachable = sorted(
-        shape for shape in claimed
-        if _has_native_producer(*shape) and shape not in guard
+        shape
+        for shape in claimed
+        if _has_native_producer(*shape)
+        and shape not in guard
         and SM120_PREFIX_ROUTE_LADDER.get(shape, ("", ()))[0] != "cublaslt"
     )
-    assert unreachable == [], (
-        f"{unreachable} have a producer the FFI check will reject"
-    )
+    assert unreachable == [], f"{unreachable} have a producer the FFI check will reject"
 
 
 def test_every_fused_admission_has_a_prefix_that_can_run() -> None:
@@ -501,11 +504,11 @@ def test_every_fused_admission_has_a_prefix_that_can_run() -> None:
     # Then: nothing is admitted that has neither, which would make the C++
     # dispatcher return cudaErrorInvalidValue for a route the tuner can pick.
     # Reachable = the FFI lets it in AND the shape computes a geometry to launch.
-    reachable = {
-        shape for shape in _ffi_guard_shapes() if _has_native_producer(*shape)
-    }
+    reachable = {shape for shape in _ffi_guard_shapes() if _has_native_producer(*shape)}
     cublaslt = {
-        key for key, entry in SM120_PREFIX_ROUTE_LADDER.items() if entry[0] == "cublaslt"
+        key
+        for key, entry in SM120_PREFIX_ROUTE_LADDER.items()
+        if entry[0] == "cublaslt"
     }
     orphans = sorted(set(SM120_FUSED_LINEAR_MK) - reachable - cublaslt)
     assert orphans == [], (
@@ -548,10 +551,21 @@ def test_swept_producers_are_admitted_and_route_native(m: int, k: int) -> None:
 
 @pytest.mark.parametrize(
     "m,k",
-    [(4096, 3072), (1024, 3072), (64, 12288), (256, 12288), (512, 12288),
-     (1024, 12288), (512, 5120), (537, 14336), (1935, 5376)],
+    [
+        (4096, 3072),
+        (1024, 3072),
+        (64, 12288),
+        (256, 12288),
+        (512, 12288),
+        (1024, 12288),
+        (512, 5120),
+        (537, 14336),
+        (1935, 5376),
+    ],
 )
-def test_prefixes_where_fusing_measured_slower_are_offered_anyway(m: int, k: int) -> None:
+def test_prefixes_where_fusing_measured_slower_are_offered_anyway(
+    m: int, k: int
+) -> None:
     # Given: the sweep measured these prefixes too, and on every one the fused
     # producer was SLOWER than the prefix the shape pays today -- 2.9% to 33.3%
     # against the unfused prefix, 11.1% to 55.6% against the cuBLASLt one.
@@ -591,28 +605,6 @@ def test_every_production_prefix_has_a_fused_producer() -> None:
 # the one failure mode that is silent rather than loud.
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 def test_fused_linear_mk_is_the_benchmark_projection() -> None:
     """The named shape list must stay the benchmark matrix, not drift into a gate.
 
@@ -624,5 +616,3 @@ def test_fused_linear_mk_is_the_benchmark_projection() -> None:
     from flashinfer.testing.svdq_model_shapes import MODEL_SHAPE_CASES
 
     assert set(SM120_FUSED_LINEAR_MK) == {(m, k) for m, _, k in MODEL_SHAPE_CASES}
-
-

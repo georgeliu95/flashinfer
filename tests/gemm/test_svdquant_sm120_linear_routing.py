@@ -12,7 +12,6 @@ from flashinfer.gemm import gemm_svdquant
 from flashinfer.gemm import svdquant_sm120_cutlass
 
 
-
 class _FakeTensor:
     """Minimal stand-in for the tensor surface the public entries actually read.
 
@@ -44,6 +43,7 @@ class _FakeTensor:
     def __repr__(self):
         return f"_FakeTensor(shape={self.shape}, dtype={self.dtype})"
 
+
 def test_table_miss_packs_m537_l2t_only_inside_fused_runner(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -65,10 +65,13 @@ def test_table_miss_packs_m537_l2t_only_inside_fused_runner(
     module = SimpleNamespace(
         nvfp4_svdquant_linear_sm120=lambda *args: native_calls.append(args),
     )
-    monkeypatch.setattr(svdquant_sm120_cutlass, "get_compute_capability", lambda device: (12, 0))
     monkeypatch.setattr(
-        svdquant_sm120_cutlass, "get_nvfp4_svdquant_sm120_module",
-        lambda lora_rank=32: module
+        svdquant_sm120_cutlass, "get_compute_capability", lambda device: (12, 0)
+    )
+    monkeypatch.setattr(
+        svdquant_sm120_cutlass,
+        "get_nvfp4_svdquant_sm120_module",
+        lambda lora_rank=32: module,
     )
     monkeypatch.setattr(gemm_svdquant.torch, "empty", fake_empty)
     monkeypatch.setattr(
@@ -78,7 +81,9 @@ def test_table_miss_packs_m537_l2t_only_inside_fused_runner(
         # on its way to a route.
         lambda *args, **kwargs: _FakeTensor((1 << 20,), dtype=torch.uint8),
     )
-    monkeypatch.setattr(svdquant_sm120_cutlass, "_sm120_max_workspace_bytes", lambda *args: 0)
+    monkeypatch.setattr(
+        svdquant_sm120_cutlass, "_sm120_max_workspace_bytes", lambda *args: 0
+    )
     # No _sm120_cutedsl_fallback_device_info stand-in: the CuTeDSL runner it
     # described is deliberately not part of this backend, so the symbol is gone
     # and patching it would only assert that it still exists.
@@ -98,7 +103,9 @@ def test_table_miss_packs_m537_l2t_only_inside_fused_runner(
         chooser_inputs.append(inputs)
         return runner, 81
 
-    monkeypatch.setattr(svdquant_sm120_cutlass, "_choose_sm120_linear_runner", choose_runner)
+    monkeypatch.setattr(
+        svdquant_sm120_cutlass, "_choose_sm120_linear_runner", choose_runner
+    )
 
     x = _FakeTensor((537, 5376), dtype=torch.bfloat16)
     weight = _FakeTensor((5376, 2688), dtype=torch.uint8)

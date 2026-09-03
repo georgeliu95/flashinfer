@@ -438,12 +438,6 @@ def sm120_fused_prefix_route(m: int, k: int) -> PrefixRoute:
 # producer that row selected before this axis existed.
 
 
-
-
-
-
-
-
 # --- producer geometry axis -------------------------------------------------
 #
 # The large-M producer takes its block size and both tile extents as template
@@ -463,17 +457,6 @@ def sm120_fused_prefix_route(m: int, k: int) -> PrefixRoute:
 
 # The geometry each exact large-M shape is pinned to today, which is always
 # variant 0 so an unselected shape runs what it has always run.
-
-
-
-
-
-
-
-
-
-
-
 
 
 def sm120_fused_prefix_uses_packed_l2t(

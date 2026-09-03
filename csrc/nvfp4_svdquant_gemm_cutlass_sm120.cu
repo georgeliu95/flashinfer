@@ -27,8 +27,8 @@
 //   nvfp4_svdquant_gemm_workspace_size : per-tactic workspace query for pre-provisioning.
 //   nvfp4_svdquant_gemm_tactic_row : decoded runtime-tactic row (packed int64).
 
-#include <cublas_v2.h>
 #include <cublasLt.h>
+#include <cublas_v2.h>
 #include <cuda_fp16.h>
 
 #include <array>
@@ -50,40 +50,133 @@ namespace sd = svdquant_sm120;
 // Dispatch a callable template over the compiled kernel configs by kernel id
 // (the decoded runtime-tactic row selects the kernel; scheduler parameters ride
 // along in the row).
-#define SVDQ_SM120_DISPATCH(kernel_id, EXPR)                                          \
-  switch (static_cast<sd::KernelShapeSm120>(kernel_id)) {                             \
-    case sd::KernelShapeSm120::k128x128x128:       { using C = sd::Tactic128x128x128Config;       EXPR; } \
-    case sd::KernelShapeSm120::k128x128x128Swap:   { using C = sd::Tactic128x128x128SwapConfig;   EXPR; } \
-    case sd::KernelShapeSm120::k128x128x128Sk:     { using C = sd::Tactic128x128x128SkConfig;     EXPR; } \
-    case sd::KernelShapeSm120::k128x128x128SwapSk: { using C = sd::Tactic128x128x128SwapSkConfig; EXPR; } \
-    case sd::KernelShapeSm120::k128x128x256:       { using C = sd::Tactic128x128x256Config;       EXPR; } \
-    case sd::KernelShapeSm120::k128x128x256Swap:   { using C = sd::Tactic128x128x256SwapConfig;   EXPR; } \
-    case sd::KernelShapeSm120::k128x128x256Sk:     { using C = sd::Tactic128x128x256SkConfig;     EXPR; } \
-    case sd::KernelShapeSm120::k128x128x256SwapSk: { using C = sd::Tactic128x128x256SwapSkConfig; EXPR; } \
-    case sd::KernelShapeSm120::k256x128x128:       { using C = sd::Tactic256x128x128Config;       EXPR; } \
-    case sd::KernelShapeSm120::k256x128x128Swap:   { using C = sd::Tactic256x128x128SwapConfig;   EXPR; } \
-    case sd::KernelShapeSm120::k256x128x128Sk:     { using C = sd::Tactic256x128x128SkConfig;     EXPR; } \
-    case sd::KernelShapeSm120::k256x128x128SwapSk: { using C = sd::Tactic256x128x128SwapSkConfig; EXPR; } \
-    case sd::KernelShapeSm120::k128x256x128:       { using C = sd::Tactic128x256x128Config;       EXPR; } \
-    case sd::KernelShapeSm120::k128x256x128Swap:   { using C = sd::Tactic128x256x128SwapConfig;   EXPR; } \
-    case sd::KernelShapeSm120::k128x256x128Sk:     { using C = sd::Tactic128x256x128SkConfig;     EXPR; } \
-    case sd::KernelShapeSm120::k128x256x128SwapSk: { using C = sd::Tactic128x256x128SwapSkConfig; EXPR; } \
-    case sd::KernelShapeSm120::k128x64x128Swap:    { using C = sd::Tactic128x64x128SwapConfig;    EXPR; } \
-    case sd::KernelShapeSm120::k128x64x128SwapSk:  { using C = sd::Tactic128x64x128SwapSkConfig;  EXPR; } \
-    case sd::KernelShapeSm120::k128x64x256Swap:    { using C = sd::Tactic128x64x256SwapConfig;    EXPR; } \
-    case sd::KernelShapeSm120::k128x32x128Swap:    { using C = sd::Tactic128x32x128SwapConfig;    EXPR; } \
-    case sd::KernelShapeSm120::k64x128x128:        { using C = sd::Tactic64x128x128Config;        EXPR; } \
-    case sd::KernelShapeSm120::k64x128x256:        { using C = sd::Tactic64x128x256Config;        EXPR; } \
-    case sd::KernelShapeSm120::k128x64x256SwapSk:  { using C = sd::Tactic128x64x256SwapSkConfig;  EXPR; } \
-    case sd::KernelShapeSm120::k128x64x256SwapStatic: { using C = sd::Tactic128x64x256SwapStaticConfig; EXPR; } \
-    case sd::KernelShapeSm120::k128x32x128SwapStatic: { using C = sd::Tactic128x32x128SwapStaticConfig; EXPR; } \
-    case sd::KernelShapeSm120::k64x128x128Static:     { using C = sd::Tactic64x128x128StaticConfig;     EXPR; } \
-    case sd::KernelShapeSm120::k128x32x256Swap:       { using C = sd::Tactic128x32x256SwapConfig;       EXPR; } \
-    case sd::KernelShapeSm120::k128x32x256SwapStatic: { using C = sd::Tactic128x32x256SwapStaticConfig; EXPR; } \
-    case sd::KernelShapeSm120::k64x32x256SwapStatic:  { using C = sd::Tactic64x32x256SwapStaticConfig;  EXPR; } \
-    case sd::KernelShapeSm120::k256x128x128SwapStatic: { using C = sd::Tactic256x128x128SwapStaticConfig; EXPR; } \
-    case sd::KernelShapeSm120::k256x64x128SwapStatic:  { using C = sd::Tactic256x64x128SwapStaticConfig;  EXPR; } \
-  }                                                                                   \
+#define SVDQ_SM120_DISPATCH(kernel_id, EXPR)              \
+  switch (static_cast<sd::KernelShapeSm120>(kernel_id)) { \
+    case sd::KernelShapeSm120::k128x128x128: {            \
+      using C = sd::Tactic128x128x128Config;              \
+      EXPR;                                               \
+    }                                                     \
+    case sd::KernelShapeSm120::k128x128x128Swap: {        \
+      using C = sd::Tactic128x128x128SwapConfig;          \
+      EXPR;                                               \
+    }                                                     \
+    case sd::KernelShapeSm120::k128x128x128Sk: {          \
+      using C = sd::Tactic128x128x128SkConfig;            \
+      EXPR;                                               \
+    }                                                     \
+    case sd::KernelShapeSm120::k128x128x128SwapSk: {      \
+      using C = sd::Tactic128x128x128SwapSkConfig;        \
+      EXPR;                                               \
+    }                                                     \
+    case sd::KernelShapeSm120::k128x128x256: {            \
+      using C = sd::Tactic128x128x256Config;              \
+      EXPR;                                               \
+    }                                                     \
+    case sd::KernelShapeSm120::k128x128x256Swap: {        \
+      using C = sd::Tactic128x128x256SwapConfig;          \
+      EXPR;                                               \
+    }                                                     \
+    case sd::KernelShapeSm120::k128x128x256Sk: {          \
+      using C = sd::Tactic128x128x256SkConfig;            \
+      EXPR;                                               \
+    }                                                     \
+    case sd::KernelShapeSm120::k128x128x256SwapSk: {      \
+      using C = sd::Tactic128x128x256SwapSkConfig;        \
+      EXPR;                                               \
+    }                                                     \
+    case sd::KernelShapeSm120::k256x128x128: {            \
+      using C = sd::Tactic256x128x128Config;              \
+      EXPR;                                               \
+    }                                                     \
+    case sd::KernelShapeSm120::k256x128x128Swap: {        \
+      using C = sd::Tactic256x128x128SwapConfig;          \
+      EXPR;                                               \
+    }                                                     \
+    case sd::KernelShapeSm120::k256x128x128Sk: {          \
+      using C = sd::Tactic256x128x128SkConfig;            \
+      EXPR;                                               \
+    }                                                     \
+    case sd::KernelShapeSm120::k256x128x128SwapSk: {      \
+      using C = sd::Tactic256x128x128SwapSkConfig;        \
+      EXPR;                                               \
+    }                                                     \
+    case sd::KernelShapeSm120::k128x256x128: {            \
+      using C = sd::Tactic128x256x128Config;              \
+      EXPR;                                               \
+    }                                                     \
+    case sd::KernelShapeSm120::k128x256x128Swap: {        \
+      using C = sd::Tactic128x256x128SwapConfig;          \
+      EXPR;                                               \
+    }                                                     \
+    case sd::KernelShapeSm120::k128x256x128Sk: {          \
+      using C = sd::Tactic128x256x128SkConfig;            \
+      EXPR;                                               \
+    }                                                     \
+    case sd::KernelShapeSm120::k128x256x128SwapSk: {      \
+      using C = sd::Tactic128x256x128SwapSkConfig;        \
+      EXPR;                                               \
+    }                                                     \
+    case sd::KernelShapeSm120::k128x64x128Swap: {         \
+      using C = sd::Tactic128x64x128SwapConfig;           \
+      EXPR;                                               \
+    }                                                     \
+    case sd::KernelShapeSm120::k128x64x128SwapSk: {       \
+      using C = sd::Tactic128x64x128SwapSkConfig;         \
+      EXPR;                                               \
+    }                                                     \
+    case sd::KernelShapeSm120::k128x64x256Swap: {         \
+      using C = sd::Tactic128x64x256SwapConfig;           \
+      EXPR;                                               \
+    }                                                     \
+    case sd::KernelShapeSm120::k128x32x128Swap: {         \
+      using C = sd::Tactic128x32x128SwapConfig;           \
+      EXPR;                                               \
+    }                                                     \
+    case sd::KernelShapeSm120::k64x128x128: {             \
+      using C = sd::Tactic64x128x128Config;               \
+      EXPR;                                               \
+    }                                                     \
+    case sd::KernelShapeSm120::k64x128x256: {             \
+      using C = sd::Tactic64x128x256Config;               \
+      EXPR;                                               \
+    }                                                     \
+    case sd::KernelShapeSm120::k128x64x256SwapSk: {       \
+      using C = sd::Tactic128x64x256SwapSkConfig;         \
+      EXPR;                                               \
+    }                                                     \
+    case sd::KernelShapeSm120::k128x64x256SwapStatic: {   \
+      using C = sd::Tactic128x64x256SwapStaticConfig;     \
+      EXPR;                                               \
+    }                                                     \
+    case sd::KernelShapeSm120::k128x32x128SwapStatic: {   \
+      using C = sd::Tactic128x32x128SwapStaticConfig;     \
+      EXPR;                                               \
+    }                                                     \
+    case sd::KernelShapeSm120::k64x128x128Static: {       \
+      using C = sd::Tactic64x128x128StaticConfig;         \
+      EXPR;                                               \
+    }                                                     \
+    case sd::KernelShapeSm120::k128x32x256Swap: {         \
+      using C = sd::Tactic128x32x256SwapConfig;           \
+      EXPR;                                               \
+    }                                                     \
+    case sd::KernelShapeSm120::k128x32x256SwapStatic: {   \
+      using C = sd::Tactic128x32x256SwapStaticConfig;     \
+      EXPR;                                               \
+    }                                                     \
+    case sd::KernelShapeSm120::k64x32x256SwapStatic: {    \
+      using C = sd::Tactic64x32x256SwapStaticConfig;      \
+      EXPR;                                               \
+    }                                                     \
+    case sd::KernelShapeSm120::k256x128x128SwapStatic: {  \
+      using C = sd::Tactic256x128x128SwapStaticConfig;    \
+      EXPR;                                               \
+    }                                                     \
+    case sd::KernelShapeSm120::k256x64x128SwapStatic: {   \
+      using C = sd::Tactic256x64x128SwapStaticConfig;     \
+      EXPR;                                               \
+    }                                                     \
+  }                                                       \
   throw std::invalid_argument("nvfp4_svdquant_gemm (sm120): invalid kernel shape");
 
 size_t nvfp4_svdquant_gemm_workspace_size(int m, int n, int k, int tactic) {
@@ -125,33 +218,28 @@ void nvfp4_svdquant_gemm_run(void* out, void const* A, void const* B, void const
   SVDQ_SM120_DISPATCH(
       rt.kernel_id,
       if constexpr (sd::kCompileInlineDownSm120<C>) {
-        return sd::run_tactic<C>(rt, out, A, B, sfa, sfb, alpha, D, L1, bias,
-                                 nullptr, nullptr, m, n, k, lora_rank, ws, wsBytes,
-                                 stream, enable_pdl);
+        return sd::run_tactic<C>(rt, out, A, B, sfa, sfb, alpha, D, L1, bias, nullptr, nullptr, m,
+                                 n, k, lora_rank, ws, wsBytes, stream, enable_pdl);
       } else {
-        return sd::run_tactic_no_inline_down<C>(rt, out, A, B, sfa, sfb, alpha, D, L1,
-                                                bias, m, n, k, lora_rank, ws, wsBytes,
-                                                stream, enable_pdl);
+        return sd::run_tactic_no_inline_down<C>(rt, out, A, B, sfa, sfb, alpha, D, L1, bias, m, n,
+                                                k, lora_rank, ws, wsBytes, stream, enable_pdl);
       })
 }
 
-void nvfp4_svdquant_gemm_run_inline_down(
-    void* out, void const* A, void const* B, void const* sfa,
-    void const* sfb, float const* alpha, void const* D, void const* L1,
-    void const* bias, void const* inline_down_x, void const* inline_down_l2t,
-    int m, int n, int k, int lora_rank, char* ws, size_t wsBytes,
-    cudaStream_t stream, int tactic, bool enable_pdl) {
+void nvfp4_svdquant_gemm_run_inline_down(void* out, void const* A, void const* B, void const* sfa,
+                                         void const* sfb, float const* alpha, void const* D,
+                                         void const* L1, void const* bias,
+                                         void const* inline_down_x, void const* inline_down_l2t,
+                                         int m, int n, int k, int lora_rank, char* ws,
+                                         size_t wsBytes, cudaStream_t stream, int tactic,
+                                         bool enable_pdl) {
   auto const rt = sd::decode_runtime_tactic(tactic);
-  if (rt.kernel_id != static_cast<int>(
-                          sd::KernelShapeSm120::k256x128x128SwapStatic)) {
-    throw std::invalid_argument(
-        "nvfp4_svdquant_gemm (sm120): inline LoRA-down requires tactic 81");
+  if (rt.kernel_id != static_cast<int>(sd::KernelShapeSm120::k256x128x128SwapStatic)) {
+    throw std::invalid_argument("nvfp4_svdquant_gemm (sm120): inline LoRA-down requires tactic 81");
   }
   using C = sd::Tactic256x128x128SwapStaticConfig;
-  return sd::run_tactic<C>(
-      rt, out, A, B, sfa, sfb, alpha, D, L1, bias, inline_down_x,
-      inline_down_l2t, m, n, k, lora_rank, ws, wsBytes, stream,
-      enable_pdl);
+  return sd::run_tactic<C>(rt, out, A, B, sfa, sfb, alpha, D, L1, bias, inline_down_x,
+                           inline_down_l2t, m, n, k, lora_rank, ws, wsBytes, stream, enable_pdl);
 }
 
 }  // namespace gemm
@@ -170,30 +258,27 @@ inline int64_t swizzled_sf_size(int64_t rows, int64_t sfCols) {
   return pad(rows, 128) * pad(sfCols, 4);
 }
 
-cudaError_t configure_case7_xq_persisting_l2(
-    int device_index, cudaStream_t stream, void* base,
-    std::size_t window_extent_bytes, std::size_t persisting_budget_bytes) {
+cudaError_t configure_case7_xq_persisting_l2(int device_index, cudaStream_t stream, void* base,
+                                             std::size_t window_extent_bytes,
+                                             std::size_t persisting_budget_bytes) {
   int persisting_l2_bytes = 0;
-  cudaError_t status = cudaDeviceGetAttribute(
-      &persisting_l2_bytes, cudaDevAttrMaxPersistingL2CacheSize,
-      device_index);
+  cudaError_t status = cudaDeviceGetAttribute(&persisting_l2_bytes,
+                                              cudaDevAttrMaxPersistingL2CacheSize, device_index);
   if (status != cudaSuccess) {
     return status;
   }
   int access_window_bytes = 0;
-  status = cudaDeviceGetAttribute(
-      &access_window_bytes, cudaDevAttrMaxAccessPolicyWindowSize,
-      device_index);
+  status = cudaDeviceGetAttribute(&access_window_bytes, cudaDevAttrMaxAccessPolicyWindowSize,
+                                  device_index);
   if (status != cudaSuccess) {
     return status;
   }
-  if (persisting_l2_bytes <= 0 || access_window_bytes <= 0 ||
-      window_extent_bytes == 0 || persisting_budget_bytes == 0) {
+  if (persisting_l2_bytes <= 0 || access_window_bytes <= 0 || window_extent_bytes == 0 ||
+      persisting_budget_bytes == 0) {
     return cudaSuccess;
   }
-  status = cudaDeviceSetLimit(
-      cudaLimitPersistingL2CacheSize,
-      static_cast<std::size_t>(persisting_l2_bytes));
+  status = cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize,
+                              static_cast<std::size_t>(persisting_l2_bytes));
   if (status != cudaSuccess) {
     return status;
   }
@@ -203,30 +288,25 @@ cudaError_t configure_case7_xq_persisting_l2(
           ? window_extent_bytes
           : static_cast<std::size_t>(access_window_bytes);
   std::size_t const budget_bytes =
-      persisting_budget_bytes <
-              static_cast<std::size_t>(persisting_l2_bytes)
+      persisting_budget_bytes < static_cast<std::size_t>(persisting_l2_bytes)
           ? persisting_budget_bytes
           : static_cast<std::size_t>(persisting_l2_bytes);
-  float const hit_ratio =
-      window_bytes <= budget_bytes
-          ? 1.0f
-          : static_cast<float>(budget_bytes) /
-                static_cast<float>(window_bytes);
+  float const hit_ratio = window_bytes <= budget_bytes
+                              ? 1.0f
+                              : static_cast<float>(budget_bytes) / static_cast<float>(window_bytes);
   cudaStreamAttrValue attribute{};
   attribute.accessPolicyWindow.base_ptr = base;
   attribute.accessPolicyWindow.num_bytes = window_bytes;
   attribute.accessPolicyWindow.hitRatio = hit_ratio;
   attribute.accessPolicyWindow.hitProp = cudaAccessPropertyPersisting;
   attribute.accessPolicyWindow.missProp = cudaAccessPropertyStreaming;
-  return cudaStreamSetAttribute(
-      stream, cudaStreamAttributeAccessPolicyWindow, &attribute);
+  return cudaStreamSetAttribute(stream, cudaStreamAttributeAccessPolicyWindow, &attribute);
 }
 
 cudaError_t clear_xq_persisting_l2(cudaStream_t stream) {
   cudaStreamAttrValue attribute{};
   attribute.accessPolicyWindow.num_bytes = 0;
-  return cudaStreamSetAttribute(
-      stream, cudaStreamAttributeAccessPolicyWindow, &attribute);
+  return cudaStreamSetAttribute(stream, cudaStreamAttributeAccessPolicyWindow, &attribute);
 }
 
 cudaError_t query_stream_capture(cudaStream_t stream, bool& is_capturing) {
@@ -312,8 +392,7 @@ struct LoraDownCublasLtInitGuard {
 };
 
 LoraDownCublasLtState& lora_down_cublaslt_state(int device_id, int m, int k) {
-  static thread_local std::array<
-      LoraDownCublasLtState, LoraDownCublasLtState::kMaxCachedPlans>
+  static thread_local std::array<LoraDownCublasLtState, LoraDownCublasLtState::kMaxCachedPlans>
       states{};
   for (auto& state : states) {
     if (state.initialized && state.device_id == device_id && state.m == m && state.k == k) {
@@ -337,8 +416,7 @@ LoraDownCublasLtState& lora_down_cublaslt_state(int device_id, int m, int k) {
     cublasStatus_t status = cublasLtCreate(&state.handle);
     TVM_FFI_ICHECK_EQ(status, CUBLAS_STATUS_SUCCESS)
         << "failed to create cuBLASLt handle for SM120 LoRA-down";
-    status =
-        cublasLtMatmulDescCreate(&state.operation, CUBLAS_COMPUTE_32F, CUDA_R_32F);
+    status = cublasLtMatmulDescCreate(&state.operation, CUBLAS_COMPUTE_32F, CUDA_R_32F);
     TVM_FFI_ICHECK_EQ(status, CUBLAS_STATUS_SUCCESS)
         << "failed to create cuBLASLt operation for SM120 LoRA-down";
     status = cublasLtMatrixLayoutCreate(&state.l2_layout, CUDA_R_16BF, kRank, k, kRank);
@@ -347,16 +425,15 @@ LoraDownCublasLtState& lora_down_cublaslt_state(int device_id, int m, int k) {
     status = cublasLtMatrixLayoutCreate(&state.x_layout, CUDA_R_16BF, k, m, k);
     TVM_FFI_ICHECK_EQ(status, CUBLAS_STATUS_SUCCESS)
         << "failed to create cuBLASLt X layout for SM120 LoRA-down";
-    status =
-        cublasLtMatrixLayoutCreate(&state.down_layout, CUDA_R_16BF, kRank, m, kRank);
+    status = cublasLtMatrixLayoutCreate(&state.down_layout, CUDA_R_16BF, kRank, m, kRank);
     TVM_FFI_ICHECK_EQ(status, CUBLAS_STATUS_SUCCESS)
         << "failed to create cuBLASLt output layout for SM120 LoRA-down";
     status = cublasLtMatmulPreferenceCreate(&state.preference);
     TVM_FFI_ICHECK_EQ(status, CUBLAS_STATUS_SUCCESS)
         << "failed to create cuBLASLt preference for SM120 LoRA-down";
-    status = cublasLtMatmulPreferenceSetAttribute(
-        state.preference, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &kMaxWorkspaceBytes,
-        sizeof(kMaxWorkspaceBytes));
+    status = cublasLtMatmulPreferenceSetAttribute(state.preference,
+                                                  CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+                                                  &kMaxWorkspaceBytes, sizeof(kMaxWorkspaceBytes));
     TVM_FFI_ICHECK_EQ(status, CUBLAS_STATUS_SUCCESS)
         << "failed to set cuBLASLt workspace limit for SM120 LoRA-down";
     int returned_results = 0;
@@ -366,8 +443,7 @@ LoraDownCublasLtState& lora_down_cublaslt_state(int device_id, int m, int k) {
         state.heuristics.data(), &returned_results);
     TVM_FFI_ICHECK_EQ(status, CUBLAS_STATUS_SUCCESS)
         << "failed to query cuBLASLt heuristic for SM120 LoRA-down";
-    TVM_FFI_ICHECK_GT(returned_results, 0)
-        << "cuBLASLt returned no heuristic for SM120 LoRA-down";
+    TVM_FFI_ICHECK_GT(returned_results, 0) << "cuBLASLt returned no heuristic for SM120 LoRA-down";
     // CTK 13.2 returns eight candidates for the admitted M537 and M1935
     // problems. Cold-L2 sweeps on SM120 (110 SMs) select the candidates below
     // independently for each exact (M, K); keep every other shape on
@@ -382,8 +458,8 @@ LoraDownCublasLtState& lora_down_cublaslt_state(int device_id, int m, int k) {
       heuristic_index = std::atoi(value);
     }
     TVM_FFI_ICHECK(heuristic_index >= 0 && heuristic_index < returned_results)
-        << "SVDQ_SM120_LORA_DOWN_HEURISTIC_INDEX must be in [0, "
-        << returned_results << "), got " << heuristic_index;
+        << "SVDQ_SM120_LORA_DOWN_HEURISTIC_INDEX must be in [0, " << returned_results << "), got "
+        << heuristic_index;
     TVM_FFI_ICHECK_EQ(state.heuristics[heuristic_index].state, CUBLAS_STATUS_SUCCESS)
         << "cuBLASLt heuristic is invalid for SM120 LoRA-down";
     state.heuristic_count = returned_results;
@@ -407,11 +483,9 @@ void run_lora_down_cublaslt(TensorView x, TensorView l2t_smoothed, TensorView do
   TVM_FFI_ICHECK(down.ndim() == 2 && down.size(0) == m && down.size(1) == rank)
       << "down must have shape [m, rank]";
 
-  LoraDownCublasLtState& state =
-      lora_down_cublaslt_state(x.device().device_id, m, k);
-  if (m == 537 &&
-      (state.persisting_l2t_ptr != l2t_smoothed.data_ptr() ||
-       state.persisting_l2t_stream != stream)) {
+  LoraDownCublasLtState& state = lora_down_cublaslt_state(x.device().device_id, m, k);
+  if (m == 537 && (state.persisting_l2t_ptr != l2t_smoothed.data_ptr() ||
+                   state.persisting_l2t_stream != stream)) {
     bool is_capturing = false;
     cudaError_t cuda_status = query_stream_capture(stream, is_capturing);
     TVM_FFI_ICHECK_EQ(cuda_status, cudaSuccess)
@@ -419,11 +493,9 @@ void run_lora_down_cublaslt(TensorView x, TensorView l2t_smoothed, TensorView do
         << cudaGetErrorString(cuda_status);
     if (!is_capturing) {
       std::size_t const l2t_bytes =
-          static_cast<std::size_t>(l2t_smoothed.numel()) *
-          get_element_size(l2t_smoothed);
-      cuda_status = configure_case7_xq_persisting_l2(
-          x.device().device_id, stream, l2t_smoothed.data_ptr(), l2t_bytes,
-          l2t_bytes);
+          static_cast<std::size_t>(l2t_smoothed.numel()) * get_element_size(l2t_smoothed);
+      cuda_status = configure_case7_xq_persisting_l2(x.device().device_id, stream,
+                                                     l2t_smoothed.data_ptr(), l2t_bytes, l2t_bytes);
       TVM_FFI_ICHECK_EQ(cuda_status, cudaSuccess)
           << "failed to configure M537 L2T persisting-L2 window: "
           << cudaGetErrorString(cuda_status);
@@ -432,19 +504,16 @@ void run_lora_down_cublaslt(TensorView x, TensorView l2t_smoothed, TensorView do
     }
   }
   auto const& heuristic = state.heuristics[state.heuristic_index];
-  std::size_t const workspace_bytes =
-      workspace_buffer.numel() * get_element_size(workspace_buffer);
+  std::size_t const workspace_bytes = workspace_buffer.numel() * get_element_size(workspace_buffer);
   TVM_FFI_ICHECK_GE(workspace_bytes, heuristic.workspaceSize)
       << "workspace buffer is too small for cuBLASLt SM120 LoRA-down";
   float const one = 1.0f;
   float const zero = 0.0f;
   cublasStatus_t status = cublasLtMatmul(
-      state.handle, state.operation, &one, l2t_smoothed.data_ptr(), state.l2_layout,
-      x.data_ptr(), state.x_layout, &zero, down.data_ptr(), state.down_layout,
-      down.data_ptr(), state.down_layout, &heuristic.algo, workspace_buffer.data_ptr(),
-      workspace_bytes, stream);
-  TVM_FFI_ICHECK_EQ(status, CUBLAS_STATUS_SUCCESS)
-      << "cuBLASLt BF16 LoRA-down launch failed";
+      state.handle, state.operation, &one, l2t_smoothed.data_ptr(), state.l2_layout, x.data_ptr(),
+      state.x_layout, &zero, down.data_ptr(), state.down_layout, down.data_ptr(), state.down_layout,
+      &heuristic.algo, workspace_buffer.data_ptr(), workspace_bytes, stream);
+  TVM_FFI_ICHECK_EQ(status, CUBLAS_STATUS_SUCCESS) << "cuBLASLt BF16 LoRA-down launch failed";
 }
 
 }  // namespace
@@ -453,29 +522,33 @@ void run_lora_down_cublaslt(TensorView x, TensorView l2t_smoothed, TensorView do
 void nvfp4_quantize_smooth(TensorView x, TensorView pqs, TensorView global_scale, TensorView xq,
                            TensorView sf, bool enable_pdl);
 
-void nvfp4_quantize_smooth_lora_down_sm120(TensorView x, TensorView pqs,
-                                           TensorView global_scale, TensorView l2t_smoothed,
-                                           TensorView xq, TensorView sf, TensorView down);
+void nvfp4_quantize_smooth_lora_down_sm120(TensorView x, TensorView pqs, TensorView global_scale,
+                                           TensorView l2t_smoothed, TensorView xq, TensorView sf,
+                                           TensorView down);
 // Geometry-selecting producer entry. Separate symbol so the seven-argument FFI
 // export keeps its arity; see nvfp4_smooth_quantize_sm100.cu.
-void nvfp4_quantize_smooth_lora_down_geometry_sm120(
-    TensorView x, TensorView pqs, TensorView global_scale, TensorView l2t_smoothed,
-    TensorView xq, TensorView sf, TensorView down, int geometry_variant);
+void nvfp4_quantize_smooth_lora_down_geometry_sm120(TensorView x, TensorView pqs,
+                                                    TensorView global_scale,
+                                                    TensorView l2t_smoothed, TensorView xq,
+                                                    TensorView sf, TensorView down,
+                                                    int geometry_variant);
 // Producer entry that takes the geometry as numbers rather than as an index
 // into a ladder both languages have to agree on; see nvfp4_smooth_quantize_sm100.cu.
-void nvfp4_quantize_smooth_lora_down_dyn_sm120(
-    TensorView x, TensorView pqs, TensorView global_scale, TensorView l2t_smoothed,
-    TensorView xq, TensorView sf, TensorView down, int family, int tiling0, int tiling1,
-    int tiling2, int address_policy);
+void nvfp4_quantize_smooth_lora_down_dyn_sm120(TensorView x, TensorView pqs,
+                                               TensorView global_scale, TensorView l2t_smoothed,
+                                               TensorView xq, TensorView sf, TensorView down,
+                                               int family, int tiling0, int tiling1, int tiling2,
+                                               int address_policy);
 
+void nvfp4_quantize_smooth_lora_down_overlap_sm120(TensorView x, TensorView pqs,
+                                                   TensorView global_scale, TensorView l2t_smoothed,
+                                                   TensorView xq, TensorView sf, TensorView down);
 
-void nvfp4_quantize_smooth_lora_down_overlap_sm120(
-    TensorView x, TensorView pqs, TensorView global_scale,
-    TensorView l2t_smoothed, TensorView xq, TensorView sf, TensorView down);
-
-void nvfp4_quantize_smooth_lora_down_cublaslt_sm120(
-    TensorView x, TensorView pqs, TensorView global_scale, TensorView l2t_smoothed,
-    TensorView xq, TensorView sf, TensorView down, TensorView workspace_buffer) {
+void nvfp4_quantize_smooth_lora_down_cublaslt_sm120(TensorView x, TensorView pqs,
+                                                    TensorView global_scale,
+                                                    TensorView l2t_smoothed, TensorView xq,
+                                                    TensorView sf, TensorView down,
+                                                    TensorView workspace_buffer) {
   CHECK_INPUT_AND_TYPE(l2t_smoothed, dl_bfloat16);
   CHECK_INPUT_AND_TYPE(down, dl_bfloat16);
   CHECK_INPUT_AND_TYPE(workspace_buffer, dl_uint8);
@@ -485,10 +558,8 @@ void nvfp4_quantize_smooth_lora_down_cublaslt_sm120(
   TVM_FFI_ICHECK(
       x.ndim() == 2 &&
       ((((x.size(0) == 512 || x.size(0) == 7800) && x.size(1) == 5120) ||
-        (x.size(0) == 537 &&
-         (x.size(1) == 5120 || x.size(1) == 7168 || x.size(1) == 14336)) ||
-        (x.size(0) == 1935 &&
-         (x.size(1) == 5120 || x.size(1) == 5376 || x.size(1) == 7168))) ||
+        (x.size(0) == 537 && (x.size(1) == 5120 || x.size(1) == 7168 || x.size(1) == 14336)) ||
+        (x.size(0) == 1935 && (x.size(1) == 5120 || x.size(1) == 5376 || x.size(1) == 7168))) ||
        // A/B seam only: an exact shape the ladder has explicitly moved onto this
        // prefix for a matched measurement. Inert with the variable unset, so the
        // admitted set above is unchanged in production.
@@ -514,12 +585,11 @@ void nvfp4_quantize_smooth_lora_down_cublaslt_sm120(
 // D [m, 32] = x_hat @ L2ᵀ (bf16) and L1 [n, 32] = svdquant_lora_b / alpha (bf16; 1/alpha folded so
 // the epilogue out = alpha * acc yields the LoRA). One module serves one LoRA rank;
 // any other rank is rejected. out [m, n] bf16, allocated by the caller.
-void nvfp4_svdquant_gemm_impl(
-    TensorView a, TensorView b, TensorView a_sf, TensorView b_sf,
-    TensorView alpha, TensorView d, TensorView l1,
-    Optional<TensorView> const& bias, TensorView out,
-    TensorView workspace_buffer, int64_t tactic, bool enable_pdl,
-    void const* inline_down_x, void const* inline_down_l2t) {
+void nvfp4_svdquant_gemm_impl(TensorView a, TensorView b, TensorView a_sf, TensorView b_sf,
+                              TensorView alpha, TensorView d, TensorView l1,
+                              Optional<TensorView> const& bias, TensorView out,
+                              TensorView workspace_buffer, int64_t tactic, bool enable_pdl,
+                              void const* inline_down_x, void const* inline_down_l2t) {
   CHECK_INPUT_AND_TYPE(a, FLOAT4_E2M1X2);
   CHECK_INPUT_AND_TYPE(b, FLOAT4_E2M1X2);
   CHECK_INPUT_AND_TYPE(a_sf, SF_DTYPE);
@@ -590,17 +660,15 @@ void nvfp4_svdquant_gemm_impl(
   // Empty batch: out is [0, n], nothing to compute.
   if (m == 0) return;
 
-  int const tacticId =
-      tactic < 0
-          ? flashinfer::gemm::nvfp4_svdquant_gemm_fallback_tactic(
-                static_cast<int>(m), static_cast<int>(n), static_cast<int>(k),
-                static_cast<int>(loraRank))
-          : static_cast<int>(tactic);
-  TVM_FFI_ICHECK_GE(tacticId, 0)
-      << "no feasible NVFP4 SVDQuant SM120 fallback tactic for m=" << m << ", n=" << n
-      << ", k=" << k << ", rank=" << loraRank << " (this module was built for LoRA rank "
-      << flashinfer::gemm::svdquant_sm120::kSvdqSm120ModuleLoRaRank
-      << "; a rank above what a tile can stage has no tactic here)";
+  int const tacticId = tactic < 0 ? flashinfer::gemm::nvfp4_svdquant_gemm_fallback_tactic(
+                                        static_cast<int>(m), static_cast<int>(n),
+                                        static_cast<int>(k), static_cast<int>(loraRank))
+                                  : static_cast<int>(tactic);
+  TVM_FFI_ICHECK_GE(tacticId, 0) << "no feasible NVFP4 SVDQuant SM120 fallback tactic for m=" << m
+                                 << ", n=" << n << ", k=" << k << ", rank=" << loraRank
+                                 << " (this module was built for LoRA rank "
+                                 << flashinfer::gemm::svdquant_sm120::kSvdqSm120ModuleLoRaRank
+                                 << "; a rank above what a tile can stage has no tactic here)";
 
   size_t const requiredWorkspaceBytes = flashinfer::gemm::nvfp4_svdquant_gemm_workspace_size(
       static_cast<int>(m), static_cast<int>(n), static_cast<int>(k), tacticId);
@@ -613,37 +681,33 @@ void nvfp4_svdquant_gemm_impl(
   int64_t const provided_workspace_size =
       workspace_buffer.numel() * get_element_size(workspace_buffer);
   TVM_FFI_ICHECK_GE(provided_workspace_size, static_cast<int64_t>(requiredWorkspaceBytes))
-      << "workspace buffer too small for tactic " << tacticId << ": need "
-      << requiredWorkspaceBytes << " bytes, got " << provided_workspace_size
+      << "workspace buffer too small for tactic " << tacticId << ": need " << requiredWorkspaceBytes
+      << " bytes, got " << provided_workspace_size
       << " (query nvfp4_svdquant_gemm_workspace_size and pre-provision before launch)";
   if (inline_down_x != nullptr && inline_down_l2t != nullptr) {
     flashinfer::gemm::nvfp4_svdquant_gemm_run_inline_down(
-        out.data_ptr(), a.data_ptr(), b.data_ptr(), a_sf.data_ptr(),
-        b_sf.data_ptr(), static_cast<float const*>(alpha.data_ptr()),
-        d.data_ptr(), l1.data_ptr(), biasPtr, inline_down_x, inline_down_l2t,
-        static_cast<int>(m), static_cast<int>(n), static_cast<int>(k),
-        static_cast<int>(loraRank),
-        reinterpret_cast<char*>(workspace_buffer.data_ptr()),
-        requiredWorkspaceBytes, stream, tacticId, enable_pdl);
+        out.data_ptr(), a.data_ptr(), b.data_ptr(), a_sf.data_ptr(), b_sf.data_ptr(),
+        static_cast<float const*>(alpha.data_ptr()), d.data_ptr(), l1.data_ptr(), biasPtr,
+        inline_down_x, inline_down_l2t, static_cast<int>(m), static_cast<int>(n),
+        static_cast<int>(k), static_cast<int>(loraRank),
+        reinterpret_cast<char*>(workspace_buffer.data_ptr()), requiredWorkspaceBytes, stream,
+        tacticId, enable_pdl);
   } else {
     flashinfer::gemm::nvfp4_svdquant_gemm_run(
-        out.data_ptr(), a.data_ptr(), b.data_ptr(), a_sf.data_ptr(),
-        b_sf.data_ptr(), static_cast<float const*>(alpha.data_ptr()),
-        d.data_ptr(), l1.data_ptr(), biasPtr, static_cast<int>(m),
-        static_cast<int>(n), static_cast<int>(k), static_cast<int>(loraRank),
-        reinterpret_cast<char*>(workspace_buffer.data_ptr()),
-        requiredWorkspaceBytes, stream, tacticId, enable_pdl);
+        out.data_ptr(), a.data_ptr(), b.data_ptr(), a_sf.data_ptr(), b_sf.data_ptr(),
+        static_cast<float const*>(alpha.data_ptr()), d.data_ptr(), l1.data_ptr(), biasPtr,
+        static_cast<int>(m), static_cast<int>(n), static_cast<int>(k), static_cast<int>(loraRank),
+        reinterpret_cast<char*>(workspace_buffer.data_ptr()), requiredWorkspaceBytes, stream,
+        tacticId, enable_pdl);
   }
 }
 
-void nvfp4_svdquant_gemm(
-    TensorView a, TensorView b, TensorView a_sf, TensorView b_sf,
-    TensorView alpha, TensorView d, TensorView l1,
-    Optional<TensorView> const& bias, TensorView out,
-    TensorView workspace_buffer, int64_t tactic, bool enable_pdl) {
-  nvfp4_svdquant_gemm_impl(
-      a, b, a_sf, b_sf, alpha, d, l1, bias, out, workspace_buffer, tactic,
-      enable_pdl, nullptr, nullptr);
+void nvfp4_svdquant_gemm(TensorView a, TensorView b, TensorView a_sf, TensorView b_sf,
+                         TensorView alpha, TensorView d, TensorView l1,
+                         Optional<TensorView> const& bias, TensorView out,
+                         TensorView workspace_buffer, int64_t tactic, bool enable_pdl) {
+  nvfp4_svdquant_gemm_impl(a, b, a_sf, b_sf, alpha, d, l1, bias, out, workspace_buffer, tactic,
+                           enable_pdl, nullptr, nullptr);
 }
 
 #if defined(FLASHINFER_ENABLE_SVDQ_SM120_K1_K2_FUSION)
@@ -652,18 +716,17 @@ void nvfp4_svdquant_gemm(
 // them. Factored out of nvfp4_svdquant_linear_sm120 without changing it so the
 // diagnostic probe seam measures this code rather than a copy of the gate that
 // could drift from it.
-void dispatch_svdquant_producer_sm120(
-    TensorView x, TensorView pqs, TensorView global_scale, TensorView l2t_smoothed,
-    TensorView xq, TensorView a_sf, TensorView down, TensorView workspace_buffer,
-    int producer_variant = 0, int producer_family = -1, int tiling0 = 0, int tiling1 = 0,
-    int tiling2 = 0, int address_policy = 0) {
+void dispatch_svdquant_producer_sm120(TensorView x, TensorView pqs, TensorView global_scale,
+                                      TensorView l2t_smoothed, TensorView xq, TensorView a_sf,
+                                      TensorView down, TensorView workspace_buffer,
+                                      int producer_variant = 0, int producer_family = -1,
+                                      int tiling0 = 0, int tiling1 = 0, int tiling2 = 0,
+                                      int address_policy = 0) {
   bool const measured_cublaslt_lora_down =
       x.ndim() == 2 &&
       ((x.size(0) == 512 && x.size(1) == 5120) ||
-       (x.size(0) == 537 &&
-        (x.size(1) == 5120 || x.size(1) == 7168 || x.size(1) == 14336)) ||
-       (x.size(0) == 1935 &&
-        (x.size(1) == 5120 || x.size(1) == 5376 || x.size(1) == 7168)));
+       (x.size(0) == 537 && (x.size(1) == 5120 || x.size(1) == 7168 || x.size(1) == 14336)) ||
+       (x.size(0) == 1935 && (x.size(1) == 5120 || x.size(1) == 5376 || x.size(1) == 7168)));
   // A/B seam only. With SVDQ_SM120_PREFIX_ROUTE unset this is the measured gate
   // above, verbatim; the reconciliation also fails loudly if the gate and the
   // ladder that drives the Python-side LoRA-down layout ever disagree.
@@ -672,8 +735,8 @@ void dispatch_svdquant_producer_sm120(
                            static_cast<int>(x.size(0)), static_cast<int>(x.size(1)),
                            measured_cublaslt_lora_down, producer_variant);
   if (use_cublaslt_lora_down) {
-    nvfp4_quantize_smooth_lora_down_cublaslt_sm120(
-        x, pqs, global_scale, l2t_smoothed, xq, a_sf, down, workspace_buffer);
+    nvfp4_quantize_smooth_lora_down_cublaslt_sm120(x, pqs, global_scale, l2t_smoothed, xq, a_sf,
+                                                   down, workspace_buffer);
     return;
   }
   // The producer variant carries two axes that never both exist on one shape:
@@ -686,53 +749,46 @@ void dispatch_svdquant_producer_sm120(
   // two languages have to keep in step. An unset geometry means the caller has
   // no opinion, so the shape's own pinned launch still applies.
   if (producer_family >= 0) {
-    nvfp4_quantize_smooth_lora_down_dyn_sm120(x, pqs, global_scale, l2t_smoothed, xq, a_sf,
-                                              down, producer_family, tiling0, tiling1,
-                                              tiling2, address_policy);
+    nvfp4_quantize_smooth_lora_down_dyn_sm120(x, pqs, global_scale, l2t_smoothed, xq, a_sf, down,
+                                              producer_family, tiling0, tiling1, tiling2,
+                                              address_policy);
     return;
   }
-  nvfp4_quantize_smooth_lora_down_geometry_sm120(x, pqs, global_scale, l2t_smoothed, xq,
-                                                 a_sf, down, 0);
+  nvfp4_quantize_smooth_lora_down_geometry_sm120(x, pqs, global_scale, l2t_smoothed, xq, a_sf, down,
+                                                 0);
 }
 
-void nvfp4_svdquant_linear_sm120(
-    TensorView x, TensorView pqs, TensorView global_scale, TensorView l2t_smoothed, TensorView b,
-    TensorView b_sf, TensorView alpha, TensorView l1, Optional<TensorView> const& bias,
-    TensorView xq, TensorView a_sf, TensorView down, TensorView out, TensorView workspace_buffer,
-    int64_t tactic, bool enable_pdl, int64_t producer_family, int64_t tiling0,
-    int64_t tiling1, int64_t tiling2, int64_t address_policy) {
-  bool const use_case7_persisting_l2 =
-      x.ndim() == 2 && x.size(0) == 27280 && x.size(1) == 14336;
+void nvfp4_svdquant_linear_sm120(TensorView x, TensorView pqs, TensorView global_scale,
+                                 TensorView l2t_smoothed, TensorView b, TensorView b_sf,
+                                 TensorView alpha, TensorView l1, Optional<TensorView> const& bias,
+                                 TensorView xq, TensorView a_sf, TensorView down, TensorView out,
+                                 TensorView workspace_buffer, int64_t tactic, bool enable_pdl,
+                                 int64_t producer_family, int64_t tiling0, int64_t tiling1,
+                                 int64_t tiling2, int64_t address_policy) {
+  bool const use_case7_persisting_l2 = x.ndim() == 2 && x.size(0) == 27280 && x.size(1) == 14336;
   cudaStream_t const stream = get_stream(x.device());
-  std::size_t const sf_bytes =
-      static_cast<std::size_t>(a_sf.numel()) * get_element_size(a_sf);
+  std::size_t const sf_bytes = static_cast<std::size_t>(a_sf.numel()) * get_element_size(a_sf);
   int max_persisting_l2_bytes = 0;
   bool configure_case7_persisting_l2 = false;
   if (use_case7_persisting_l2) {
     bool is_capturing = false;
     cudaError_t status = query_stream_capture(stream, is_capturing);
     TVM_FFI_ICHECK_EQ(status, cudaSuccess)
-        << "failed to query case-7 stream capture status: "
-        << cudaGetErrorString(status);
+        << "failed to query case-7 stream capture status: " << cudaGetErrorString(status);
     configure_case7_persisting_l2 = !is_capturing;
   }
   if (configure_case7_persisting_l2) {
     cudaError_t status = cudaDeviceGetAttribute(
-        &max_persisting_l2_bytes,
-        cudaDevAttrMaxPersistingL2CacheSize, x.device().device_id);
+        &max_persisting_l2_bytes, cudaDevAttrMaxPersistingL2CacheSize, x.device().device_id);
     TVM_FFI_ICHECK_EQ(status, cudaSuccess)
-        << "failed to query case-7 persisting-L2 capacity: "
-        << cudaGetErrorString(status);
-    std::size_t const sf_budget =
-        sf_bytes < static_cast<std::size_t>(max_persisting_l2_bytes)
-            ? sf_bytes
-            : static_cast<std::size_t>(max_persisting_l2_bytes);
-    status = configure_case7_xq_persisting_l2(
-        x.device().device_id, stream, a_sf.data_ptr(), sf_bytes,
-        sf_budget);
+        << "failed to query case-7 persisting-L2 capacity: " << cudaGetErrorString(status);
+    std::size_t const sf_budget = sf_bytes < static_cast<std::size_t>(max_persisting_l2_bytes)
+                                      ? sf_bytes
+                                      : static_cast<std::size_t>(max_persisting_l2_bytes);
+    status = configure_case7_xq_persisting_l2(x.device().device_id, stream, a_sf.data_ptr(),
+                                              sf_bytes, sf_budget);
     TVM_FFI_ICHECK_EQ(status, cudaSuccess)
-        << "failed to configure case-7 SF persisting-L2 window: "
-        << cudaGetErrorString(status);
+        << "failed to configure case-7 SF persisting-L2 window: " << cudaGetErrorString(status);
   }
   // The tactic is a packed pair: the producer half selects the prefix and the
   // consumer half is the K3 row. Python resolved the same producer half to pick
@@ -740,32 +796,24 @@ void nvfp4_svdquant_linear_sm120(
   namespace prefix_route = flashinfer::gemm::svdquant_sm120_prefix_route;
   int const producer_variant = prefix_route::producer_variant_of(tactic);
   int const k3_row = prefix_route::k3_row_of(tactic);
-  dispatch_svdquant_producer_sm120(x, pqs, global_scale, l2t_smoothed, xq, a_sf, down,
-                                   workspace_buffer, producer_variant,
-                                   static_cast<int>(producer_family),
-                                   static_cast<int>(tiling0), static_cast<int>(tiling1),
-                                   static_cast<int>(tiling2),
-                                   static_cast<int>(address_policy));
+  dispatch_svdquant_producer_sm120(
+      x, pqs, global_scale, l2t_smoothed, xq, a_sf, down, workspace_buffer, producer_variant,
+      static_cast<int>(producer_family), static_cast<int>(tiling0), static_cast<int>(tiling1),
+      static_cast<int>(tiling2), static_cast<int>(address_policy));
   if (configure_case7_persisting_l2) {
-    std::size_t const max_budget =
-        static_cast<std::size_t>(max_persisting_l2_bytes);
-    std::size_t const xq_budget =
-        max_budget > sf_bytes ? max_budget - sf_bytes : 0;
+    std::size_t const max_budget = static_cast<std::size_t>(max_persisting_l2_bytes);
+    std::size_t const xq_budget = max_budget > sf_bytes ? max_budget - sf_bytes : 0;
     cudaError_t const status = configure_case7_xq_persisting_l2(
-        x.device().device_id, stream, xq.data_ptr(), xq_budget,
-        xq_budget);
+        x.device().device_id, stream, xq.data_ptr(), xq_budget, xq_budget);
     TVM_FFI_ICHECK_EQ(status, cudaSuccess)
-        << "failed to configure case-7 XQ persisting-L2 window: "
-        << cudaGetErrorString(status);
+        << "failed to configure case-7 XQ persisting-L2 window: " << cudaGetErrorString(status);
   }
-  nvfp4_svdquant_gemm_impl(
-      xq, b, a_sf, b_sf, alpha, down, l1, bias, out, workspace_buffer,
-      k3_row, enable_pdl, nullptr, nullptr);
+  nvfp4_svdquant_gemm_impl(xq, b, a_sf, b_sf, alpha, down, l1, bias, out, workspace_buffer, k3_row,
+                           enable_pdl, nullptr, nullptr);
   if (configure_case7_persisting_l2) {
     cudaError_t const status = clear_xq_persisting_l2(stream);
     TVM_FFI_ICHECK_EQ(status, cudaSuccess)
-        << "failed to clear case-7 XQ persisting-L2 window: "
-        << cudaGetErrorString(status);
+        << "failed to clear case-7 XQ persisting-L2 window: " << cudaGetErrorString(status);
   }
 }
 
@@ -776,9 +824,9 @@ void nvfp4_svdquant_linear_sm120(
 // from svdquant_linear: the symbol exists only in the probe build, which the
 // JIT spec caches under its own module name, and no production Python path
 // names it.
-void nvfp4_svdquant_producer_probe_sm120(
-    TensorView x, TensorView pqs, TensorView global_scale, TensorView l2t_smoothed,
-    TensorView xq, TensorView a_sf, TensorView down, TensorView workspace_buffer) {
+void nvfp4_svdquant_producer_probe_sm120(TensorView x, TensorView pqs, TensorView global_scale,
+                                         TensorView l2t_smoothed, TensorView xq, TensorView a_sf,
+                                         TensorView down, TensorView workspace_buffer) {
   dispatch_svdquant_producer_sm120(x, pqs, global_scale, l2t_smoothed, xq, a_sf, down,
                                    workspace_buffer);
 }
@@ -804,11 +852,9 @@ bool nvfp4_svdquant_gemm_can_implement(int64_t m, int64_t n, int64_t k, int64_t 
       static_cast<int>(tactic));
 }
 
-int64_t nvfp4_svdquant_gemm_fallback_tactic(int64_t m, int64_t n, int64_t k,
-                                             int64_t lora_rank) {
+int64_t nvfp4_svdquant_gemm_fallback_tactic(int64_t m, int64_t n, int64_t k, int64_t lora_rank) {
   return flashinfer::gemm::nvfp4_svdquant_gemm_fallback_tactic(
-      static_cast<int>(m), static_cast<int>(n), static_cast<int>(k),
-      static_cast<int>(lora_rank));
+      static_cast<int>(m), static_cast<int>(n), static_cast<int>(k), static_cast<int>(lora_rank));
 }
 
 int64_t nvfp4_svdquant_gemm_shared_storage_size(int64_t tactic) {
@@ -825,8 +871,7 @@ int64_t nvfp4_svdquant_gemm_workspace_size(int64_t m, int64_t n, int64_t k, int6
 // packed into one int64: kernel_id | splits<<8 | raster<<16 | swizzle<<24 |
 // streamk<<32, with raster 0=Heuristic 1=AlongM 2=AlongN.
 int64_t nvfp4_svdquant_gemm_tactic_row(int64_t tactic) {
-  auto const rt =
-      flashinfer::gemm::svdquant_sm120::decode_runtime_tactic(static_cast<int>(tactic));
+  auto const rt = flashinfer::gemm::svdquant_sm120::decode_runtime_tactic(static_cast<int>(tactic));
   int64_t const streamk =
       flashinfer::gemm::svdquant_sm120::kernel_is_streamk_sm120(rt.kernel_id) ? 1 : 0;
   return static_cast<int64_t>(rt.kernel_id) | (static_cast<int64_t>(rt.splits) << 8) |
@@ -838,11 +883,9 @@ int64_t nvfp4_svdquant_gemm_tactic_row(int64_t tactic) {
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(nvfp4_svdquant_gemm, torch_ext::nvfp4_svdquant_gemm);
 #if defined(FLASHINFER_ENABLE_SVDQ_SM120_K1_K2_FUSION)
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(
-    nvfp4_quantize_smooth_lora_down_cublaslt_sm120,
-    torch_ext::nvfp4_quantize_smooth_lora_down_cublaslt_sm120);
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(nvfp4_svdquant_linear_sm120,
-                              torch_ext::nvfp4_svdquant_linear_sm120);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(nvfp4_quantize_smooth_lora_down_cublaslt_sm120,
+                              torch_ext::nvfp4_quantize_smooth_lora_down_cublaslt_sm120);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(nvfp4_svdquant_linear_sm120, torch_ext::nvfp4_svdquant_linear_sm120);
 #if defined(FLASHINFER_ENABLE_SVDQ_SM120_DIAGNOSTIC_PROBE)
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(nvfp4_svdquant_producer_probe_sm120,
                               torch_ext::nvfp4_svdquant_producer_probe_sm120);

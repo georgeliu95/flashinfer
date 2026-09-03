@@ -42,7 +42,9 @@ _SM120_110SM_SM_COUNT = 110
 
 def _parse_cpp_ladder() -> dict[tuple[int, int], tuple[str, frozenset[str]]]:
     text = LADDER_HEADER.read_text()
-    body = text.split("inline constexpr LadderEntry kLadder[] = {", 1)[1].split("};", 1)[0]
+    body = text.split("inline constexpr LadderEntry kLadder[] = {", 1)[1].split(
+        "};", 1
+    )[0]
     ladder: dict[tuple[int, int], tuple[str, frozenset[str]]] = {}
     for match in _LADDER_ENTRY.finditer(body):
         m, k, route, cublaslt, native, native_alt = match.groups()
@@ -69,7 +71,9 @@ def _large_m_geometry(m: int, k: int, block_threads: int, tile_m: int, tile_k: i
     grid_blocks = (padded_m + tile_m - 1) // tile_m
     prefetch_lines = k * _RANK * 2 // 128
     shared_bytes = (
-        2 * tile_m * (tile_k + 8) * 2 + 2 * tile_k * 2 + 2 * (tile_m * sf_cols_per_tile if k >= 8192 else 1)
+        2 * tile_m * (tile_k + 8) * 2
+        + 2 * tile_k * 2
+        + 2 * (tile_m * sf_cols_per_tile if k >= 8192 else 1)
     )
     assert k % tile_k == 0
     assert tile_k % (4 * _SF_VEC_SIZE) == 0
@@ -101,7 +105,9 @@ def test_both_sides_read_the_same_environment_variable() -> None:
 def _parse_measured_gate() -> set[tuple[int, int]]:
     """Recover the literal cuBLASLt-prefix shape set from the TVM-FFI gate."""
     source = LINEAR_SOURCE.read_text()
-    gate = source.split("bool const measured_cublaslt_lora_down =", 1)[1].split(";", 1)[0]
+    gate = source.split("bool const measured_cublaslt_lora_down =", 1)[1].split(";", 1)[
+        0
+    ]
     groups = re.split(r"x\.size\(0\) == (\d+)", gate)[1:]
     shapes: set[tuple[int, int]] = set()
     for index in range(0, len(groups), 2):
@@ -116,7 +122,9 @@ def test_measured_gate_matches_the_ladder_default_column() -> None:
     # When: the literal gate is parsed and compared with the ladder's defaults.
     # Then: the two agree, which is also what the C++ reconciliation enforces.
     ladder_defaults = {
-        key for key, (default, _) in SM120_PREFIX_ROUTE_LADDER.items() if default == "cublaslt"
+        key
+        for key, (default, _) in SM120_PREFIX_ROUTE_LADDER.items()
+        if default == "cublaslt"
     }
     assert _parse_measured_gate() == ladder_defaults
 
@@ -151,8 +159,6 @@ def test_linear_source_call_sites_are_fully_qualified() -> None:
     assert references, "the seam must still be wired into the TU"
     for start in references:
         assert source[start - len("flashinfer::gemm::") : start] == "flashinfer::gemm::"
-
-
 
 
 def test_no_rung_admits_a_route_it_cannot_run() -> None:

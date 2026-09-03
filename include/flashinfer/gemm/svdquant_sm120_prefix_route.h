@@ -291,9 +291,9 @@ inline std::vector<Route> producer_variants(int m, int k) {
   std::vector<Route> variants{entry->default_route};
   for (Route candidate : {Route::kCublaslt, Route::kNative, Route::kNativeAlt}) {
     if (candidate == entry->default_route) continue;
-    bool const admitted = candidate == Route::kCublaslt   ? entry->allows_cublaslt
-                          : candidate == Route::kNative   ? entry->allows_native
-                                                          : entry->allows_native_alt;
+    bool const admitted = candidate == Route::kCublaslt ? entry->allows_cublaslt
+                          : candidate == Route::kNative ? entry->allows_native
+                                                        : entry->allows_native_alt;
     if (admitted) variants.push_back(candidate);
   }
   return variants;
@@ -304,15 +304,15 @@ inline std::vector<Route> producer_variants(int m, int k) {
 // must agree with the ladder's default column, because Python selects the
 // LoRA-down layout from that column and a silent disagreement would hand the
 // prepacked matrix to a prefix that expects the row-major one.
-inline bool resolve_cublaslt_prefix(int m, int k, bool measured_gate,
-                                   int producer_variant = 0) {
+inline bool resolve_cublaslt_prefix(int m, int k, bool measured_gate, int producer_variant = 0) {
   LadderEntry const* entry = find_ladder_entry(m, k);
   if (entry == nullptr) {
     return measured_gate;
   }
   if ((entry->default_route == Route::kCublaslt) != measured_gate) {
-    throw std::runtime_error(std::string(kEnvName) + " ladder disagrees with the measured gate at (" +
-                             std::to_string(m) + ", " + std::to_string(k) + ")");
+    throw std::runtime_error(std::string(kEnvName) +
+                             " ladder disagrees with the measured gate at (" + std::to_string(m) +
+                             ", " + std::to_string(k) + ")");
   }
   // The reconciliation above stays on the DEFAULT column: it is what guards the
   // two copies of the gate against drifting apart, and comparing the effective

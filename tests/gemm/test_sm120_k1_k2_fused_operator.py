@@ -17,8 +17,6 @@ from flashinfer.gemm.gemm_svdquant import nvfp4_quantize_smooth, svdquant_linear
 from flashinfer.gemm.svdquant_sm120_cutlass import get_nvfp4_svdquant_sm120_module
 
 
-
-
 # The producer half of the FFI. -1 means "the caller has no opinion about the
 # producer geometry", which keeps the shape-dispatched templated launch these
 # tests were written against; the runtime-M/K conversion added producer_family,
@@ -138,9 +136,10 @@ def test_sm120_m537_l2t_pack_matches_kernel_lane_mapping(k: int) -> None:
     ):
         source_row = step * 16 + half * 8 + pair * 2 + within
         source_col = tile_n * 16 + fragment * 8 + group
-        assert packed_tiles[
-            step, tile_n, fragment, group, pair, half, within
-        ].item() == source[source_row, source_col].item()
+        assert (
+            packed_tiles[step, tile_n, fragment, group, pair, half, within].item()
+            == source[source_row, source_col].item()
+        )
 
 
 def test_sm120_m537_l2t_pack_cache_reuses_and_invalidates() -> None:
@@ -227,10 +226,11 @@ def test_sm120_fused_k1_k2_matches_unfused_outputs(m: int, k: int) -> None:
         .contiguous()
     )
     global_scale = (
-        (448.0 * 6.0)
-        / (x.float() * pre_quant_scale.float()).abs().nan_to_num().max()
+        (448.0 * 6.0) / (x.float() * pre_quant_scale.float()).abs().nan_to_num().max()
     ).reshape(1)
-    l2t_smoothed = torch.randn((k, 32), dtype=torch.bfloat16, device="cuda").contiguous()
+    l2t_smoothed = torch.randn(
+        (k, 32), dtype=torch.bfloat16, device="cuda"
+    ).contiguous()
     xq = torch.empty((m, k // 2), dtype=torch.uint8, device="cuda")
     sf = torch.empty(
         (((m + 127) // 128) * 128 * (k // 16),),
@@ -395,7 +395,9 @@ def test_sm120_fused_k1_k2_rejects_non_exact_shape() -> None:
         (1935, 21504, 5376, 8),
     ),
 )
-def test_sm120_combined_k12_k3_matches_separate_launches(m: int, n: int, k: int, tactic: int) -> None:
+def test_sm120_combined_k12_k3_matches_separate_launches(
+    m: int, n: int, k: int, tactic: int
+) -> None:
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0):
         pytest.skip("requires SM120")
 
@@ -408,31 +410,22 @@ def test_sm120_combined_k12_k3_matches_separate_launches(m: int, n: int, k: int,
         .contiguous()
     )
     global_scale = (
-        (448.0 * 6.0)
-        / (x.float() * pre_quant_scale.float()).abs().nan_to_num().max()
+        (448.0 * 6.0) / (x.float() * pre_quant_scale.float()).abs().nan_to_num().max()
     ).reshape(1)
     l2t_smoothed = torch.randn(
         (k, rank), dtype=torch.bfloat16, device="cuda"
     ).contiguous()
-    weight_fp4 = torch.randint(
-        0, 256, (n, k // 2), dtype=torch.uint8, device="cuda"
-    )
-    weight_sf = torch.ones(
-        (n * (k // 16),), dtype=torch.uint8, device="cuda"
-    )
+    weight_fp4 = torch.randint(0, 256, (n, k // 2), dtype=torch.uint8, device="cuda")
+    weight_sf = torch.ones((n * (k // 16),), dtype=torch.uint8, device="cuda")
     alpha = torch.ones((1,), dtype=torch.float32, device="cuda")
-    l1_scaled = torch.randn(
-        (n, rank), dtype=torch.bfloat16, device="cuda"
-    ).contiguous()
+    l1_scaled = torch.randn((n, rank), dtype=torch.bfloat16, device="cuda").contiguous()
     bias = torch.randn((n,), dtype=torch.bfloat16, device="cuda").contiguous()
     module = get_nvfp4_svdquant_sm120_module()
     workspace_bytes = max(
         32 * 1024 * 1024,
         int(module.nvfp4_svdquant_gemm_workspace_size(m, n, k, tactic)),
     )
-    workspace = torch.empty(
-        (workspace_bytes,), dtype=torch.uint8, device="cuda"
-    )
+    workspace = torch.empty((workspace_bytes,), dtype=torch.uint8, device="cuda")
 
     separate = (
         torch.empty((m, k // 2), dtype=torch.uint8, device="cuda"),
@@ -562,10 +555,11 @@ def test_sm120_k12288_large_m_writes_every_output_byte(m: int, k: int) -> None:
         .contiguous()
     )
     global_scale = (
-        (448.0 * 6.0)
-        / (x.float() * pre_quant_scale.float()).abs().nan_to_num().max()
+        (448.0 * 6.0) / (x.float() * pre_quant_scale.float()).abs().nan_to_num().max()
     ).reshape(1)
-    l2t_smoothed = torch.randn((k, 32), dtype=torch.bfloat16, device="cuda").contiguous()
+    l2t_smoothed = torch.randn(
+        (k, 32), dtype=torch.bfloat16, device="cuda"
+    ).contiguous()
     xq = torch.empty((m, k // 2), dtype=torch.uint8, device="cuda")
     sf = torch.empty(
         (((m + 127) // 128) * 128 * (k // 16),),
@@ -724,31 +718,22 @@ def test_sm120_k12288_large_m_combined_k12_k3_matches_separate_launches(
         .contiguous()
     )
     global_scale = (
-        (448.0 * 6.0)
-        / (x.float() * pre_quant_scale.float()).abs().nan_to_num().max()
+        (448.0 * 6.0) / (x.float() * pre_quant_scale.float()).abs().nan_to_num().max()
     ).reshape(1)
     l2t_smoothed = torch.randn(
         (k, rank), dtype=torch.bfloat16, device="cuda"
     ).contiguous()
-    weight_fp4 = torch.randint(
-        0, 256, (n, k // 2), dtype=torch.uint8, device="cuda"
-    )
-    weight_sf = torch.ones(
-        (n * (k // 16),), dtype=torch.uint8, device="cuda"
-    )
+    weight_fp4 = torch.randint(0, 256, (n, k // 2), dtype=torch.uint8, device="cuda")
+    weight_sf = torch.ones((n * (k // 16),), dtype=torch.uint8, device="cuda")
     alpha = torch.ones((1,), dtype=torch.float32, device="cuda")
-    l1_scaled = torch.randn(
-        (n, rank), dtype=torch.bfloat16, device="cuda"
-    ).contiguous()
+    l1_scaled = torch.randn((n, rank), dtype=torch.bfloat16, device="cuda").contiguous()
     bias = torch.randn((n,), dtype=torch.bfloat16, device="cuda").contiguous()
     module = get_nvfp4_svdquant_sm120_module()
     workspace_bytes = max(
         32 * 1024 * 1024,
         int(module.nvfp4_svdquant_gemm_workspace_size(m, n, k, tactic)),
     )
-    workspace = torch.empty(
-        (workspace_bytes,), dtype=torch.uint8, device="cuda"
-    )
+    workspace = torch.empty((workspace_bytes,), dtype=torch.uint8, device="cuda")
 
     separate = (
         torch.empty((m, k // 2), dtype=torch.uint8, device="cuda"),
@@ -910,7 +895,6 @@ def _production_ffi_body(csrc: str) -> str:
     return body
 
 
-
 def test_sm120_m32760_k1536_has_exact_production_admission() -> None:
     retained_launch = "launch_large_m_kernel<32760, 1536, 256, 32, 256>"
     # The dispatcher used to carry an "m == 32760 && k == 1536" branch and this
@@ -978,8 +962,7 @@ def _n16_producer_inputs(
         .contiguous()
     )
     global_scale = (
-        (448.0 * 6.0)
-        / (x.float() * pre_quant_scale.float()).abs().nan_to_num().max()
+        (448.0 * 6.0) / (x.float() * pre_quant_scale.float()).abs().nan_to_num().max()
     ).reshape(1)
     l2t_smoothed = torch.randn(
         (_N16_K, _N16_RANK), dtype=torch.bfloat16, device="cuda"
@@ -1068,12 +1051,18 @@ def test_sm120_m512_k3072_n16_is_a_candidate_only_seam() -> None:
     # This pre-existing fused route keeps the base route ABI: its runner set did
     # not change, so the records the tuner persisted under that name stay
     # reachable.
-    assert svdquant_sm120_cutlass._sm120_fused_linear_supported(_N16_M, _N16_K, _N16_RANK)
+    assert svdquant_sm120_cutlass._sm120_fused_linear_supported(
+        _N16_M, _N16_K, _N16_RANK
+    )
     assert svdquant_sm120_cutlass._SM120_LINEAR_ROUTE_ABI_VERSION == 5
     assert (
-        svdquant_sm120_cutlass._sm120_linear_route_abi_version(_N16_M, _N16_K, _N16_RANK) == 5
+        svdquant_sm120_cutlass._sm120_linear_route_abi_version(
+            _N16_M, _N16_K, _N16_RANK
+        )
+        == 5
     )
     assert svdquant_sm120_cutlass._SM120_TACTIC_ABI_VERSION == 3
+
 
 def test_sm120_m512_k3072_n16_is_exported_beside_the_production_producer() -> None:
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0):
@@ -1111,12 +1100,10 @@ def test_sm120_m512_k3072_n16_writes_every_output_byte() -> None:
         torch.cuda.synchronize()
 
         assert torch.equal(xq, xq_ref), (
-            "n16 xq left unwritten or wrong after the "
-            f"0x{xq_sentinel:02x} prefill"
+            f"n16 xq left unwritten or wrong after the 0x{xq_sentinel:02x} prefill"
         )
         assert torch.equal(sf, sf_ref), (
-            "n16 sf left unwritten or wrong after the "
-            f"0x{sf_sentinel:02x} prefill"
+            f"n16 sf left unwritten or wrong after the 0x{sf_sentinel:02x} prefill"
         )
         assert bool(torch.isfinite(down).all()), (
             "n16 down retains the NaN prefill after the opposing "
@@ -1201,9 +1188,7 @@ def test_sm120_m512_k3072_n16_rejects_non_rank32_lora(lora_rank: int) -> None:
     x = torch.empty((_N16_M, _N16_K), dtype=torch.bfloat16, device="cuda")
     pre_quant_scale = torch.empty((_N16_K,), dtype=torch.bfloat16, device="cuda")
     global_scale = torch.ones((1,), dtype=torch.float32, device="cuda")
-    l2t_smoothed = torch.empty(
-        (_N16_K, lora_rank), dtype=torch.bfloat16, device="cuda"
-    )
+    l2t_smoothed = torch.empty((_N16_K, lora_rank), dtype=torch.bfloat16, device="cuda")
     xq = torch.empty((_N16_M, _N16_K // 2), dtype=torch.uint8, device="cuda")
     sf = torch.empty((_n16_sf_numel(),), dtype=torch.uint8, device="cuda")
     down = torch.empty((_N16_M, lora_rank), dtype=torch.bfloat16, device="cuda")
@@ -1312,9 +1297,7 @@ def test_sm120_m512_k3072_public_rows0_and_28_keep_the_production_producer() -> 
         weight_fp4 = torch.randint(
             0, 256, (n, _N16_K // 2), dtype=torch.uint8, device="cuda"
         )
-        weight_sf = torch.ones(
-            (n * (_N16_K // 16),), dtype=torch.uint8, device="cuda"
-        )
+        weight_sf = torch.ones((n * (_N16_K // 16),), dtype=torch.uint8, device="cuda")
         alpha = torch.ones((1,), dtype=torch.float32, device="cuda")
         l1_scaled = torch.randn(
             (n, _N16_RANK), dtype=torch.bfloat16, device="cuda"
@@ -1322,16 +1305,14 @@ def test_sm120_m512_k3072_public_rows0_and_28_keep_the_production_producer() -> 
         bias = torch.randn((n,), dtype=torch.bfloat16, device="cuda").contiguous()
         workspace_bytes = max(
             32 * 1024 * 1024,
-            int(
-                module.nvfp4_svdquant_gemm_workspace_size(
-                    _N16_M, n, _N16_K, tactic
-                )
-            ),
+            int(module.nvfp4_svdquant_gemm_workspace_size(_N16_M, n, _N16_K, tactic)),
         )
         workspace = torch.empty((workspace_bytes,), dtype=torch.uint8, device="cuda")
         row = "row 0" if n == _N16_ROW0_N else "row 28"
 
-        for lora_weight, reference in zip((l2t_smoothed, perturbed_l2t), references, strict=False):
+        for lora_weight, reference in zip(
+            (l2t_smoothed, perturbed_l2t), references, strict=False
+        ):
             combined_xq, combined_sf, combined_down = _n16_producer_outputs()
             combined_output = torch.full(
                 (_N16_M, n), float("nan"), dtype=torch.bfloat16, device="cuda"
@@ -1417,8 +1398,8 @@ def _skip_unless_free_device_memory(required_bytes: int) -> None:
     free_bytes, _ = torch.cuda.mem_get_info()
     if free_bytes < required_bytes:
         pytest.skip(
-            f"needs {required_bytes / 1024 ** 3:.1f} GiB free device memory, "
-            f"only {free_bytes / 1024 ** 3:.1f} GiB available"
+            f"needs {required_bytes / 1024**3:.1f} GiB free device memory, "
+            f"only {free_bytes / 1024**3:.1f} GiB available"
         )
 
 
@@ -1464,7 +1445,11 @@ def test_sm120_h3_row52_admission_is_exactly_one_shape() -> None:
     # "Exact" is about the admission being keyed on the (M, K) pair and not
     # generalising -- so the K set is pinned outright, and a K nobody measured
     # stays out.
-    assert {k for m, k in SM120_FUSED_LINEAR_MK if m == _H3_ROW52_M} == {5376, 7168, 14336}
+    assert {k for m, k in SM120_FUSED_LINEAR_MK if m == _H3_ROW52_M} == {
+        5376,
+        7168,
+        14336,
+    }
     for k in (5120, 7040, 12288):
         _assert_admission_tracks_the_ladder(_H3_ROW52_M, k, _H3_ROW52_RANK)
     # Rank is part of the admission, not just of the FFI contract.
@@ -1498,7 +1483,11 @@ def test_sm120_h3_row61_admission_is_exactly_one_new_shape() -> None:
     # "Exact" is about the admission being keyed on the (M, K) pair and not
     # generalising -- so the K set is pinned outright, and a K nobody measured
     # stays out.
-    assert {k for m, k in SM120_FUSED_LINEAR_MK if m == _H3_ROW61_M} == {5376, 7168, 14336}
+    assert {k for m, k in SM120_FUSED_LINEAR_MK if m == _H3_ROW61_M} == {
+        5376,
+        7168,
+        14336,
+    }
     for k in (5120, 7040, 12288):
         _assert_admission_tracks_the_ladder(_H3_ROW61_M, k, _H3_ROW52_RANK)
     for rank in (16, 64):
@@ -1532,7 +1521,11 @@ def test_sm120_h3_row70_admission_is_exactly_one_new_shape() -> None:
     # "Exact" is about the admission being keyed on the (M, K) pair and not
     # generalising -- so the K set is pinned outright, and a K nobody measured
     # stays out.
-    assert {k for m, k in SM120_FUSED_LINEAR_MK if m == _H3_ROW70_M} == {5376, 7168, 14336}
+    assert {k for m, k in SM120_FUSED_LINEAR_MK if m == _H3_ROW70_M} == {
+        5376,
+        7168,
+        14336,
+    }
     for k in (5120, 7040, 12288):
         _assert_admission_tracks_the_ladder(_H3_ROW70_M, k, _H3_ROW52_RANK)
     for rank in (16, 64):
@@ -1550,8 +1543,6 @@ def test_sm120_h3_row68_admission_is_exactly_one_new_shape() -> None:
         _assert_admission_tracks_the_ladder(_H3_ROW70_M, k, _H3_ROW52_RANK)
     for rank in (16, 64):
         _assert_admission_tracks_the_ladder(_H3_ROW70_M, _H3_ROW68_K, rank)
-
-
 
 
 def test_sm120_h3_routes_bump_abi_only_where_the_runner_set_changed() -> None:
@@ -1620,16 +1611,19 @@ def test_sm120_h3_routes_bump_abi_only_where_the_runner_set_changed() -> None:
 
     # Scoped, not global: the base version every other shape keys on is untouched.
     assert svdquant_sm120_cutlass._SM120_LINEAR_ROUTE_ABI_VERSION == 5
-    assert frozenset(
-        {
-            (_H3_ROW52_M, _H3_ROW52_K, _H3_ROW52_RANK),
-            (_H3_ROW52_M, _H3_ROW50_K, _H3_ROW52_RANK),
-            (_H3_ROW61_M, _H3_ROW52_K, _H3_ROW52_RANK),
-            (_H3_ROW61_M, _H3_ROW59_K, _H3_ROW52_RANK),
-            (_H3_ROW70_M, _H3_ROW52_K, _H3_ROW52_RANK),
-            (_H3_ROW70_M, _H3_ROW68_K, _H3_ROW52_RANK),
-        }
-    ) == svdquant_sm120_cutlass._SM120_LINEAR_ROUTE_V6_MKR, "only the six H3 routes with a screened producer may carry the bump"
+    assert (
+        frozenset(
+            {
+                (_H3_ROW52_M, _H3_ROW52_K, _H3_ROW52_RANK),
+                (_H3_ROW52_M, _H3_ROW50_K, _H3_ROW52_RANK),
+                (_H3_ROW61_M, _H3_ROW52_K, _H3_ROW52_RANK),
+                (_H3_ROW61_M, _H3_ROW59_K, _H3_ROW52_RANK),
+                (_H3_ROW70_M, _H3_ROW52_K, _H3_ROW52_RANK),
+                (_H3_ROW70_M, _H3_ROW68_K, _H3_ROW52_RANK),
+            }
+        )
+        == svdquant_sm120_cutlass._SM120_LINEAR_ROUTE_V6_MKR
+    ), "only the six H3 routes with a screened producer may carry the bump"
     assert svdquant_sm120_cutlass._SM120_TACTIC_ABI_VERSION == 3
 
 
@@ -1681,11 +1675,9 @@ def test_sm120_h3_promoted_producers_are_wired_to_their_routes() -> None:
 def test_sm120_h3_remaining_batch4_routes_are_exact() -> None:
     """Nine measured K12 routes admit exactly their own (M, K)."""
     expected_mkr = frozenset(
-        (m, k, _H3_ROW52_RANK)
-        for m, k, _ in _H3_REMAINING_BATCH4_CANDIDATES
+        (m, k, _H3_ROW52_RANK) for m, k, _ in _H3_REMAINING_BATCH4_CANDIDATES
     )
     assert expected_mkr == svdquant_sm120_cutlass._SM120_LINEAR_ROUTE_V7_MKR
-
 
     for m, k, launch in _H3_REMAINING_BATCH4_CANDIDATES:
         assert svdquant_sm120_cutlass._sm120_fused_linear_supported(
@@ -1693,12 +1685,16 @@ def test_sm120_h3_remaining_batch4_routes_are_exact() -> None:
         )
         _assert_admission_tracks_the_ladder(m + 1, k, _H3_ROW52_RANK)
         _assert_admission_tracks_the_ladder(m, k, 64)
-        assert svdquant_sm120_cutlass._sm120_linear_route_abi_version(
-            m, k, _H3_ROW52_RANK
-        ) == 7
-        assert svdquant_sm120_cutlass._sm120_linear_op_name(
-            m, k, _H3_ROW52_RANK, enable_pdl=False
-        ) == "svdquant_linear_sm120_routes_v7_tactics_v3"
+        assert (
+            svdquant_sm120_cutlass._sm120_linear_route_abi_version(m, k, _H3_ROW52_RANK)
+            == 7
+        )
+        assert (
+            svdquant_sm120_cutlass._sm120_linear_op_name(
+                m, k, _H3_ROW52_RANK, enable_pdl=False
+            )
+            == "svdquant_linear_sm120_routes_v7_tactics_v3"
+        )
         _assert_shape_computes_geometry(m, k, launch)
         # The FFI used to carry an "m == M && k == K" branch per admitted shape.
         # The runtime producer takes the geometry as arguments instead, so what
@@ -1722,20 +1718,19 @@ def test_sm120_h3_remaining_batch4_routes_are_exact() -> None:
 def test_sm120_batch4_gap_closure_routes_are_exact() -> None:
     """Case 4 uses only its screened cuBLASLt prefix."""
     m, _n, k, rank = (537, 5376, 14336, 32)
-    assert frozenset({(m, k, rank)}) == svdquant_sm120_cutlass._SM120_LINEAR_ROUTE_V9_MKR
+    assert (
+        frozenset({(m, k, rank)}) == svdquant_sm120_cutlass._SM120_LINEAR_ROUTE_V9_MKR
+    )
     assert svdquant_sm120_cutlass._sm120_linear_route_abi_version(m, k, rank) == 9
-    assert svdquant_sm120_cutlass._sm120_linear_op_name(
-        m, k, rank, enable_pdl=False
-    ) == "svdquant_linear_sm120_routes_v9_tactics_v3"
+    assert (
+        svdquant_sm120_cutlass._sm120_linear_op_name(m, k, rank, enable_pdl=False)
+        == "svdquant_linear_sm120_routes_v9_tactics_v3"
+    )
     assert svdquant_sm120_cutlass._sm120_fused_linear_supported(m, k, rank)
     _assert_admission_tracks_the_ladder(m + 1, k, rank)
 
-    combined = _read_repo_source(
-        "csrc/nvfp4_svdquant_gemm_cutlass_sm120.cu"
-    )
-    exact_k_set = (
-        "x.size(1) == 5120 || x.size(1) == 7168 || x.size(1) == 14336"
-    )
+    combined = _read_repo_source("csrc/nvfp4_svdquant_gemm_cutlass_sm120.cu")
+    exact_k_set = "x.size(1) == 5120 || x.size(1) == 7168 || x.size(1) == 14336"
     assert combined.count(exact_k_set) == 2
     assert "k == 5120 || k == 7168 || k == 14336" in combined
     assert "k == 5120 ? 2 : k == 5376 ? 4 : k == 7168 ? 5 : 0" in combined
@@ -1755,15 +1750,18 @@ def test_sm120_batch4_k5376_fused_routes_are_exact() -> None:
         (82752, 21504, 5376, 32),
         (82752, 28672, 5376, 32),
     )
-    assert frozenset(
-        {
-            (1935, 5376, 32),
-            (6913, 5376, 32),
-            (73984, 5376, 32),
-            (61056, 5376, 32),
-            (82752, 5376, 32),
-        }
-    ) == svdquant_sm120_cutlass._SM120_LINEAR_ROUTE_V8_MKR
+    assert (
+        frozenset(
+            {
+                (1935, 5376, 32),
+                (6913, 5376, 32),
+                (73984, 5376, 32),
+                (61056, 5376, 32),
+                (82752, 5376, 32),
+            }
+        )
+        == svdquant_sm120_cutlass._SM120_LINEAR_ROUTE_V8_MKR
+    )
     for m, _, k, rank in expected:
         assert svdquant_sm120_cutlass._sm120_fused_linear_supported(m, k, rank)
         _assert_admission_tracks_the_ladder(m + 1, k, rank)
@@ -1781,6 +1779,7 @@ def test_sm120_batch4_k5376_fused_routes_are_exact() -> None:
     combined = _read_repo_source("csrc/nvfp4_svdquant_gemm_cutlass_sm120.cu")
     assert combined.count("x.size(1) == 5120 || x.size(1) == 5376 ||") == 2
     assert "x.size(0) == 537 || x.size(0) == 1935" in combined
+
 
 def test_sm120_m537_prepacked_warp_rows_have_exact_shape_admission() -> None:
     """The accepted row-44 producer cannot leak to a sibling K."""
@@ -1901,9 +1900,7 @@ def test_sm120_h3_row52_writes_every_output_byte() -> None:
         # its own rather than letting the bulk rows carry the average.
         tail = slice(m - 64, m)
         tail_noise = ((down_ref[tail].float() - down[tail].float()) ** 2).mean()
-        tail_sqnr = 10 * torch.log10(
-            (down_ref[tail].float() ** 2).mean() / tail_noise
-        )
+        tail_sqnr = 10 * torch.log10((down_ref[tail].float() ** 2).mean() / tail_noise)
         assert float(tail_sqnr) > 48.0, (
             f"the 64-row partial final M tile SQNR {float(tail_sqnr):.3f} dB "
             f"is below 48.0 dB"
@@ -2185,14 +2182,10 @@ def test_sm120_m537_cublaslt_down_matches_generic_prefix() -> None:
     l2t_smoothed = torch.randn(
         (k, rank), dtype=torch.bfloat16, device="cuda"
     ).contiguous()
-    weight_fp4 = torch.randint(
-        0, 256, (n, k // 2), dtype=torch.uint8, device="cuda"
-    )
+    weight_fp4 = torch.randint(0, 256, (n, k // 2), dtype=torch.uint8, device="cuda")
     weight_sf = torch.ones((n * (k // 16),), dtype=torch.uint8, device="cuda")
     alpha = torch.ones((1,), dtype=torch.float32, device="cuda")
-    l1_scaled = torch.randn(
-        (n, rank), dtype=torch.bfloat16, device="cuda"
-    ).contiguous()
+    l1_scaled = torch.randn((n, rank), dtype=torch.bfloat16, device="cuda").contiguous()
 
     module = get_nvfp4_svdquant_sm120_module()
     workspace_bytes = max(
@@ -2257,7 +2250,5 @@ def test_sm120_m537_cublaslt_down_matches_generic_prefix() -> None:
     down_sqnr = 10 * torch.log10((down_ref.float() ** 2).mean() / down_noise)
     assert float(down_sqnr) > 48.0
     output_noise = ((output_ref.float() - output.float()) ** 2).mean()
-    output_sqnr = 10 * torch.log10(
-        (output_ref.float() ** 2).mean() / output_noise
-    )
+    output_sqnr = 10 * torch.log10((output_ref.float() ** 2).mean() / output_noise)
     assert float(output_sqnr) > 40.0

@@ -75,8 +75,7 @@ using EpilogueTileType = cutlass::epilogue::collective::EpilogueTileAuto;
 using ClusterShape = Shape<_1, _1, _1>;  // SM120: fixed, no multicast.
 inline constexpr size_t kInlineDownWorkspaceBytes = 256;
 
-#if defined(SVDQ_SM120_ROW80_STAGES) && \
-    SVDQ_SM120_ROW80_STAGES != 4 && SVDQ_SM120_ROW80_STAGES != 5
+#if defined(SVDQ_SM120_ROW80_STAGES) && SVDQ_SM120_ROW80_STAGES != 4 && SVDQ_SM120_ROW80_STAGES != 5
 #error "SVDQ_SM120_ROW80_STAGES must be 4 or 5"
 #endif
 
@@ -87,7 +86,8 @@ inline constexpr size_t kInlineDownWorkspaceBytes = 256;
     (defined(SVDQ_SM120_LORA_DEDICATED) || defined(SVDQ_SM120_LORA_NEUTRAL_BARRIER))
 #error "the row80 LoRA side slot cannot combine with another pipeline-owning path"
 #elif defined(SVDQ_SM120_LORA_DEDICATED) && defined(SVDQ_SM120_LORA_NEUTRAL_BARRIER)
-#error "SVDQ_SM120_LORA_DEDICATED and SVDQ_SM120_LORA_NEUTRAL_BARRIER select conflicting LoRA data paths"
+#error \
+    "SVDQ_SM120_LORA_DEDICATED and SVDQ_SM120_LORA_NEUTRAL_BARRIER select conflicting LoRA data paths"
 #endif
 #if defined(SVDQ_SM120_LORA_DEDICATED)
 inline constexpr cutlass::gemm::collective::Sm120LoRaPath kBuildWideLoRaPathSm120 =
@@ -172,40 +172,32 @@ struct SvdquantGemmConfigSm120 {
   // KernelShapeSm120 enum and SVDQ_SM120_DISPATCH are written out by hand and
   // would otherwise have to be regenerated per rank.
   static constexpr int kLoRaStageCapacity = cute::size<2>(MmaTileShape{}) / 4;
-  static constexpr int LoRaRank = kSvdqSm120ModuleLoRaRank <= kLoRaStageCapacity
-                                     ? kSvdqSm120ModuleLoRaRank
-                                     : 32;
-  static_assert(!IsRow80SideSlot || IsRow80,
-                "the production side slot is row80-only");
+  static constexpr int LoRaRank =
+      kSvdqSm120ModuleLoRaRank <= kLoRaStageCapacity ? kSvdqSm120ModuleLoRaRank : 32;
+  static_assert(!IsRow80SideSlot || IsRow80, "the production side slot is row80-only");
 #if defined(SVDQ_SM120_ROW80_LORA_SIDE_SLOT)
   static_assert(IsRow80 ||
-                    LoRaPathSm120 ==
-                        cutlass::gemm::collective::Sm120LoRaPath::kByteExactMainloop,
+                    LoRaPathSm120 == cutlass::gemm::collective::Sm120LoRaPath::kByteExactMainloop,
                 "non-row80 configs must retain the byte-exact LoRA path");
 #endif
-#if defined(SVDQ_SM120_LORA_EVERY_SPLIT) || \
-    ((defined(SVDQ_SM120_LORA_LADDER_RESIDUAL_ONLY) || \
-      defined(SVDQ_SM120_LORA_LADDER_TRANSFER_ONLY)) && \
-     !defined(SVDQ_SM120_ROW80_PRODUCTION_PARITY))
+#if defined(SVDQ_SM120_LORA_EVERY_SPLIT) || ((defined(SVDQ_SM120_LORA_LADDER_RESIDUAL_ONLY) ||  \
+                                              defined(SVDQ_SM120_LORA_LADDER_TRANSFER_ONLY)) && \
+                                             !defined(SVDQ_SM120_ROW80_PRODUCTION_PARITY))
   // Fault-injection and cost-decomposition builds preserve their original
   // row80 codegen so production tuning cannot contaminate those diagnostics.
   static constexpr bool IsProductionRow80 = false;
 #else
   static constexpr bool IsProductionRow80 =
-      IsRow80 &&
-      (LoRaPathSm120 == cutlass::gemm::collective::Sm120LoRaPath::kByteExactMainloop ||
-       IsRow80SideSlot);
+      IsRow80 && (LoRaPathSm120 == cutlass::gemm::collective::Sm120LoRaPath::kByteExactMainloop ||
+                  IsRow80SideSlot);
 #endif
-#if defined(SVDQ_SM120_ROW80_PRODUCTION_PARITY) || \
-    defined(SVDQ_SM120_ROW80_LORA_SIDE_SLOT)
-  static_assert(!IsRow80 || IsProductionRow80,
-                "the row80 diagnostic lost its production traits");
+#if defined(SVDQ_SM120_ROW80_PRODUCTION_PARITY) || defined(SVDQ_SM120_ROW80_LORA_SIDE_SLOT)
+  static_assert(!IsRow80 || IsProductionRow80, "the row80 diagnostic lost its production traits");
 #endif
-  static_assert(!SmallM || IsProvenSmallM || IsRow80,
-                "unsupported 64-row SM120 SVDQuant tile");
+  static_assert(!SmallM || IsProvenSmallM || IsRow80, "unsupported 64-row SM120 SVDQuant tile");
 
-  using LayoutC = cute::conditional_t<SwapAB, cutlass::layout::ColumnMajor,
-                                      cutlass::layout::RowMajor>;
+  using LayoutC =
+      cute::conditional_t<SwapAB, cutlass::layout::ColumnMajor, cutlass::layout::RowMajor>;
 #if defined(SVDQ_SM120_BIAS_COALESCED)
   // Staged bias only on swapped tiles at or below 128x128: the 256-row swap TUs run 384
   // threads against a full 64K register file with ptxas spills pinned exactly, so they
@@ -213,13 +205,11 @@ struct SvdquantGemmConfigSm120 {
   // restriction below.
   static constexpr bool UseStagedBias =
       SwapAB && cute::size<0>(MmaTileShape{}) * cute::size<1>(MmaTileShape{}) <= 128 * 128;
-  using FusionOperation =
-      cute::conditional_t<UseStagedBias, FusionOperationPerRowStaged,
-                          cute::conditional_t<SwapAB, FusionOperationPerRow,
-                                              FusionOperationPerCol>>;
+  using FusionOperation = cute::conditional_t<
+      UseStagedBias, FusionOperationPerRowStaged,
+      cute::conditional_t<SwapAB, FusionOperationPerRow, FusionOperationPerCol>>;
 #else
-  using FusionOperation = cute::conditional_t<SwapAB, FusionOperationPerRow,
-                                              FusionOperationPerCol>;
+  using FusionOperation = cute::conditional_t<SwapAB, FusionOperationPerRow, FusionOperationPerCol>;
 #endif
 
   using CollectiveEpilogueBase = typename cutlass::epilogue::collective::CollectiveBuilder<
@@ -254,19 +244,17 @@ struct SvdquantGemmConfigSm120 {
   // tight: over-counting drops a residual stage (K256 tiles sit directly on the Stages >= 2
   // floor), under-counting over-allocates the smem capacity (checked by the static_assert
   // below).
-  static constexpr int Row80SideSlotStorageK =
-      cute::size<2>(MmaTileShape{}) * cutlass::sizeof_bits<ElementType>::value /
-      cutlass::sizeof_bits<cutlass::bfloat16_t>::value;
+  static constexpr int Row80SideSlotStorageK = cute::size<2>(MmaTileShape{}) *
+                                               cutlass::sizeof_bits<ElementType>::value /
+                                               cutlass::sizeof_bits<cutlass::bfloat16_t>::value;
   static constexpr int LoRaSmemCarveoutBytes =
       LoRaPathSm120 == cutlass::gemm::collective::Sm120LoRaPath::kDedicatedTma
-          ? static_cast<int>(
-                (cute::size<0>(MmaTileShape{}) + cute::size<1>(MmaTileShape{})) *
-                (IsRow80SideSlot ? Row80SideSlotStorageK : 32) *
-                sizeof(cutlass::bfloat16_t)) +
+          ? static_cast<int>((cute::size<0>(MmaTileShape{}) + cute::size<1>(MmaTileShape{})) *
+                             (IsRow80SideSlot ? Row80SideSlotStorageK : 32) *
+                             sizeof(cutlass::bfloat16_t)) +
                 128
-          : (LoRaPathSm120 == cutlass::gemm::collective::Sm120LoRaPath::kSmemNeutralBarrier
-                 ? 128
-                 : 0);
+          : (LoRaPathSm120 == cutlass::gemm::collective::Sm120LoRaPath::kSmemNeutralBarrier ? 128
+                                                                                            : 0);
 
   // Build the standard SM120 block-scaled mainloop, then re-instantiate the LoRA collective
   // with the builder's extracted template arguments and this config's LoRA path policy.
@@ -276,41 +264,36 @@ struct SvdquantGemmConfigSm120 {
   // carveout) purely to extract the dispatch policy (donor stage count included), operand
   // strides, TMA/smem/copy atoms, and the NVFP4 MMA atom; the 128-thread TiledMma is
   // hand-built below and the collective is re-instantiated at the real tile shape.
-  using DonorTileShape = cute::conditional_t<
-      SmallM,
-      decltype(cute::make_shape(_128{}, cute::shape<1>(MmaTileShape{}),
-                                cute::shape<2>(MmaTileShape{}))),
-      MmaTileShape>;
+  using DonorTileShape =
+      cute::conditional_t<SmallM,
+                          decltype(cute::make_shape(_128{}, cute::shape<1>(MmaTileShape{}),
+                                                    cute::shape<2>(MmaTileShape{}))),
+                          MmaTileShape>;
 
   using AutoMainloopStageCount = cutlass::gemm::collective::StageCountAutoCarveout<
-      static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage)) +
-      LoRaSmemCarveoutBytes>;
+      static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage)) + LoRaSmemCarveoutBytes>;
 #if defined(SVDQ_SM120_ROW80_STAGES)
   // Keep the diagnostic stage override row80-only: every other config retains
   // the builder's capacity-aware automatic stage policy.
-  using MainloopStageCount = cute::conditional_t<
-      IsRow80,
-      cutlass::gemm::collective::StageCount<SVDQ_SM120_ROW80_STAGES>,
-      AutoMainloopStageCount>;
+  using MainloopStageCount =
+      cute::conditional_t<IsRow80, cutlass::gemm::collective::StageCount<SVDQ_SM120_ROW80_STAGES>,
+                          AutoMainloopStageCount>;
 #else
   // NCU exposed pipeline-wait headroom in the three-stage row80 donor. Four
   // stages won the strict-CUPTI comparison without changing CTA residency and
   // use less shared memory than the statistically tied five-stage candidate.
-  using MainloopStageCount = cute::conditional_t<
-      IsProductionRow80,
-      cutlass::gemm::collective::StageCount<4>,
-      AutoMainloopStageCount>;
+  using MainloopStageCount =
+      cute::conditional_t<IsProductionRow80, cutlass::gemm::collective::StageCount<4>,
+                          AutoMainloopStageCount>;
 #endif
 
   using CollectiveMainloopBase = typename cutlass::gemm::collective::CollectiveBuilder<
       Arch, cutlass::arch::OpClassBlockScaledTensorOp, cute::tuple<ElementType, SFType>, LayoutA,
-      AlignA, cute::tuple<ElementType, SFType>, LayoutB, AlignB, ElementAccumulator,
-      DonorTileShape, ClusterShape,
-      MainloopStageCount,
+      AlignA, cute::tuple<ElementType, SFType>, LayoutB, AlignB, ElementAccumulator, DonorTileShape,
+      ClusterShape, MainloopStageCount,
       cutlass::gemm::KernelTmaWarpSpecializedNvf4Sm120>::CollectiveOp;
-  static_assert(!IsRow80SideSlot ||
-                    (CollectiveMainloopBase::DispatchPolicy::Stages == 4 &&
-                     Row80SideSlotStorageK == 64),
+  static_assert(!IsRow80SideSlot || (CollectiveMainloopBase::DispatchPolicy::Stages == 4 &&
+                                     Row80SideSlotStorageK == 64),
                 "the row80 side slot requires stage4 and a padded K64 slot");
 
   // Hand-built 64-row MMA: reuse the donor NVFP4 atom and N/K permutations, but run a
@@ -333,8 +316,7 @@ struct SvdquantGemmConfigSm120 {
       typename CollectiveMainloopBase::DispatchPolicy, MmaTileShape,
       typename CollectiveMainloopBase::ElementPairA, typename CollectiveMainloopBase::StridePairA,
       typename CollectiveMainloopBase::ElementPairB, typename CollectiveMainloopBase::StridePairB,
-      TiledMma,
-      typename CollectiveMainloopBase::GmemTiledCopyPairA,
+      TiledMma, typename CollectiveMainloopBase::GmemTiledCopyPairA,
       typename CollectiveMainloopBase::SmemLayoutAtomsA,
       typename CollectiveMainloopBase::SmemCopyAtomsA, typename CollectiveMainloopBase::TransformA,
       typename CollectiveMainloopBase::GmemTiledCopyPairB,
@@ -346,21 +328,19 @@ struct SvdquantGemmConfigSm120 {
 
   // A 64-row CTA stores one 64x32 epilogue subtile per 32 output columns; the count reaches
   // the Stream-K scheduler sizing through get_store_pipe_increment.
-  static_assert(!SmallM ||
-                    (cute::size<0>(typename CollectiveEpilogue::EpilogueTile{}) == 64 &&
-                     cute::size<1>(typename CollectiveEpilogue::EpilogueTile{}) == 32 &&
-                     CollectiveEpilogue::get_store_pipe_increment(MmaTileShape{}) ==
-                         cute::size<1>(MmaTileShape{}) / 32),
+  static_assert(!SmallM || (cute::size<0>(typename CollectiveEpilogue::EpilogueTile{}) == 64 &&
+                            cute::size<1>(typename CollectiveEpilogue::EpilogueTile{}) == 32 &&
+                            CollectiveEpilogue::get_store_pipe_increment(MmaTileShape{}) ==
+                                cute::size<1>(MmaTileShape{}) / 32),
                 "a 64-row tile must produce one 64x32 store subtile per 32 columns");
 
   using GemmKernel = GemmUniversalLoRaSm120<Shape<int, int, int, int>, CollectiveMainloop,
                                             CollectiveEpilogue, TileSchedulerTag>;
-  using GemmKernelNoInlineDown = GemmUniversalLoRaSm120<
-      Shape<int, int, int, int>, CollectiveMainloopNoInlineDown,
-      CollectiveEpilogue, TileSchedulerTag>;
+  using GemmKernelNoInlineDown =
+      GemmUniversalLoRaSm120<Shape<int, int, int, int>, CollectiveMainloopNoInlineDown,
+                             CollectiveEpilogue, TileSchedulerTag>;
   using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
-  using GemmNoInlineDown =
-      cutlass::gemm::device::GemmUniversalAdapter<GemmKernelNoInlineDown>;
+  using GemmNoInlineDown = cutlass::gemm::device::GemmUniversalAdapter<GemmKernelNoInlineDown>;
 
   // The carveout above must upper-bound the storage the LoRA path actually adds; a
   // violation means the builder selected residual stages against bytes that do not exist.
@@ -391,30 +371,45 @@ inline void apply_streamk_test_overrides(SchedulerArgs& scheduler_args) {
       int const splits = std::atoi(forced);
       if (splits > 1) {
         scheduler_args.splits = splits;
-        scheduler_args.decomposition_mode =
-            decltype(scheduler_args.decomposition_mode)::SplitK;
+        scheduler_args.decomposition_mode = decltype(scheduler_args.decomposition_mode)::SplitK;
       }
     }
   }
 }
 
 // 16 legacy kernels: shape-major, then swap_ab, then scheduler. IDs are stable.
-using Tactic128x128x128Config       = SvdquantGemmConfigSm120<Shape<_128, _128, _128>, false, PersistentTag>;
-using Tactic128x128x128SwapConfig   = SvdquantGemmConfigSm120<Shape<_128, _128, _128>, true,  PersistentTag>;
-using Tactic128x128x128SkConfig     = SvdquantGemmConfigSm120<Shape<_128, _128, _128>, false, StreamKTag>;
-using Tactic128x128x128SwapSkConfig = SvdquantGemmConfigSm120<Shape<_128, _128, _128>, true,  StreamKTag>;
-using Tactic128x128x256Config       = SvdquantGemmConfigSm120<Shape<_128, _128, _256>, false, PersistentTag>;
-using Tactic128x128x256SwapConfig   = SvdquantGemmConfigSm120<Shape<_128, _128, _256>, true,  PersistentTag>;
-using Tactic128x128x256SkConfig     = SvdquantGemmConfigSm120<Shape<_128, _128, _256>, false, StreamKTag>;
-using Tactic128x128x256SwapSkConfig = SvdquantGemmConfigSm120<Shape<_128, _128, _256>, true,  StreamKTag>;
-using Tactic256x128x128Config       = SvdquantGemmConfigSm120<Shape<_256, _128, _128>, false, PersistentTag>;
-using Tactic256x128x128SwapConfig   = SvdquantGemmConfigSm120<Shape<_256, _128, _128>, true,  PersistentTag>;
-using Tactic256x128x128SkConfig     = SvdquantGemmConfigSm120<Shape<_256, _128, _128>, false, StreamKTag>;
-using Tactic256x128x128SwapSkConfig = SvdquantGemmConfigSm120<Shape<_256, _128, _128>, true,  StreamKTag>;
-using Tactic128x256x128Config       = SvdquantGemmConfigSm120<Shape<_128, _256, _128>, false, PersistentTag>;
-using Tactic128x256x128SwapConfig   = SvdquantGemmConfigSm120<Shape<_128, _256, _128>, true,  PersistentTag>;
-using Tactic128x256x128SkConfig     = SvdquantGemmConfigSm120<Shape<_128, _256, _128>, false, StreamKTag>;
-using Tactic128x256x128SwapSkConfig = SvdquantGemmConfigSm120<Shape<_128, _256, _128>, true,  StreamKTag>;
+using Tactic128x128x128Config =
+    SvdquantGemmConfigSm120<Shape<_128, _128, _128>, false, PersistentTag>;
+using Tactic128x128x128SwapConfig =
+    SvdquantGemmConfigSm120<Shape<_128, _128, _128>, true, PersistentTag>;
+using Tactic128x128x128SkConfig =
+    SvdquantGemmConfigSm120<Shape<_128, _128, _128>, false, StreamKTag>;
+using Tactic128x128x128SwapSkConfig =
+    SvdquantGemmConfigSm120<Shape<_128, _128, _128>, true, StreamKTag>;
+using Tactic128x128x256Config =
+    SvdquantGemmConfigSm120<Shape<_128, _128, _256>, false, PersistentTag>;
+using Tactic128x128x256SwapConfig =
+    SvdquantGemmConfigSm120<Shape<_128, _128, _256>, true, PersistentTag>;
+using Tactic128x128x256SkConfig =
+    SvdquantGemmConfigSm120<Shape<_128, _128, _256>, false, StreamKTag>;
+using Tactic128x128x256SwapSkConfig =
+    SvdquantGemmConfigSm120<Shape<_128, _128, _256>, true, StreamKTag>;
+using Tactic256x128x128Config =
+    SvdquantGemmConfigSm120<Shape<_256, _128, _128>, false, PersistentTag>;
+using Tactic256x128x128SwapConfig =
+    SvdquantGemmConfigSm120<Shape<_256, _128, _128>, true, PersistentTag>;
+using Tactic256x128x128SkConfig =
+    SvdquantGemmConfigSm120<Shape<_256, _128, _128>, false, StreamKTag>;
+using Tactic256x128x128SwapSkConfig =
+    SvdquantGemmConfigSm120<Shape<_256, _128, _128>, true, StreamKTag>;
+using Tactic128x256x128Config =
+    SvdquantGemmConfigSm120<Shape<_128, _256, _128>, false, PersistentTag>;
+using Tactic128x256x128SwapConfig =
+    SvdquantGemmConfigSm120<Shape<_128, _256, _128>, true, PersistentTag>;
+using Tactic128x256x128SkConfig =
+    SvdquantGemmConfigSm120<Shape<_128, _256, _128>, false, StreamKTag>;
+using Tactic128x256x128SwapSkConfig =
+    SvdquantGemmConfigSm120<Shape<_128, _256, _128>, true, StreamKTag>;
 
 // Small-N swap tiles (kernel ids 16-19): the low-risk vehicle for small-M
 // problems - swap_ab maps the problem M onto the CTA tile's N side, so a
@@ -422,20 +417,27 @@ using Tactic128x256x128SwapSkConfig = SvdquantGemmConfigSm120<Shape<_128, _256, 
 // without touching the cooperative (128-row, 2-consumer-warpgroup) driver.
 // The pinned CUTLASS builder supports TileShape_N >= 32 and pads the SFB smem
 // layout to 128 itself.
-using Tactic128x64x128SwapConfig   = SvdquantGemmConfigSm120<Shape<_128, _64, _128>, true, PersistentTag>;
-using Tactic128x64x128SwapSkConfig = SvdquantGemmConfigSm120<Shape<_128, _64, _128>, true, StreamKTag>;
-using Tactic128x64x256SwapConfig   = SvdquantGemmConfigSm120<Shape<_128, _64, _256>, true, PersistentTag>;
-using Tactic128x32x128SwapConfig   = SvdquantGemmConfigSm120<Shape<_128, _32, _128>, true, PersistentTag>;
+using Tactic128x64x128SwapConfig =
+    SvdquantGemmConfigSm120<Shape<_128, _64, _128>, true, PersistentTag>;
+using Tactic128x64x128SwapSkConfig =
+    SvdquantGemmConfigSm120<Shape<_128, _64, _128>, true, StreamKTag>;
+using Tactic128x64x256SwapConfig =
+    SvdquantGemmConfigSm120<Shape<_128, _64, _256>, true, PersistentTag>;
+using Tactic128x32x128SwapConfig =
+    SvdquantGemmConfigSm120<Shape<_128, _32, _128>, true, PersistentTag>;
 // Kernel id 22: Stream-K sibling of the 128x64x256 swap tile, so the thin-tile
 // K256 schedule (the small-M winner) can also split its K range natively.
-using Tactic128x64x256SwapSkConfig = SvdquantGemmConfigSm120<Shape<_128, _64, _256>, true, StreamKTag>;
+using Tactic128x64x256SwapSkConfig =
+    SvdquantGemmConfigSm120<Shape<_128, _64, _256>, true, StreamKTag>;
 
 // Small-M tiles (kernel ids 20-21): 64-row CTAs remove the half-tile waste of M<=64
 // problems on the non-swap side, running the driver's single-consumer-warpgroup
 // contract (128 MMA threads, 256-thread block). Persistent only; a Stream-K sibling
 // is admitted separately once this path is proven.
-using Tactic64x128x128Config = SvdquantGemmConfigSm120<Shape<_64, _128, _128>, false, PersistentTag>;
-using Tactic64x128x256Config = SvdquantGemmConfigSm120<Shape<_64, _128, _256>, false, PersistentTag>;
+using Tactic64x128x128Config =
+    SvdquantGemmConfigSm120<Shape<_64, _128, _128>, false, PersistentTag>;
+using Tactic64x128x256Config =
+    SvdquantGemmConfigSm120<Shape<_64, _128, _256>, false, PersistentTag>;
 
 // Per-shape static-scheduler flavors (kernel ids 23-25): the same three tiles the
 // measured one-wave winners run, compiled on the static tile scheduler
@@ -450,18 +452,23 @@ using Tactic64x128x256Config = SvdquantGemmConfigSm120<Shape<_64, _128, _256>, f
 // exactly one definition per specialization.
 using Tactic128x64x256SwapStaticConfig = Tactic128x64x256SwapConfig;
 using Tactic128x32x128SwapStaticConfig = Tactic128x32x128SwapConfig;
-using Tactic64x128x128StaticConfig     = Tactic64x128x128Config;
+using Tactic64x128x128StaticConfig = Tactic64x128x128Config;
 #else
-using Tactic128x64x256SwapStaticConfig = SvdquantGemmConfigSm120<Shape<_128, _64, _256>, true,  cutlass::gemm::StaticPersistentScheduler>;
-using Tactic128x32x128SwapStaticConfig = SvdquantGemmConfigSm120<Shape<_128, _32, _128>, true,  cutlass::gemm::StaticPersistentScheduler>;
-using Tactic64x128x128StaticConfig     = SvdquantGemmConfigSm120<Shape<_64, _128, _128>, false, cutlass::gemm::StaticPersistentScheduler>;
+using Tactic128x64x256SwapStaticConfig =
+    SvdquantGemmConfigSm120<Shape<_128, _64, _256>, true, cutlass::gemm::StaticPersistentScheduler>;
+using Tactic128x32x128SwapStaticConfig =
+    SvdquantGemmConfigSm120<Shape<_128, _32, _128>, true, cutlass::gemm::StaticPersistentScheduler>;
+using Tactic64x128x128StaticConfig =
+    SvdquantGemmConfigSm120<Shape<_64, _128, _128>, false,
+                            cutlass::gemm::StaticPersistentScheduler>;
 #endif
 
 // Fill-geometry kernel (id 26): the 32-column swap tile with K256 steps -
 // kernel 19's grid fill (48 CTAs at M=64 on 3072-column problems) combined
 // with kernel 18's half K-step count. Exposed like the other thin swap
 // tiles (M <= 512).
-using Tactic128x32x256SwapConfig = SvdquantGemmConfigSm120<Shape<_128, _32, _256>, true, PersistentTag>;
+using Tactic128x32x256SwapConfig =
+    SvdquantGemmConfigSm120<Shape<_128, _32, _256>, true, PersistentTag>;
 
 // Kernel id 27: static-scheduler sibling of the fill-geometry kernel. The
 // host exposes it only for one-wave grids; keeping the dynamic config as id 26
@@ -469,15 +476,15 @@ using Tactic128x32x256SwapConfig = SvdquantGemmConfigSm120<Shape<_128, _32, _256
 #if defined(SVDQ_SM120_STATIC_SCHED)
 using Tactic128x32x256SwapStaticConfig = Tactic128x32x256SwapConfig;
 #else
-using Tactic128x32x256SwapStaticConfig = SvdquantGemmConfigSm120<
-    Shape<_128, _32, _256>, true, cutlass::gemm::StaticPersistentScheduler>;
+using Tactic128x32x256SwapStaticConfig =
+    SvdquantGemmConfigSm120<Shape<_128, _32, _256>, true, cutlass::gemm::StaticPersistentScheduler>;
 #endif
 
 // Kernel id 28: production row80 combines the proven 64-row single-consumer
 // driver with the 32-column K256 donor. At M=64,N=3072 the swapped grid grows
 // from 48 to 96 CTAs.
-using Tactic64x32x256SwapStaticConfig = SvdquantGemmConfigSm120<
-    Shape<_64, _32, _256>, true, cutlass::gemm::StaticPersistentScheduler>;
+using Tactic64x32x256SwapStaticConfig =
+    SvdquantGemmConfigSm120<Shape<_64, _32, _256>, true, cutlass::gemm::StaticPersistentScheduler>;
 
 // Row 81: static K3 sibling of the legacy 256x128x128 swap kernel for the
 // 105-tile M537,N5376 grid. It fits the 110-SM SM120 (110 SMs) in one wave, where the
@@ -486,15 +493,16 @@ using Tactic64x32x256SwapStaticConfig = SvdquantGemmConfigSm120<
 #if defined(SVDQ_SM120_STATIC_SCHED)
 using Tactic256x128x128SwapStaticConfig = Tactic256x128x128SwapConfig;
 #else
-using Tactic256x128x128SwapStaticConfig = SvdquantGemmConfigSm120<
-    Shape<_256, _128, _128>, true, cutlass::gemm::StaticPersistentScheduler>;
+using Tactic256x128x128SwapStaticConfig =
+    SvdquantGemmConfigSm120<Shape<_256, _128, _128>, true,
+                            cutlass::gemm::StaticPersistentScheduler>;
 #endif
 
 // Row 82: the six-wave case-9 winner. Its 651 nearly full CTA slots make the
 // static scheduler profitable despite the multi-wave grid, while the 64-column
 // tile preserves enough parallelism for M1935,N5376.
-using Tactic256x64x128SwapStaticConfig = SvdquantGemmConfigSm120<
-    Shape<_256, _64, _128>, true, cutlass::gemm::StaticPersistentScheduler>;
+using Tactic256x64x128SwapStaticConfig =
+    SvdquantGemmConfigSm120<Shape<_256, _64, _128>, true, cutlass::gemm::StaticPersistentScheduler>;
 
 inline constexpr int kNvfp4SvdquantGemmSm120NumLegacyKernels = 16;
 inline constexpr int kNvfp4SvdquantGemmSm120NumKernels = 31;
@@ -551,7 +559,7 @@ enum class RasterOrderSm120 : int { kHeuristic = 0, kAlongM = 1, kAlongN = 2 };
 
 struct RuntimeTacticSm120 {
   int kernel_id;
-  int splits;   // 1 = scheduler-default decomposition; >1 = forced Split-K
+  int splits;  // 1 = scheduler-default decomposition; >1 = forced Split-K
   RasterOrderSm120 raster;
   int swizzle;  // power of two; 1 = default
 };
@@ -609,14 +617,13 @@ static_assert(kRuntimeTacticTableSm120[0].kernel_id == 0 &&
                   kRuntimeTacticTableSm120[15].swizzle == 1 &&
                   kRuntimeTacticTableSm120[15].raster == RasterOrderSm120::kHeuristic,
               "legacy tactic rows 0-15 must stay bitwise-equivalent to the compiled kernels");
-static_assert(
-    kRuntimeTacticTableSm120[kNoInlineDownRuntimeTactic].kernel_id ==
-            static_cast<int>(KernelShapeSm120::k256x128x128Swap) &&
-        kRuntimeTacticTableSm120[kNoInlineDownRuntimeTactic].splits == 1 &&
-        kRuntimeTacticTableSm120[kNoInlineDownRuntimeTactic].swizzle == 1 &&
-        kRuntimeTacticTableSm120[kNoInlineDownRuntimeTactic].raster ==
-            RasterOrderSm120::kHeuristic,
-    "the no-inline-down specialization must remain the legacy tactic 9 row");
+static_assert(kRuntimeTacticTableSm120[kNoInlineDownRuntimeTactic].kernel_id ==
+                      static_cast<int>(KernelShapeSm120::k256x128x128Swap) &&
+                  kRuntimeTacticTableSm120[kNoInlineDownRuntimeTactic].splits == 1 &&
+                  kRuntimeTacticTableSm120[kNoInlineDownRuntimeTactic].swizzle == 1 &&
+                  kRuntimeTacticTableSm120[kNoInlineDownRuntimeTactic].raster ==
+                      RasterOrderSm120::kHeuristic,
+              "the no-inline-down specialization must remain the legacy tactic 9 row");
 static_assert(kRuntimeTacticTableSm120[16].kernel_id == 2 &&
                   kRuntimeTacticTableSm120[16].splits == 2 &&
                   kRuntimeTacticTableSm120[31].kernel_id == 15 &&
@@ -651,19 +658,16 @@ static_assert(kRuntimeTacticTableSm120[72].kernel_id == 22 &&
                   kRuntimeTacticTableSm120[74].kernel_id == 22 &&
                   kRuntimeTacticTableSm120[74].splits == 4,
               "the K256-swap Stream-K rows are appended after the small-M rows");
-static_assert(kRuntimeTacticTableSm120[75].kernel_id == 23 &&
-                  kRuntimeTacticTableSm120[76].kernel_id == 24 &&
-                  kRuntimeTacticTableSm120[77].kernel_id == 25 &&
-                  kRuntimeTacticTableSm120[75].splits == 1 &&
-                  kRuntimeTacticTableSm120[76].splits == 1 &&
-                  kRuntimeTacticTableSm120[77].splits == 1 &&
-                  kRuntimeTacticTableSm120[75].swizzle == 1 &&
-                  kRuntimeTacticTableSm120[76].swizzle == 1 &&
-                  kRuntimeTacticTableSm120[77].swizzle == 1 &&
-                  kRuntimeTacticTableSm120[75].raster == RasterOrderSm120::kHeuristic &&
-                  kRuntimeTacticTableSm120[76].raster == RasterOrderSm120::kHeuristic &&
-                  kRuntimeTacticTableSm120[77].raster == RasterOrderSm120::kHeuristic,
-              "the static-scheduler rows close the table as scheduler-default rows");
+static_assert(
+    kRuntimeTacticTableSm120[75].kernel_id == 23 && kRuntimeTacticTableSm120[76].kernel_id == 24 &&
+        kRuntimeTacticTableSm120[77].kernel_id == 25 && kRuntimeTacticTableSm120[75].splits == 1 &&
+        kRuntimeTacticTableSm120[76].splits == 1 && kRuntimeTacticTableSm120[77].splits == 1 &&
+        kRuntimeTacticTableSm120[75].swizzle == 1 && kRuntimeTacticTableSm120[76].swizzle == 1 &&
+        kRuntimeTacticTableSm120[77].swizzle == 1 &&
+        kRuntimeTacticTableSm120[75].raster == RasterOrderSm120::kHeuristic &&
+        kRuntimeTacticTableSm120[76].raster == RasterOrderSm120::kHeuristic &&
+        kRuntimeTacticTableSm120[77].raster == RasterOrderSm120::kHeuristic,
+    "the static-scheduler rows close the table as scheduler-default rows");
 static_assert(kRuntimeTacticTableSm120[78].kernel_id == 26 &&
                   kRuntimeTacticTableSm120[78].splits == 1 &&
                   kRuntimeTacticTableSm120[78].swizzle == 1 &&
@@ -788,13 +792,11 @@ bool can_implement_tactic(RuntimeTacticSm120 const& rt, int m, int n, int k, int
 }
 
 template <class Config, bool CompileInlineDown>
-void run_tactic_impl(RuntimeTacticSm120 const& rt, void* out, void const* A,
-                     void const* B, void const* sfa, void const* sfb,
-                     float const* alpha, void const* D, void const* L1,
-                     void const* bias, void const* inline_down_x,
-                     void const* inline_down_l2t, int m, int n, int k,
-                     int lora_rank, char* ws, size_t wsBytes,
-                     cudaStream_t stream, bool enable_pdl) {
+void run_tactic_impl(RuntimeTacticSm120 const& rt, void* out, void const* A, void const* B,
+                     void const* sfa, void const* sfb, float const* alpha, void const* D,
+                     void const* L1, void const* bias, void const* inline_down_x,
+                     void const* inline_down_l2t, int m, int n, int k, int lora_rank, char* ws,
+                     size_t wsBytes, cudaStream_t stream, bool enable_pdl) {
   using Gemm = std::conditional_t<CompileInlineDown, typename Config::Gemm,
                                   typename Config::GemmNoInlineDown>;
   using Sm1xxBlkScaledConfig = typename Config::CollectiveMainloop::Sm1xxBlkScaledConfig;
@@ -804,9 +806,9 @@ void run_tactic_impl(RuntimeTacticSm120 const& rt, void* out, void const* A,
   // This config stages Config::LoRaRank; a launcher that hands it anything else
   // would read the D/L1 tiles at the wrong extent rather than fail, so refuse.
   if (lora_rank != Config::LoRaRank)
-    throw std::invalid_argument(
-        "nvfp4_svdquant_gemm (sm120): this tactic stages LoRA rank " +
-        std::to_string(Config::LoRaRank) + ", got " + std::to_string(lora_rank));
+    throw std::invalid_argument("nvfp4_svdquant_gemm (sm120): this tactic stages LoRA rank " +
+                                std::to_string(Config::LoRaRank) + ", got " +
+                                std::to_string(lora_rank));
   int64_t const r = lora_rank;
 
   if constexpr (Config::SwapAB) {
@@ -837,25 +839,19 @@ void run_tactic_impl(RuntimeTacticSm120 const& rt, void* out, void const* A,
   args.mainloop.layout_SFA = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFA(args.problem_shape);
   args.mainloop.layout_SFB = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(args.problem_shape);
   args.mainloop.lora_rank = lora_rank;
-  bool const use_inline_down =
-      inline_down_x != nullptr && inline_down_l2t != nullptr;
+  bool const use_inline_down = inline_down_x != nullptr && inline_down_l2t != nullptr;
   if constexpr (!CompileInlineDown) {
     if (use_inline_down)
-      throw std::invalid_argument(
-          "nvfp4_svdquant_gemm (sm120): inline LoRA-down is compiled out");
+      throw std::invalid_argument("nvfp4_svdquant_gemm (sm120): inline LoRA-down is compiled out");
   }
-  if (use_inline_down &&
-      (m != 537 || n != 5376 || k != 5120 || !Config::SwapAB))
+  if (use_inline_down && (m != 537 || n != 5376 || k != 5120 || !Config::SwapAB))
     throw std::invalid_argument(
         "nvfp4_svdquant_gemm (sm120): inline LoRA-down requires exact "
         "M537/N5376/K5120 swap configuration");
   if (use_inline_down) {
-    args.mainloop.ptr_inline_down_x =
-        static_cast<cutlass::bfloat16_t const*>(inline_down_x);
-    args.mainloop.ptr_inline_down_l2t =
-        static_cast<cutlass::bfloat16_t const*>(inline_down_l2t);
-    args.mainloop.ptr_inline_down_output =
-        static_cast<cutlass::bfloat16_t*>(const_cast<void*>(D));
+    args.mainloop.ptr_inline_down_x = static_cast<cutlass::bfloat16_t const*>(inline_down_x);
+    args.mainloop.ptr_inline_down_l2t = static_cast<cutlass::bfloat16_t const*>(inline_down_l2t);
+    args.mainloop.ptr_inline_down_output = static_cast<cutlass::bfloat16_t*>(const_cast<void*>(D));
     args.mainloop.ptr_inline_down_counters = reinterpret_cast<uint32_t*>(ws);
     args.mainloop.inline_down_m = m;
     args.mainloop.inline_down_k = k;
@@ -881,13 +877,11 @@ void run_tactic_impl(RuntimeTacticSm120 const& rt, void* out, void const* A,
 
   Gemm gemm;
   size_t const gemmWorkspaceBytes = gemm.get_workspace_size(args);
-  size_t const requiredWorkspaceBytes =
-      kInlineDownWorkspaceBytes + gemmWorkspaceBytes;
+  size_t const requiredWorkspaceBytes = kInlineDownWorkspaceBytes + gemmWorkspaceBytes;
   if (wsBytes < requiredWorkspaceBytes)
     throw std::invalid_argument("nvfp4_svdquant_gemm (sm120): insufficient workspace");
   if (use_inline_down) {
-    auto const clear_status = cudaMemsetAsync(
-        ws, 0, kInlineDownWorkspaceBytes, stream);
+    auto const clear_status = cudaMemsetAsync(ws, 0, kInlineDownWorkspaceBytes, stream);
     if (clear_status != cudaSuccess)
       throw std::runtime_error("nvfp4_svdquant_gemm (sm120): inline-down counter clear failed");
   }
@@ -904,28 +898,24 @@ void run_tactic_impl(RuntimeTacticSm120 const& rt, void* out, void const* A,
 }
 
 template <class Config>
-void run_tactic(RuntimeTacticSm120 const& rt, void* out, void const* A,
-                void const* B, void const* sfa, void const* sfb,
-                float const* alpha, void const* D, void const* L1,
-                void const* bias, void const* inline_down_x,
-                void const* inline_down_l2t, int m, int n, int k,
-                int lora_rank, char* ws, size_t wsBytes, cudaStream_t stream,
+void run_tactic(RuntimeTacticSm120 const& rt, void* out, void const* A, void const* B,
+                void const* sfa, void const* sfb, float const* alpha, void const* D, void const* L1,
+                void const* bias, void const* inline_down_x, void const* inline_down_l2t, int m,
+                int n, int k, int lora_rank, char* ws, size_t wsBytes, cudaStream_t stream,
                 bool enable_pdl) {
-  run_tactic_impl<Config, true>(
-      rt, out, A, B, sfa, sfb, alpha, D, L1, bias, inline_down_x,
-      inline_down_l2t, m, n, k, lora_rank, ws, wsBytes, stream, enable_pdl);
+  run_tactic_impl<Config, true>(rt, out, A, B, sfa, sfb, alpha, D, L1, bias, inline_down_x,
+                                inline_down_l2t, m, n, k, lora_rank, ws, wsBytes, stream,
+                                enable_pdl);
 }
 
 template <class Config>
-void run_tactic_no_inline_down(
-    RuntimeTacticSm120 const& rt, void* out, void const* A, void const* B,
-    void const* sfa, void const* sfb, float const* alpha, void const* D,
-    void const* L1, void const* bias, int m, int n, int k,
-    int lora_rank, char* ws, size_t wsBytes, cudaStream_t stream,
-    bool enable_pdl) {
-  run_tactic_impl<Config, false>(
-      rt, out, A, B, sfa, sfb, alpha, D, L1, bias, nullptr, nullptr,
-      m, n, k, lora_rank, ws, wsBytes, stream, enable_pdl);
+void run_tactic_no_inline_down(RuntimeTacticSm120 const& rt, void* out, void const* A,
+                               void const* B, void const* sfa, void const* sfb, float const* alpha,
+                               void const* D, void const* L1, void const* bias, int m, int n, int k,
+                               int lora_rank, char* ws, size_t wsBytes, cudaStream_t stream,
+                               bool enable_pdl) {
+  run_tactic_impl<Config, false>(rt, out, A, B, sfa, sfb, alpha, D, L1, bias, nullptr, nullptr, m,
+                                 n, k, lora_rank, ws, wsBytes, stream, enable_pdl);
 }
 
 // ---------------------------------------------------------------------------
@@ -952,24 +942,24 @@ void run_tactic_no_inline_down(
 // The list drives three things that must stay in lockstep: the selector below,
 // the extern declarations, and the per-tactic explicit instantiations emitted by
 // csrc/nvfp4_svdquant_gemm_cutlass_sm120.jinja.
-#define SVDQ_SM120_NO_INLINE_DOWN_CONFIG_LIST(X)                                        \
-  X(Tactic128x128x128Config)                                                   \
-  X(Tactic128x128x128SwapConfig)                                               \
-  X(Tactic128x128x128SkConfig)                                                 \
-  X(Tactic128x128x128SwapSkConfig)                                             \
-  X(Tactic128x128x256Config)                                                   \
-  X(Tactic128x128x256SwapConfig)                                               \
-  X(Tactic128x128x256SkConfig)                                                 \
-  X(Tactic128x128x256SwapSkConfig)                                             \
-  X(Tactic256x128x128Config)                                                   \
-  X(Tactic256x128x128SwapConfig)                                               \
-  X(Tactic128x256x128Config)                                                   \
-  X(Tactic128x256x128SwapConfig)                                               \
-  X(Tactic128x64x128SwapConfig)                                                \
-  X(Tactic128x64x128SwapSkConfig)                                              \
-  X(Tactic128x64x256SwapConfig)                                                \
-  X(Tactic128x64x256SwapSkConfig)                                              \
-  X(Tactic128x32x128SwapConfig)                                                \
+#define SVDQ_SM120_NO_INLINE_DOWN_CONFIG_LIST(X) \
+  X(Tactic128x128x128Config)                     \
+  X(Tactic128x128x128SwapConfig)                 \
+  X(Tactic128x128x128SkConfig)                   \
+  X(Tactic128x128x128SwapSkConfig)               \
+  X(Tactic128x128x256Config)                     \
+  X(Tactic128x128x256SwapConfig)                 \
+  X(Tactic128x128x256SkConfig)                   \
+  X(Tactic128x128x256SwapSkConfig)               \
+  X(Tactic256x128x128Config)                     \
+  X(Tactic256x128x128SwapConfig)                 \
+  X(Tactic128x256x128Config)                     \
+  X(Tactic128x256x128SwapConfig)                 \
+  X(Tactic128x64x128SwapConfig)                  \
+  X(Tactic128x64x128SwapSkConfig)                \
+  X(Tactic128x64x256SwapConfig)                  \
+  X(Tactic128x64x256SwapSkConfig)                \
+  X(Tactic128x32x128SwapConfig)                  \
   X(Tactic128x32x256SwapConfig)
 
 template <class Config>
@@ -987,20 +977,18 @@ SVDQ_SM120_NO_INLINE_DOWN_CONFIG_LIST(SVDQ_SM120_DECLARE_NO_INLINE_DOWN)
                                                     int k);                                       \
   template bool can_implement_tactic<Config>(RuntimeTacticSm120 const& rt, int m, int n, int k,   \
                                              int lora_rank);                                      \
-  template void run_tactic<Config>(RuntimeTacticSm120 const& rt, void* out, void const* A,        \
-                                   void const* B, void const* sfa, void const* sfb,               \
-                                   float const* alpha, void const* D, void const* L1,             \
-                                   void const* bias, void const* inline_down_x,                   \
-                                   void const* inline_down_l2t, int m, int n, int k,              \
-                                   int lora_rank, char* ws, size_t wsBytes, cudaStream_t stream,  \
-                                   bool enable_pdl);
-
-#define INSTANTIATE_NVFP4_SVDQUANT_GEMM_SM120_NO_INLINE_DOWN_TACTIC(Config)                       \
-  template void run_tactic_no_inline_down<Config>(                                                \
-      RuntimeTacticSm120 const& rt, void* out, void const* A, void const* B,                      \
-      void const* sfa, void const* sfb, float const* alpha, void const* D,                        \
-      void const* L1, void const* bias, int m, int n, int k, int lora_rank,                       \
+  template void run_tactic<Config>(                                                               \
+      RuntimeTacticSm120 const& rt, void* out, void const* A, void const* B, void const* sfa,     \
+      void const* sfb, float const* alpha, void const* D, void const* L1, void const* bias,       \
+      void const* inline_down_x, void const* inline_down_l2t, int m, int n, int k, int lora_rank, \
       char* ws, size_t wsBytes, cudaStream_t stream, bool enable_pdl);
+
+#define INSTANTIATE_NVFP4_SVDQUANT_GEMM_SM120_NO_INLINE_DOWN_TACTIC(Config)                        \
+  template void run_tactic_no_inline_down<Config>(                                                 \
+      RuntimeTacticSm120 const& rt, void* out, void const* A, void const* B, void const* sfa,      \
+      void const* sfb, float const* alpha, void const* D, void const* L1, void const* bias, int m, \
+      int n, int k, int lora_rank, char* ws, size_t wsBytes, cudaStream_t stream,                  \
+      bool enable_pdl);
 
 // The per-shape static-scheduler configs alias their base configs under the global
 // static-scheduler build; their translation units must then define nothing (the
@@ -1021,15 +1009,15 @@ SVDQ_SM120_NO_INLINE_DOWN_CONFIG_LIST(SVDQ_SM120_DECLARE_NO_INLINE_DOWN)
   extern template void run_tactic<Config>(                                                        \
       RuntimeTacticSm120 const& rt, void* out, void const* A, void const* B, void const* sfa,     \
       void const* sfb, float const* alpha, void const* D, void const* L1, void const* bias,       \
-      void const* inline_down_x, void const* inline_down_l2t, int m, int n, int k,                \
-      int lora_rank, char* ws, size_t wsBytes, cudaStream_t stream, bool enable_pdl);
-
-#define EXTERN_NVFP4_SVDQUANT_GEMM_SM120_NO_INLINE_DOWN_TACTIC(Config)                    \
-  extern template void run_tactic_no_inline_down<Config>(                                      \
-      RuntimeTacticSm120 const& rt, void* out, void const* A, void const* B,                 \
-      void const* sfa, void const* sfb, float const* alpha, void const* D,                  \
-      void const* L1, void const* bias, int m, int n, int k, int lora_rank,                 \
+      void const* inline_down_x, void const* inline_down_l2t, int m, int n, int k, int lora_rank, \
       char* ws, size_t wsBytes, cudaStream_t stream, bool enable_pdl);
+
+#define EXTERN_NVFP4_SVDQUANT_GEMM_SM120_NO_INLINE_DOWN_TACTIC(Config)                             \
+  extern template void run_tactic_no_inline_down<Config>(                                          \
+      RuntimeTacticSm120 const& rt, void* out, void const* A, void const* B, void const* sfa,      \
+      void const* sfb, float const* alpha, void const* D, void const* L1, void const* bias, int m, \
+      int n, int k, int lora_rank, char* ws, size_t wsBytes, cudaStream_t stream,                  \
+      bool enable_pdl);
 SVDQ_SM120_NO_INLINE_DOWN_CONFIG_LIST(EXTERN_NVFP4_SVDQUANT_GEMM_SM120_NO_INLINE_DOWN_TACTIC)
 
 // The per-tactic kernels are explicitly instantiated in Jinja-generated translation units

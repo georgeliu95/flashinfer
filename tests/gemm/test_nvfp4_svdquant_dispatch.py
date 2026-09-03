@@ -21,11 +21,12 @@ def test_backend_for_capability_routing():
     assert svdquant_sm120_cutlass._svdquant_backend_for_capability(12, 0) == "sm120"
 
 
-@pytest.mark.parametrize("major,minor", [(9, 0), (8, 9), (10, 1), (10, 2), (11, 0), (12, 1)])
+@pytest.mark.parametrize(
+    "major,minor", [(9, 0), (8, 9), (10, 1), (10, 2), (11, 0), (12, 1)]
+)
 def test_backend_for_capability_rejects_unsupported(major, minor):
     with pytest.raises(ValueError, match="not supported"):
         svdquant_sm120_cutlass._svdquant_backend_for_capability(major, minor)
-
 
 
 class _FakeTensor:
@@ -59,11 +60,12 @@ class _FakeTensor:
     def __repr__(self):
         return f"_FakeTensor(shape={self.shape}, dtype={self.dtype})"
 
+
 def _fake_tensor(shape, dtype, is_cuda=True, contiguous=True):
     """Duck-typed stand-in for what _check_mm_nvfp4_svdquant_problem reads."""
-    return _FakeTensor(shape, dtype=dtype,
-                       device="cuda:0" if is_cuda else "cpu",
-                       contiguous=contiguous)
+    return _FakeTensor(
+        shape, dtype=dtype, device="cuda:0" if is_cuda else "cpu", contiguous=contiguous
+    )
 
 
 def _problem(m=256, n=256, k=256, rank=32):
@@ -89,14 +91,18 @@ def test_ranks_above_32_clear_the_shared_problem_check(monkeypatch, rank):
     for rank 64 serves it. What decides a rank now is which module you built
     and which entry point you call, not the architecture.
     """
-    monkeypatch.setattr(svdquant_sm120_cutlass, "get_compute_capability", lambda device: (12, 0))
+    monkeypatch.setattr(
+        svdquant_sm120_cutlass, "get_compute_capability", lambda device: (12, 0)
+    )
     assert gemm_svdquant._check_mm_nvfp4_svdquant_problem(*_problem(rank=rank)) is True
 
 
 @pytest.mark.parametrize("rank", [8, 48, 33])
 def test_ranks_off_the_granularity_are_refused(monkeypatch, rank):
     """The granularity itself is still a hard boundary, on every architecture."""
-    monkeypatch.setattr(svdquant_sm120_cutlass, "get_compute_capability", lambda device: (12, 0))
+    monkeypatch.setattr(
+        svdquant_sm120_cutlass, "get_compute_capability", lambda device: (12, 0)
+    )
     with pytest.raises(ValueError, match="multiple of 32"):
         gemm_svdquant._check_mm_nvfp4_svdquant_problem(*_problem(rank=rank))
 
@@ -114,7 +120,9 @@ def test_fused_linear_admission_is_rank_32_only(monkeypatch):
 
 
 def test_sm120_accepts_rank_32(monkeypatch):
-    monkeypatch.setattr(svdquant_sm120_cutlass, "get_compute_capability", lambda device: (12, 0))
+    monkeypatch.setattr(
+        svdquant_sm120_cutlass, "get_compute_capability", lambda device: (12, 0)
+    )
     assert gemm_svdquant._check_mm_nvfp4_svdquant_problem(*_problem(rank=32)) is True
 
 
@@ -143,20 +151,18 @@ def test_sm120_linear_rejects_rank_above_32_before_route_dispatch(monkeypatch):
         )
 
 
-
-
-
-
-
-
 @pytest.mark.parametrize("rank", [32, 64, 128])
 def test_sm100_keeps_multiple_of_32_ranks(monkeypatch, rank):
-    monkeypatch.setattr(svdquant_sm120_cutlass, "get_compute_capability", lambda device: (10, 0))
+    monkeypatch.setattr(
+        svdquant_sm120_cutlass, "get_compute_capability", lambda device: (10, 0)
+    )
     assert gemm_svdquant._check_mm_nvfp4_svdquant_problem(*_problem(rank=rank)) is True
 
 
 def test_rank_not_multiple_of_32_rejected_everywhere(monkeypatch):
-    monkeypatch.setattr(svdquant_sm120_cutlass, "get_compute_capability", lambda device: (10, 0))
+    monkeypatch.setattr(
+        svdquant_sm120_cutlass, "get_compute_capability", lambda device: (10, 0)
+    )
     with pytest.raises(ValueError, match="positive multiple"):
         gemm_svdquant._check_mm_nvfp4_svdquant_problem(*_problem(rank=48))
 
@@ -179,13 +185,19 @@ def test_module_getter_routes_by_capability(monkeypatch):
         lambda lora_rank=32: calls.append("sm120") or "M120",
     )
 
-    monkeypatch.setattr(svdquant_sm120_cutlass, "get_compute_capability", lambda device: (10, 3))
+    monkeypatch.setattr(
+        svdquant_sm120_cutlass, "get_compute_capability", lambda device: (10, 3)
+    )
     assert svdquant_sm120_cutlass._get_nvfp4_svdquant_module_for_device("dev") == "M100"
 
-    monkeypatch.setattr(svdquant_sm120_cutlass, "get_compute_capability", lambda device: (12, 0))
+    monkeypatch.setattr(
+        svdquant_sm120_cutlass, "get_compute_capability", lambda device: (12, 0)
+    )
     assert svdquant_sm120_cutlass._get_nvfp4_svdquant_module_for_device("dev") == "M120"
 
-    monkeypatch.setattr(svdquant_sm120_cutlass, "get_compute_capability", lambda device: (9, 0))
+    monkeypatch.setattr(
+        svdquant_sm120_cutlass, "get_compute_capability", lambda device: (9, 0)
+    )
     with pytest.raises(ValueError, match="not supported"):
         svdquant_sm120_cutlass._get_nvfp4_svdquant_module_for_device("dev")
 
@@ -212,9 +224,15 @@ def _fake_runner():
 # Ten shapes matching the real input list (a, b, a_sf, b_sf, alpha, d, l1, bias,
 # out, workspace): the tuning config's dynamic/constraint specs index into them.
 _CACHE_TEST_SHAPES = (
-    torch.Size([128, 32]), torch.Size([64, 32]), torch.Size([1024]),
-    torch.Size([1024]), torch.Size([1]), torch.Size([128, 32]),
-    torch.Size([64, 32]), torch.Size([64]), torch.Size([128, 64]),
+    torch.Size([128, 32]),
+    torch.Size([64, 32]),
+    torch.Size([1024]),
+    torch.Size([1024]),
+    torch.Size([1]),
+    torch.Size([128, 32]),
+    torch.Size([64, 32]),
+    torch.Size([64]),
+    torch.Size([128, 64]),
     torch.Size([1024]),
 )
 
@@ -240,17 +258,28 @@ def test_autotune_cache_namespaces_do_not_cross():
     config_sm100 = svdquant_sm120_cutlass._svdquant_tuning_config("sm100")
     config_sm120 = svdquant_sm120_cutlass._svdquant_tuning_config("sm120")
     key_sm100 = _seed_cache(
-        tuner, svdquant_sm120_cutlass._svdquant_op_name("sm100"), runner,
-        _CACHE_TEST_SHAPES, config_sm100, 7)
+        tuner,
+        svdquant_sm120_cutlass._svdquant_op_name("sm100"),
+        runner,
+        _CACHE_TEST_SHAPES,
+        config_sm100,
+        7,
+    )
     try:
         hit_sm100, _, tactic_sm100, _ = tuner.search_cache(
-            svdquant_sm120_cutlass._svdquant_op_name("sm100"), [runner],
-            _CACHE_TEST_SHAPES, config_sm100)
+            svdquant_sm120_cutlass._svdquant_op_name("sm100"),
+            [runner],
+            _CACHE_TEST_SHAPES,
+            config_sm100,
+        )
         assert hit_sm100 and tactic_sm100 == 7
 
         hit_sm120, _, tactic_sm120, _ = tuner.search_cache(
-            svdquant_sm120_cutlass._svdquant_op_name("sm120"), [runner],
-            _CACHE_TEST_SHAPES, config_sm120)
+            svdquant_sm120_cutlass._svdquant_op_name("sm120"),
+            [runner],
+            _CACHE_TEST_SHAPES,
+            config_sm120,
+        )
         assert not hit_sm120 or tactic_sm120 != 7, (
             "an SM100-cached tactic leaked into the SM120 lookup"
         )
@@ -275,11 +304,15 @@ def test_stale_v1_namespace_cache_never_replays():
     runner = _fake_runner()
     config = svdquant_sm120_cutlass._svdquant_tuning_config("sm120")
     key_v1 = _seed_cache(
-        tuner, "nvfp4_svdquant_gemm_sm120", runner, _CACHE_TEST_SHAPES, config, 9)
+        tuner, "nvfp4_svdquant_gemm_sm120", runner, _CACHE_TEST_SHAPES, config, 9
+    )
     try:
         hit, _, tactic, _ = tuner.search_cache(
-            svdquant_sm120_cutlass._svdquant_op_name("sm120"), [runner],
-            _CACHE_TEST_SHAPES, config)
+            svdquant_sm120_cutlass._svdquant_op_name("sm120"),
+            [runner],
+            _CACHE_TEST_SHAPES,
+            config,
+        )
         assert not hit or tactic != 9, "a v1-cached tactic id replayed under v2"
     finally:
         tuner.profiling_cache.pop(key_v1, None)
@@ -291,15 +324,25 @@ def test_same_process_stale_cache_invalidated_by_version_bump(monkeypatch):
     runner = _fake_runner()
     config = svdquant_sm120_cutlass._svdquant_tuning_config("sm120")
     key_cur = _seed_cache(
-        tuner, svdquant_sm120_cutlass._svdquant_op_name("sm120"), runner,
-        _CACHE_TEST_SHAPES, config, 5)
+        tuner,
+        svdquant_sm120_cutlass._svdquant_op_name("sm120"),
+        runner,
+        _CACHE_TEST_SHAPES,
+        config,
+        5,
+    )
     try:
         monkeypatch.setattr(
-            svdquant_sm120_cutlass, "_SM120_TACTIC_ABI_VERSION",
-            svdquant_sm120_cutlass._SM120_TACTIC_ABI_VERSION + 1)
+            svdquant_sm120_cutlass,
+            "_SM120_TACTIC_ABI_VERSION",
+            svdquant_sm120_cutlass._SM120_TACTIC_ABI_VERSION + 1,
+        )
         hit, _, tactic, _ = tuner.search_cache(
-            svdquant_sm120_cutlass._svdquant_op_name("sm120"), [runner],
-            _CACHE_TEST_SHAPES, config)
+            svdquant_sm120_cutlass._svdquant_op_name("sm120"),
+            [runner],
+            _CACHE_TEST_SHAPES,
+            config,
+        )
         assert not hit or tactic != 5, (
             "a stale same-process tactic id survived the ABI version bump"
         )
@@ -322,9 +365,15 @@ def test_sm120_exact_shape_keys_distinguish_m():
 
     def shapes_for(m):
         return (
-            torch.Size([m, 32]), torch.Size([64, 32]), torch.Size([1024]),
-            torch.Size([1024]), torch.Size([1]), torch.Size([m, 32]),
-            torch.Size([64, 32]), torch.Size([64]), torch.Size([m, 64]),
+            torch.Size([m, 32]),
+            torch.Size([64, 32]),
+            torch.Size([1024]),
+            torch.Size([1024]),
+            torch.Size([1]),
+            torch.Size([m, 32]),
+            torch.Size([64, 32]),
+            torch.Size([64]),
+            torch.Size([m, 64]),
             torch.Size([1024]),
         )
 
@@ -341,16 +390,20 @@ def test_get_valid_tactics_filters_by_can_implement(monkeypatch):
         nvfp4_svdquant_gemm_can_implement=lambda m, n, k, rank, t: t % 2 == 0,
     )
     monkeypatch.setattr(
-        svdquant_sm120_cutlass, "_get_nvfp4_svdquant_module_for_device",
-        lambda device, lora_rank=32: fake_module)
+        svdquant_sm120_cutlass,
+        "_get_nvfp4_svdquant_module_for_device",
+        lambda device, lora_rank=32: fake_module,
+    )
     # The two-argument runner is this backend's; gemm_svdquant keeps upstream's
     # one-argument version, and the module split left these pointing at it.
     runner = svdquant_sm120_cutlass._nvfp4_svdquant_gemm_runner(False, "dev")
     inputs = [
-        SimpleNamespace(shape=(64, 1536)),   # a [m, k/2]
+        SimpleNamespace(shape=(64, 1536)),  # a [m, k/2]
         SimpleNamespace(shape=(3072, 1536)),  # b [n, k/2]
-        None, None, None,
-        SimpleNamespace(shape=(64, 32)),      # d [m, r]
+        None,
+        None,
+        None,
+        SimpleNamespace(shape=(64, 32)),  # d [m, r]
     ]
     assert runner.get_valid_tactics(inputs, profile=None) == [0, 2, 4]
 
@@ -359,8 +412,10 @@ def test_get_valid_tactics_unfiltered_without_query(monkeypatch):
     """Backends without the feasibility query keep the historical behavior."""
     fake_module = SimpleNamespace(nvfp4_svdquant_gemm_tactic_num=lambda: 4)
     monkeypatch.setattr(
-        svdquant_sm120_cutlass, "_get_nvfp4_svdquant_module_for_device",
-        lambda device, lora_rank=32: fake_module)
+        svdquant_sm120_cutlass,
+        "_get_nvfp4_svdquant_module_for_device",
+        lambda device, lora_rank=32: fake_module,
+    )
     # The two-argument runner is this backend's; gemm_svdquant keeps upstream's
     # one-argument version, and the module split left these pointing at it.
     runner = svdquant_sm120_cutlass._nvfp4_svdquant_gemm_runner(False, "dev")
@@ -389,31 +444,32 @@ def test_sm120_candidate_set_carries_no_shape_fitted_pruning(monkeypatch):
         nvfp4_svdquant_gemm_workspace_size=lambda m, n, k, t: 1 << 20,
     )
     monkeypatch.setattr(
-        svdquant_sm120_cutlass, "_sm120_workspace_budget_bytes",
-        lambda device_index: 1 << 40)
+        svdquant_sm120_cutlass,
+        "_sm120_workspace_budget_bytes",
+        lambda device_index: 1 << 40,
+    )
     every = list(range(8))
     # The shapes the deleted thresholds treated differently from one another.
-    for m, n, k in [(64, 3072, 3072), (512, 3072, 3072), (1024, 3072, 3072),
-                    (7800, 3072, 3072), (64, 3072, 12288), (4096, 3072, 12288),
-                    (27280, 3072, 14336), (82752, 28672, 5376)]:
-        assert svdquant_sm120_cutlass._nvfp4_svdquant_valid_tactics(
-            fake_module, m, n, k, 32, SimpleNamespace(index=0)) == every, (m, n, k)
+    for m, n, k in [
+        (64, 3072, 3072),
+        (512, 3072, 3072),
+        (1024, 3072, 3072),
+        (7800, 3072, 3072),
+        (64, 3072, 12288),
+        (4096, 3072, 12288),
+        (27280, 3072, 14336),
+        (82752, 28672, 5376),
+    ]:
+        assert (
+            svdquant_sm120_cutlass._nvfp4_svdquant_valid_tactics(
+                fake_module, m, n, k, 32, SimpleNamespace(index=0)
+            )
+            == every
+        ), (m, n, k)
 
 
 # No _pack_row helper here any more: the candidate bound reads a tactic's
 # workspace size, never its packed kernel id, raster or swizzle fields.
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 def test_sm120_tuned_linear_route_bypasses_repeated_autotuner_lookup():
@@ -606,16 +662,6 @@ def test_sm120_linear_op_name_separates_pdl_in_the_persistent_key(
 # not part of this backend, so the hazard it covered cannot arise here.
 
 
-
-
-
-
-
-
-
-
-
-
 def test_lora_ladder_gen_rungs_are_guarded_variants():
     """Ladder rungs are separate whole-module variants and refuse to combine
     with the other variant flags (they measure the byte-exact path only)."""
@@ -686,9 +732,7 @@ def test_row80_stage_override_gen_is_guarded_variant():
     )
 
     default_spec = gen()
-    assert "SVDQ_SM120_ROW80_STAGES" not in " ".join(
-        default_spec.extra_cuda_cflags
-    )
+    assert "SVDQ_SM120_ROW80_STAGES" not in " ".join(default_spec.extra_cuda_cflags)
     for stages in (4, 5):
         spec = gen(row80_stages=stages)
         assert spec.name.endswith(f"_row80_stages{stages}")
@@ -702,12 +746,11 @@ def test_row80_stage_override_gen_is_guarded_variant():
             gen(row80_stages=invalid)
 
 
-
 @pytest.mark.parametrize(
     "m,n,k",
     [
-        (1935, 5376, 7168),   # was pinned to tactic 82
-        (537, 5376, 14336),   # was pinned to tactic 81, route ABI v9
+        (1935, 5376, 7168),  # was pinned to tactic 82
+        (537, 5376, 14336),  # was pinned to tactic 81, route ABI v9
     ],
 )
 def test_sm120_linear_always_reaches_the_tuner(monkeypatch, m, n, k):
@@ -758,8 +801,9 @@ def test_sm120_linear_always_reaches_the_tuner(monkeypatch, m, n, k):
         svdquant_sm120_cutlass, "get_compute_capability", lambda device: (12, 0)
     )
     monkeypatch.setattr(
-        svdquant_sm120_cutlass, "get_nvfp4_svdquant_sm120_module",
-        lambda lora_rank=32: module
+        svdquant_sm120_cutlass,
+        "get_nvfp4_svdquant_sm120_module",
+        lambda lora_rank=32: module,
     )
     monkeypatch.setattr(gemm_svdquant.torch, "empty", fake_empty)
     monkeypatch.setattr(
@@ -773,7 +817,9 @@ def test_sm120_linear_always_reaches_the_tuner(monkeypatch, m, n, k):
         "_cached_sm120_linear_runners",
         lambda *args, **kwargs: [recorder],
     )
-    monkeypatch.setattr(gemm_svdquant.AutoTuner, "get", classmethod(lambda cls: Tuner()))
+    monkeypatch.setattr(
+        gemm_svdquant.AutoTuner, "get", classmethod(lambda cls: Tuner())
+    )
     svdquant_sm120_cutlass._SM120_LINEAR_DISPATCH_CACHE.clear()
 
     x = SimpleNamespace(ndim=2, shape=(m, k), device="cuda:0")
@@ -802,6 +848,7 @@ def test_sm120_linear_always_reaches_the_tuner(monkeypatch, m, n, k):
     assert Tuner.seen, "the tuner was never consulted"
     svdquant_sm120_cutlass._SM120_LINEAR_DISPATCH_CACHE.clear()
 
+
 def test_sm120_linear_route_pool(monkeypatch):
     """Which routes a shape offers the tuner, now that there are only two.
 
@@ -810,15 +857,18 @@ def test_sm120_linear_route_pool(monkeypatch):
     a third route would mean the CuTeDSL fallback came back.
     """
     monkeypatch.setattr(
-        svdquant_sm120_cutlass, "_sm120_fused_linear_runner",
+        svdquant_sm120_cutlass,
+        "_sm120_fused_linear_runner",
         lambda enable_pdl, device: "fused",
     )
     monkeypatch.setattr(
-        svdquant_sm120_cutlass, "_sm120_cutlass_linear_runner",
+        svdquant_sm120_cutlass,
+        "_sm120_cutlass_linear_runner",
         lambda enable_pdl, device: "cutlass",
     )
     monkeypatch.setattr(
-        svdquant_sm120_cutlass, "_sm120_fused_linear_supported",
+        svdquant_sm120_cutlass,
+        "_sm120_fused_linear_supported",
         lambda m, k, rank: m == 4096,
     )
     pool = svdquant_sm120_cutlass._sm120_linear_runners(
