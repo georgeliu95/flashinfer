@@ -165,11 +165,6 @@ def test_no_rung_admits_a_route_it_cannot_run() -> None:
     # Then: it always contains its own default, never contains the retired
     # native_alt, and any extra route it admits is one the C++ dispatcher can
     # actually reach -- admission is a claim that something will run.
-    header = PRODUCER_HEADER.read_text()
-    body = header[
-        header.index("inline cudaError_t nvfp4_smooth_quantize_lora_down_sm120(") :
-        header.index("// Direct-only n16 diagnostic entry")
-    ]
     for key, (default, admitted) in SM120_PREFIX_ROUTE_LADDER.items():
         assert default in admitted, key
         assert "native_alt" not in admitted, key
