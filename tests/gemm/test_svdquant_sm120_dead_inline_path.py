@@ -76,8 +76,16 @@ def test_collective_still_exposes_the_compile_time_toggle() -> None:
     collective_source = _COLLECTIVE_PATH.read_text(encoding="utf-8")
     template_source = _TEMPLATE_PATH.read_text(encoding="utf-8")
 
-    assert "bool CompileInlineDown_ = true>" in collective_source
+    # No trailing ">" in this match: what matters is that the toggle is a
+    # defaulted compile-time template parameter, not that it is the last one in
+    # the list. Pinning the ">" made this fail the moment a parameter was added
+    # after it, which says nothing about the toggle.
+    assert "bool CompileInlineDown_ = true" in collective_source
     assert "static constexpr bool CompileInlineDown = CompileInlineDown_;" in collective_source
+    # The LoRA rank reached the collective the same way, and for the same reason:
+    # it has to be known at compile time for the smem overlay to be sized.
+    assert "int LoRaK_ = 32" in collective_source
+    assert "static constexpr int LoRaK = LoRaK_;" in collective_source
     assert "if constexpr (CollectiveMainloop::CompileInlineDown)" in collective_source
     assert "CollectiveMainloop::inline_lora_down_m537_k5120(" in collective_source
     assert "using CollectiveMainloop = CollectiveMainloopT<true>;" in template_source

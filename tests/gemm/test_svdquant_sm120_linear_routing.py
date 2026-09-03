@@ -1,5 +1,8 @@
 """Host-side contracts for SM120 full-linear runner selection."""
 
+import math
+
+import torch
 from types import SimpleNamespace
 
 import pytest
@@ -9,6 +12,38 @@ from flashinfer.gemm import gemm_svdquant
 from flashinfer.gemm import svdquant_sm120_cutlass
 
 
+
+class _FakeTensor:
+    """Minimal stand-in for the tensor surface the public entries actually read.
+
+    These tests grew SimpleNamespace fakes and then chased AttributeErrors one
+    attribute at a time as the entry points came to read more of the tensor
+    surface -- dtype, then numel, then size. A small class states the surface
+    once, so a new read fails loudly here instead of somewhere downstream.
+    """
+
+    def __init__(self, shape, dtype=None, device="cuda:0", contiguous=True, **kwargs):
+        # torch.empty takes either a size tuple or bare ints.
+        self.shape = (shape,) if isinstance(shape, int) else tuple(shape)
+        self.ndim = len(self.shape)
+        self.dtype = dtype if dtype is not None else torch.float32
+        self.device = device
+        self.is_cuda = str(device).startswith("cuda")
+        self.kwargs = kwargs
+        self._contiguous = contiguous
+
+    def numel(self):
+        return math.prod(self.shape) if self.shape else 0
+
+    def size(self, dim=None):
+        return self.shape if dim is None else self.shape[dim]
+
+    def is_contiguous(self):
+        return self._contiguous
+
+    def __repr__(self):
+        return f"_FakeTensor(shape={self.shape}, dtype={self.dtype})"
+
 def test_table_miss_packs_m537_l2t_only_inside_fused_runner(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -16,10 +51,14 @@ def test_table_miss_packs_m537_l2t_only_inside_fused_runner(
     allocated = []
     native_calls = []
     chooser_inputs = []
-    packed_l2t = SimpleNamespace(name="packed_l2t")
+    # The packed L2T is handed back to the entry point, which reads its dtype
+    # before deciding a route, so it needs the tensor surface too.
+    packed_l2t = _FakeTensor((5376, 32), dtype=torch.bfloat16)
 
     def fake_empty(shape, **kwargs):
-        tensor = SimpleNamespace(shape=tuple(shape), kwargs=kwargs)
+        # dtype and numel are read by the public entry's own validation before
+        # the route is ever chosen, so a stand-in has to answer both.
+        tensor = _FakeTensor(shape, **kwargs)
         allocated.append(tensor)
         return tensor
 
@@ -28,18 +67,21 @@ def test_table_miss_packs_m537_l2t_only_inside_fused_runner(
     )
     monkeypatch.setattr(svdquant_sm120_cutlass, "get_compute_capability", lambda device: (12, 0))
     monkeypatch.setattr(
-        svdquant_sm120_cutlass, "get_nvfp4_svdquant_sm120_module", lambda: module
+        svdquant_sm120_cutlass, "get_nvfp4_svdquant_sm120_module",
+        lambda lora_rank=32: module
     )
     monkeypatch.setattr(gemm_svdquant.torch, "empty", fake_empty)
     monkeypatch.setattr(
-        gemm_svdquant, "_get_cache_buf", lambda *args, **kwargs: "workspace"
+        gemm_svdquant,
+        "_get_cache_buf",
+        # Not the string "workspace": the entry point reads this buffer's dtype
+        # on its way to a route.
+        lambda *args, **kwargs: _FakeTensor((1 << 20,), dtype=torch.uint8),
     )
     monkeypatch.setattr(svdquant_sm120_cutlass, "_sm120_max_workspace_bytes", lambda *args: 0)
-    monkeypatch.setattr(
-        gemm_svdquant,
-        "_sm120_cutedsl_fallback_device_info",
-        lambda device: (110, False),
-    )
+    # No _sm120_cutedsl_fallback_device_info stand-in: the CuTeDSL runner it
+    # described is deliberately not part of this backend, so the symbol is gone
+    # and patching it would only assert that it still exists.
     monkeypatch.setattr(
         svdquant_sm120_cutlass,
         "_cached_sm120_m537_l2t",
@@ -58,16 +100,18 @@ def test_table_miss_packs_m537_l2t_only_inside_fused_runner(
 
     monkeypatch.setattr(svdquant_sm120_cutlass, "_choose_sm120_linear_runner", choose_runner)
 
-    x = SimpleNamespace(ndim=2, shape=(537, 5376), device="cuda:0")
-    weight = SimpleNamespace(ndim=2, shape=(5376, 2688))
-    raw_l2t = SimpleNamespace(ndim=2, shape=(5376, 32))
+    x = _FakeTensor((537, 5376), dtype=torch.bfloat16)
+    weight = _FakeTensor((5376, 2688), dtype=torch.uint8)
+    raw_l2t = _FakeTensor((5376, 32), dtype=torch.bfloat16)
 
     out = gemm_svdquant.svdquant_linear(
         x,
         weight,
         "weight_sf",
         "alpha",
-        "pre_quant_scale",
+        # A marker string everywhere it is only carried through, but the entry
+        # point reads pre_quant_scale's dtype on its way to a route.
+        _FakeTensor((5376,), dtype=torch.bfloat16),
         raw_l2t,
         "l1_scaled",
         "global_scale",

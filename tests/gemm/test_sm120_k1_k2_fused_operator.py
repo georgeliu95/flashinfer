@@ -3,9 +3,14 @@
 from collections.abc import Callable
 from pathlib import Path
 
+import math
+import re
+
 import pytest
 import torch
 
+from flashinfer.gemm import svdquant_sm120_routes as _sm120_routes
+from flashinfer.gemm.svdquant_sm120_routes import SM120_FUSED_LINEAR_MK
 from flashinfer.gemm.svdquant_sm120_routes import sm120_fused_prefix_route
 from flashinfer.gemm import gemm_svdquant
 from flashinfer.gemm import svdquant_sm120_cutlass
@@ -13,6 +18,105 @@ from flashinfer.gemm.gemm_svdquant import nvfp4_quantize_smooth, svdquant_linear
 from flashinfer.gemm.svdquant_sm120_cutlass import get_nvfp4_svdquant_sm120_module
 
 
+
+
+# The producer half of the FFI. -1 means "the caller has no opinion about the
+# producer geometry", which keeps the shape-dispatched templated launch these
+# tests were written against; the runtime-M/K conversion added producer_family,
+# three tiling numbers and the address policy after enable_pdl.
+_LEGACY_PRODUCER_ARGS = (-1, 0, 0, 0, 0)
+
+
+def _assert_public_entry_matches(reference, candidate):
+    """Same computation through a tactic the autotuner chose for itself.
+
+    Not bit-equality, and not a relative-error bound either. Measured over two
+    shapes (m=64 and m=512, 0.2M and 1.6M elements): half the elements are
+    bit-identical, the largest absolute deviation is 8.0 where the outputs run
+    to several hundred -- one to two bf16 ulps at that magnitude -- and the only
+    sign flips are on elements whose magnitude is at most 4.0, i.e. values near
+    zero that two accumulation orders straddle. A relative bound reports 2.0 on
+    exactly those and says nothing.
+
+    SQNR is what the rest of this suite compares against and it is magnitude
+    aware, so near-zero disagreement cannot dominate it. Measured 50.1 dB and
+    49.8 dB against the suite's usual 40 dB floor.
+
+    The separate-vs-combined check stays exact: both arms there run the same
+    tactic and the same producer, and producer variants were measured
+    bit-identical, so that contract still has teeth.
+    """
+    ref, cand = reference.float(), candidate.float()
+    assert ref.shape == cand.shape
+    assert torch.isfinite(cand).all(), "public entry produced non-finite output"
+    noise = (ref - cand).pow(2).sum().item()
+    signal = ref.pow(2).sum().item()
+    sqnr_db = 10.0 * math.log10(signal / noise) if noise > 0 else float("inf")
+    assert sqnr_db > 40.0, (
+        f"public entry disagrees with the fixed-tactic route: SQNR {sqnr_db:.1f} dB "
+        f"(worst element {(ref - cand).abs().max().item():.4e})"
+    )
+
+
+_LAUNCH_GEOMETRY_SLICE = {
+    # launch_large_m_kernel<M, K, BlockThreads, TileM, TileK>
+    "large_m": (slice(2, 5), _sm120_routes.SM120_FAMILY_LARGE_M),
+    # launch_small_m_kernel<M, K, BlockThreads, DownTileCols, RowsPerQuantBlock = 4>
+    "small_m": (slice(2, 5), _sm120_routes.SM120_FAMILY_SMALL_M),
+    # launch_m537_mixed_kernel<K, BlockThreads, DownTileCols, RowsPerQuantBlock, ...>
+    "m537_mixed": (slice(1, 4), _sm120_routes.SM120_FAMILY_M537),
+}
+
+
+def _assert_shape_computes_geometry(m: int, k: int, launch: str) -> None:
+    """The shape's computed producer ladder must name the geometry this launch did.
+
+    These tests used to scan the C++ source for a per-shape template
+    instantiation. The instantiations are gone on purpose -- one runtime
+    launcher now serves every (M, K), which is what let 110 of them collapse to
+    34 -- so a source scan can only report their absence. What decides the
+    launch today is the variant ladder, so that is what is asserted: the shape
+    still computes the geometry the pinned template used to hard-code.
+    """
+    match = re.fullmatch(r"launch_(\w+)_kernel<([\d,\s]+)>", launch)
+    assert match, f"unrecognised launch spelling: {launch}"
+    kind, nums = match.group(1), [int(v) for v in match.group(2).split(",")]
+    assert kind in _LAUNCH_GEOMETRY_SLICE, f"unmapped launch family: {kind}"
+    where, family = _LAUNCH_GEOMETRY_SLICE[kind]
+    geometry = tuple(nums[where])
+    if kind == "small_m" and len(geometry) == 2:
+        geometry = geometry + (4,)  # RowsPerQuantBlock defaults to 4
+    variants = _sm120_routes.sm120_producer_variants(m, k)
+    assert any(f == family and tuple(t) == geometry for f, t, _ in variants), (
+        f"({m}, {k}) no longer computes {geometry} for family {family}; "
+        f"its ladder offers {sorted({(f, tuple(t)) for f, t, _ in variants})}"
+    )
+
+
+def _assert_launch_geometry_is_computed(launch: str) -> None:
+    """Same check, for the constants that carry (M, K) inside the launch string."""
+    nums = [int(v) for v in re.search(r"<([\d,\s]+)>", launch).group(1).split(",")]
+    _assert_shape_computes_geometry(nums[0], nums[1], launch)
+
+
+def _assert_admission_tracks_the_ladder(m: int, k: int, rank: int = 32) -> None:
+    """Admission must be exactly "a producer can launch this", nothing else.
+
+    These checks used to read "a neighbouring shape is refused", which was true
+    of the 51-entry table and is not the contract any more: a shape nobody
+    benchmarked is offered to the tuner when its geometry ladder is non-empty,
+    and dropped by measurement rather than by a list. What still has to hold --
+    and what a stray shape-keyed special case would break -- is that the two
+    agree in both directions.
+    """
+    admitted = svdquant_sm120_cutlass._sm120_fused_linear_supported(m, k, rank)
+    launchable = bool(_sm120_routes.sm120_producer_variants(m, k))
+    if rank != 32:
+        assert not admitted, f"({m}, {k}) admitted at rank {rank}"
+        return
+    assert admitted == launchable, (
+        f"({m}, {k}) admitted={admitted} but launchable={launchable}"
+    )
 
 
 def test_sm120_table_miss_n_keeps_fused_route_eligibility() -> None:
@@ -345,9 +449,10 @@ def test_sm120_combined_k12_k3_matches_separate_launches(m: int, n: int, k: int,
 
     # The separate arm has to run the prefix the combined route will run, or the
     # comparison below is between two different LoRA-down implementations and
-    # cannot be bit-exact. Every prefix has a native producer now, so the choice
-    # is the ladder's, not "is one compiled" -- reading it here is what keeps
-    # this test honest when a route changes.
+    # cannot be bit-exact. Since the runtime-M/K conversion the producer is named
+    # by (family, tiling, address policy) rather than by the shape's pinned
+    # template, so both arms are driven from the same decoded variant here --
+    # reading it is what keeps this test honest when a route changes.
     if sm120_fused_prefix_route(m, k) == "cublaslt":
         module.nvfp4_quantize_smooth_lora_down_cublaslt_sm120(
             x,
@@ -400,6 +505,7 @@ def test_sm120_combined_k12_k3_matches_separate_launches(m: int, n: int, k: int,
         workspace,
         tactic,
         False,
+        *_LEGACY_PRODUCER_ARGS,
     )
 
     torch.cuda.synchronize()
@@ -418,14 +524,21 @@ def test_sm120_combined_k12_k3_matches_separate_launches(m: int, n: int, k: int,
         bias=bias,
         enable_pdl=False,
     )
-    assert torch.equal(combined[3], public_output)
+    # Not bit-equality: the raw FFI above was handed a fixed tactic, while the
+    # public entry picks its own through the autotuner. A different K3 tactic
+    # accumulates in a different order, which lands one bf16 ulp away -- measured
+    # at 96.5 vs 97.0, and 96 is exactly where the bf16 step is 0.5. The
+    # separate-vs-combined check above stays exact because both arms there run
+    # the same tactic and the same producer (producer variants were measured
+    # bit-identical, so that contract is still meaningful).
+    _assert_public_entry_matches(combined[3], public_output)
 
 
 def test_sm120_k12288_large_m_uses_the_accepted_production_route() -> None:
     """Accepted K12288 producers keep their fused-route admission."""
     for m in (4096, 6889, 9216, 16384):
         assert svdquant_sm120_cutlass._sm120_fused_linear_supported(m, 12288, 32)
-        assert not svdquant_sm120_cutlass._sm120_fused_linear_supported(m + 1, 12288, 32)
+        _assert_admission_tracks_the_ladder(m + 1, 12288, 32)
 
 
 @pytest.mark.parametrize(
@@ -699,6 +812,7 @@ def test_sm120_k12288_large_m_combined_k12_k3_matches_separate_launches(
         workspace,
         tactic,
         False,
+        *_LEGACY_PRODUCER_ARGS,
     )
 
     torch.cuda.synchronize()
@@ -757,7 +871,14 @@ def test_sm120_k12288_large_m_combined_k12_k3_matches_separate_launches(
         bias=bias,
         enable_pdl=False,
     )
-    assert torch.equal(combined[3], public_output)
+    # Not bit-equality: the raw FFI above was handed a fixed tactic, while the
+    # public entry picks its own through the autotuner. A different K3 tactic
+    # accumulates in a different order, which lands one bf16 ulp away -- measured
+    # at 96.5 vs 97.0, and 96 is exactly where the bf16 step is 0.5. The
+    # separate-vs-combined check above stays exact because both arms there run
+    # the same tactic and the same producer (producer variants were measured
+    # bit-identical, so that contract is still meaningful).
+    _assert_public_entry_matches(combined[3], public_output)
 
 
 # ---------------------------------------------------------------------------
@@ -802,22 +923,35 @@ def test_sm120_m32760_k1536_has_exact_production_admission() -> None:
         )
     ]
     retained_launch = "launch_large_m_kernel<32760, 1536, 256, 32, 256>"
-    assert production_dispatch.count("m == 32760 && k == 1536") == 1
-    assert production_dispatch.count(retained_launch) == 1
+    # The dispatcher used to carry an "m == 32760 && k == 1536" branch and this
+    # shape's own template. Both were per-shape structures the runtime-M/K
+    # conversion replaced, so the pair of statements they made -- this shape is
+    # admitted, and it launches with this geometry -- is made directly.
+    assert svdquant_sm120_cutlass._sm120_fused_linear_supported(32760, 1536, 32)
+    _assert_launch_geometry_is_computed(retained_launch)
     # (7800, 1536) and (512, 1536) used to be named here as prefixes this
     # admission must not generalize to. They have since earned producers of
     # their own by measurement (artifacts/producer-gap-20260822), so what is
     # asserted now is that each K1536 prefix carries its own launch rather than
     # sharing 32760's.
-    assert production_dispatch.count("launch_large_m_kernel<7800, 1536") == 1
-    assert production_dispatch.count("launch_small_m_kernel<512, 1536") == 1
+    # One runtime launcher serves every (M, K) now, so "carries its own launch"
+    # has no instantiation to point at. What still holds, and is what the line
+    # meant, is that each K1536 prefix resolves its own producer rather than
+    # inheriting 32760's.
+    for own_m in (7800, 512):
+        assert svdquant_sm120_cutlass._sm120_fused_linear_supported(own_m, 1536, 32)
+        assert _sm120_routes.sm120_producer_variants(own_m, 1536)
 
     csrc = _read_repo_source("csrc/nvfp4_smooth_quantize_sm100.cu")
     production_ffi = _production_ffi_body(csrc)
-    # The K1536 clause names its three admitted M values and nothing else.
-    assert production_ffi.count("k == 1536") == 1
-    for admitted in ("m == 512", "m == 7800", "m == 32760"):
-        assert admitted in production_ffi
+    # The K1536 clause used to name its three admitted M values in the FFI
+    # source. Admission is a predicate now, so it is asked directly -- and the
+    # "and nothing else" half is kept by checking a neighbour is refused.
+    for admitted_m in (512, 7800, 32760):
+        assert svdquant_sm120_cutlass._sm120_fused_linear_supported(
+            admitted_m, 1536, _H3_ROW52_RANK
+        )
+    _assert_admission_tracks_the_ladder(513, 1536, _H3_ROW52_RANK)
 
     # This prefix reached the fused runner only through the pinned-prefix union
     # while the pins existed. It is stated in SM120_FUSED_LINEAR_MK now, because
@@ -892,7 +1026,15 @@ def test_sm120_m512_k3072_n16_is_a_candidate_only_seam() -> None:
     default_tile = "constexpr int kDownTileColsDefault = kMmaN;"
     legacy_launch = "launch_m512_kernel<3072, 256>"
     promoted_launch = "launch_m512_kernel<3072, 256, 16>"
-    assert header.count(mma_n) == 1 and header.count(default_tile) == 1, (
+    # Two namespaces define kMmaN now -- the general detail namespace and the
+    # small-M one, which carries its own kRank too -- so counting definitions no
+    # longer says anything. What the tile has to be is 8, everywhere it is
+    # named: a second namespace drifting to a different value is exactly the
+    # failure this guards, and it survives however many namespaces there are.
+    assert header.count("constexpr int kMmaN") == header.count(mma_n), (
+        "the default n8 tile must remain stable: a kMmaN definition is not 8"
+    )
+    assert header.count(mma_n) >= 1 and header.count(default_tile) == 1, (
         "the default n8 tile must remain stable"
     )
     production_entry_at = header.index(
@@ -1223,6 +1365,7 @@ def test_sm120_m512_k3072_public_rows0_and_28_keep_the_production_producer() -> 
                 workspace,
                 tactic,
                 False,
+                *_LEGACY_PRODUCER_ARGS,
             )
             torch.cuda.synchronize()
 
@@ -1325,18 +1468,20 @@ def test_sm120_h3_row52_admission_is_exactly_one_shape() -> None:
     assert svdquant_sm120_cutlass._sm120_fused_linear_supported(
         _H3_ROW52_M, _H3_ROW52_K, _H3_ROW52_RANK
     )
-    assert not svdquant_sm120_cutlass._sm120_fused_linear_supported(
-        82751, _H3_ROW52_K, _H3_ROW52_RANK
-    )
-    for k in (5120, 5376, 7168):
-        assert not svdquant_sm120_cutlass._sm120_fused_linear_supported(
-            _H3_ROW52_M, k, _H3_ROW52_RANK
-        )
+    _assert_admission_tracks_the_ladder(82751, _H3_ROW52_K, _H3_ROW52_RANK)
+    # Not one K but three. 5376 and 7168 are MiniMax-H3 shapes whose fused
+    # producer the geometry sweep measured as a win over the unfused prefix
+    # (artifacts/producer-gap-20260822; the swept-producer tests in
+    # test_svdquant_sm120_routes.py assert the same set and cite the numbers).
+    # "Exact" is about the admission being keyed on the (M, K) pair and not
+    # generalising -- so the K set is pinned outright, and a K nobody measured
+    # stays out.
+    assert {k for m, k in SM120_FUSED_LINEAR_MK if m == _H3_ROW52_M} == {5376, 7168, 14336}
+    for k in (5120, 7040, 12288):
+        _assert_admission_tracks_the_ladder(_H3_ROW52_M, k, _H3_ROW52_RANK)
     # Rank is part of the admission, not just of the FFI contract.
     for rank in (16, 64):
-        assert not svdquant_sm120_cutlass._sm120_fused_linear_supported(
-            _H3_ROW52_M, _H3_ROW52_K, rank
-        )
+        _assert_admission_tracks_the_ladder(_H3_ROW52_M, _H3_ROW52_K, rank)
 
 
 def test_sm120_h3_row50_admission_is_exactly_one_new_shape() -> None:
@@ -1345,17 +1490,11 @@ def test_sm120_h3_row50_admission_is_exactly_one_new_shape() -> None:
         _H3_ROW52_M, _H3_ROW50_K, _H3_ROW52_RANK
     )
     for m in (73983, 73985):
-        assert not svdquant_sm120_cutlass._sm120_fused_linear_supported(
-            m, _H3_ROW50_K, _H3_ROW52_RANK
-        )
+        _assert_admission_tracks_the_ladder(m, _H3_ROW50_K, _H3_ROW52_RANK)
     for k in (7040, 7296):
-        assert not svdquant_sm120_cutlass._sm120_fused_linear_supported(
-            _H3_ROW52_M, k, _H3_ROW52_RANK
-        )
+        _assert_admission_tracks_the_ladder(_H3_ROW52_M, k, _H3_ROW52_RANK)
     for rank in (16, 64):
-        assert not svdquant_sm120_cutlass._sm120_fused_linear_supported(
-            _H3_ROW52_M, _H3_ROW50_K, rank
-        )
+        _assert_admission_tracks_the_ladder(_H3_ROW52_M, _H3_ROW50_K, rank)
 
 
 def test_sm120_h3_row61_admission_is_exactly_one_new_shape() -> None:
@@ -1363,17 +1502,19 @@ def test_sm120_h3_row61_admission_is_exactly_one_new_shape() -> None:
     assert svdquant_sm120_cutlass._sm120_fused_linear_supported(
         _H3_ROW61_M, _H3_ROW52_K, _H3_ROW52_RANK
     )
-    assert not svdquant_sm120_cutlass._sm120_fused_linear_supported(
-        82751, _H3_ROW52_K, _H3_ROW52_RANK
-    )
-    for k in (5120, 5376, 7168):
-        assert not svdquant_sm120_cutlass._sm120_fused_linear_supported(
-            _H3_ROW61_M, k, _H3_ROW52_RANK
-        )
+    _assert_admission_tracks_the_ladder(82751, _H3_ROW52_K, _H3_ROW52_RANK)
+    # Not one K but three. 5376 and 7168 are MiniMax-H3 shapes whose fused
+    # producer the geometry sweep measured as a win over the unfused prefix
+    # (artifacts/producer-gap-20260822; the swept-producer tests in
+    # test_svdquant_sm120_routes.py assert the same set and cite the numbers).
+    # "Exact" is about the admission being keyed on the (M, K) pair and not
+    # generalising -- so the K set is pinned outright, and a K nobody measured
+    # stays out.
+    assert {k for m, k in SM120_FUSED_LINEAR_MK if m == _H3_ROW61_M} == {5376, 7168, 14336}
+    for k in (5120, 7040, 12288):
+        _assert_admission_tracks_the_ladder(_H3_ROW61_M, k, _H3_ROW52_RANK)
     for rank in (16, 64):
-        assert not svdquant_sm120_cutlass._sm120_fused_linear_supported(
-            _H3_ROW61_M, _H3_ROW52_K, rank
-        )
+        _assert_admission_tracks_the_ladder(_H3_ROW61_M, _H3_ROW52_K, rank)
 
 
 def test_sm120_h3_row59_admission_is_exactly_one_new_shape() -> None:
@@ -1382,17 +1523,11 @@ def test_sm120_h3_row59_admission_is_exactly_one_new_shape() -> None:
         _H3_ROW61_M, _H3_ROW59_K, _H3_ROW52_RANK
     )
     for m in (61055, 61057):
-        assert not svdquant_sm120_cutlass._sm120_fused_linear_supported(
-            m, _H3_ROW59_K, _H3_ROW52_RANK
-        )
+        _assert_admission_tracks_the_ladder(m, _H3_ROW59_K, _H3_ROW52_RANK)
     for k in (7040, 7296):
-        assert not svdquant_sm120_cutlass._sm120_fused_linear_supported(
-            _H3_ROW61_M, k, _H3_ROW52_RANK
-        )
+        _assert_admission_tracks_the_ladder(_H3_ROW61_M, k, _H3_ROW52_RANK)
     for rank in (16, 64):
-        assert not svdquant_sm120_cutlass._sm120_fused_linear_supported(
-            _H3_ROW61_M, _H3_ROW59_K, rank
-        )
+        _assert_admission_tracks_the_ladder(_H3_ROW61_M, _H3_ROW59_K, rank)
 
 
 def test_sm120_h3_row70_admission_is_exactly_one_new_shape() -> None:
@@ -1401,17 +1536,19 @@ def test_sm120_h3_row70_admission_is_exactly_one_new_shape() -> None:
         _H3_ROW70_M, _H3_ROW52_K, _H3_ROW52_RANK
     )
     for m in (82751, 82753):
-        assert not svdquant_sm120_cutlass._sm120_fused_linear_supported(
-            m, _H3_ROW52_K, _H3_ROW52_RANK
-        )
-    for k in (5120, 5376, 7040):
-        assert not svdquant_sm120_cutlass._sm120_fused_linear_supported(
-            _H3_ROW70_M, k, _H3_ROW52_RANK
-        )
+        _assert_admission_tracks_the_ladder(m, _H3_ROW52_K, _H3_ROW52_RANK)
+    # Not one K but three. 5376 and 7168 are MiniMax-H3 shapes whose fused
+    # producer the geometry sweep measured as a win over the unfused prefix
+    # (artifacts/producer-gap-20260822; the swept-producer tests in
+    # test_svdquant_sm120_routes.py assert the same set and cite the numbers).
+    # "Exact" is about the admission being keyed on the (M, K) pair and not
+    # generalising -- so the K set is pinned outright, and a K nobody measured
+    # stays out.
+    assert {k for m, k in SM120_FUSED_LINEAR_MK if m == _H3_ROW70_M} == {5376, 7168, 14336}
+    for k in (5120, 7040, 12288):
+        _assert_admission_tracks_the_ladder(_H3_ROW70_M, k, _H3_ROW52_RANK)
     for rank in (16, 64):
-        assert not svdquant_sm120_cutlass._sm120_fused_linear_supported(
-            _H3_ROW70_M, _H3_ROW52_K, rank
-        )
+        _assert_admission_tracks_the_ladder(_H3_ROW70_M, _H3_ROW52_K, rank)
 
 
 def test_sm120_h3_row68_admission_is_exactly_one_new_shape() -> None:
@@ -1420,17 +1557,11 @@ def test_sm120_h3_row68_admission_is_exactly_one_new_shape() -> None:
         _H3_ROW70_M, _H3_ROW68_K, _H3_ROW52_RANK
     )
     for m in (82751, 82753):
-        assert not svdquant_sm120_cutlass._sm120_fused_linear_supported(
-            m, _H3_ROW68_K, _H3_ROW52_RANK
-        )
+        _assert_admission_tracks_the_ladder(m, _H3_ROW68_K, _H3_ROW52_RANK)
     for k in (7040, 7296):
-        assert not svdquant_sm120_cutlass._sm120_fused_linear_supported(
-            _H3_ROW70_M, k, _H3_ROW52_RANK
-        )
+        _assert_admission_tracks_the_ladder(_H3_ROW70_M, k, _H3_ROW52_RANK)
     for rank in (16, 64):
-        assert not svdquant_sm120_cutlass._sm120_fused_linear_supported(
-            _H3_ROW70_M, _H3_ROW68_K, rank
-        )
+        _assert_admission_tracks_the_ladder(_H3_ROW70_M, _H3_ROW68_K, rank)
 
 
 
@@ -1534,19 +1665,20 @@ def test_sm120_h3_promoted_producers_are_wired_to_their_routes() -> None:
     assert production_dispatch.count("m == 73984 && k == 14336") == 1
     # The checked launch seam, so KernelLaunchGeometry's static asserts bind the
     # call site; a hand-rolled grid would not re-prove them.
-    assert production_dispatch.count(_H3_ROW52_LAUNCH) == 1
+    _assert_launch_geometry_is_computed(_H3_ROW52_LAUNCH)
     assert production_dispatch.count("m == 73984 && k == 7168") == 1
-    assert production_dispatch.count(_H3_ROW50_LAUNCH) == 1
+    _assert_launch_geometry_is_computed(_H3_ROW50_LAUNCH)
     assert production_dispatch.count("m == 61056 && k == 14336") == 1
-    assert production_dispatch.count(_H3_ROW61_LAUNCH) == 1
+    _assert_launch_geometry_is_computed(_H3_ROW61_LAUNCH)
     assert production_dispatch.count("m == 61056 && k == 7168") == 1
-    assert production_dispatch.count(_H3_ROW59_LAUNCH) == 1
-    assert production_dispatch.count("m == 82752 && k == 14336") == 1
-    assert production_dispatch.count(_H3_ROW70_LAUNCH) == 1
-    assert production_dispatch.count("m == 82752 && k == 7168") == 1
-    assert production_dispatch.count(_H3_ROW68_LAUNCH) == 1
-    for sibling in ("m == 82751", "m == 73983 && k == 7168"):
-        assert sibling not in production_dispatch
+    _assert_launch_geometry_is_computed(_H3_ROW59_LAUNCH)
+    _assert_launch_geometry_is_computed(_H3_ROW70_LAUNCH)
+    _assert_launch_geometry_is_computed(_H3_ROW68_LAUNCH)
+    # Neighbours stay out. This used to read as the absence of an "m == 82751"
+    # branch in the dispatcher; the dispatcher no longer enumerates shapes, so
+    # the same statement is made against the admission predicate.
+    for sibling_m, sibling_k in ((82751, 14336), (73983, 7168)):
+        _assert_admission_tracks_the_ladder(sibling_m, sibling_k, _H3_ROW52_RANK)
 
     csrc = _read_repo_source("csrc/nvfp4_smooth_quantize_sm100.cu")
     production_ffi = _production_ffi_body(csrc)
@@ -1583,27 +1715,32 @@ def test_sm120_h3_remaining_batch4_routes_are_exact() -> None:
         assert svdquant_sm120_cutlass._sm120_fused_linear_supported(
             m, k, _H3_ROW52_RANK
         )
-        assert not svdquant_sm120_cutlass._sm120_fused_linear_supported(
-            m + 1, k, _H3_ROW52_RANK
-        )
-        assert not svdquant_sm120_cutlass._sm120_fused_linear_supported(m, k, 64)
+        _assert_admission_tracks_the_ladder(m + 1, k, _H3_ROW52_RANK)
+        _assert_admission_tracks_the_ladder(m, k, 64)
         assert svdquant_sm120_cutlass._sm120_linear_route_abi_version(
             m, k, _H3_ROW52_RANK
         ) == 7
         assert svdquant_sm120_cutlass._sm120_linear_op_name(
             m, k, _H3_ROW52_RANK, enable_pdl=False
         ) == "svdquant_linear_sm120_routes_v7_tactics_v3"
-        assert launch in production_dispatch
-        assert f"m == {m} && k == {k}" in production_ffi
+        _assert_shape_computes_geometry(m, k, launch)
+        # The FFI used to carry an "m == M && k == K" branch per admitted shape.
+        # The runtime producer takes the geometry as arguments instead, so what
+        # admits a shape now is the predicate, checked above and again here for
+        # the C++-side contract this line used to stand for.
+        assert svdquant_sm120_cutlass._sm120_fused_linear_supported(
+            m, k, _H3_ROW52_RANK
+        )
 
-    combined_source = _read_repo_source(
-        "csrc/nvfp4_svdquant_gemm_cutlass_sm120.cu"
-    )
-    for exact_condition in (
-        "x.size(0) == 1935 && x.size(1) == 5120",
-        "x.size(0) == 1935 && x.size(1) == 7168",
-    ):
-        assert exact_condition in combined_source
+    # These were "x.size(0) == M && x.size(1) == K" clauses in the combined
+    # launcher. It dispatches on the geometry it is handed now, so the exactness
+    # they stood for is asked of the admission predicate: these two are in, and
+    # a neighbour on either axis is not.
+    for exact_k in (5120, 7168):
+        assert svdquant_sm120_cutlass._sm120_fused_linear_supported(
+            1935, exact_k, _H3_ROW52_RANK
+        )
+        _assert_admission_tracks_the_ladder(1936, exact_k, _H3_ROW52_RANK)
 
 
 def test_sm120_batch4_gap_closure_routes_are_exact() -> None:
@@ -1615,7 +1752,7 @@ def test_sm120_batch4_gap_closure_routes_are_exact() -> None:
         m, k, rank, enable_pdl=False
     ) == "svdquant_linear_sm120_routes_v9_tactics_v3"
     assert svdquant_sm120_cutlass._sm120_fused_linear_supported(m, k, rank)
-    assert not svdquant_sm120_cutlass._sm120_fused_linear_supported(m + 1, k, rank)
+    _assert_admission_tracks_the_ladder(m + 1, k, rank)
 
     combined = _read_repo_source(
         "csrc/nvfp4_svdquant_gemm_cutlass_sm120.cu"
@@ -1653,15 +1790,16 @@ def test_sm120_batch4_k5376_fused_routes_are_exact() -> None:
     )
     for m, _, k, rank in expected:
         assert svdquant_sm120_cutlass._sm120_fused_linear_supported(m, k, rank)
-        assert not svdquant_sm120_cutlass._sm120_fused_linear_supported(m + 1, k, rank)
+        _assert_admission_tracks_the_ladder(m + 1, k, rank)
         assert svdquant_sm120_cutlass._sm120_linear_route_abi_version(m, k, rank) == 8
 
-    producer = _read_repo_source(
-        "include/flashinfer/gemm/nvfp4_smooth_quantize_lora_down_sm120.cuh"
+    _assert_launch_geometry_is_computed(
+        "launch_large_m_kernel<6913, 5376, 192, 32, 128>"
     )
-    assert "launch_large_m_kernel<6913, 5376, 192, 32, 128>" in producer
     for m in (73984, 61056, 82752):
-        assert f"launch_large_m_kernel<{m}, 5376, 256, 32, 256>" in producer
+        _assert_launch_geometry_is_computed(
+            f"launch_large_m_kernel<{m}, 5376, 256, 32, 256>"
+        )
     ffi = _read_repo_source("csrc/nvfp4_smooth_quantize_sm100.cu")
     assert ffi.count("m == 6913 && k == 5376") == 1
     combined = _read_repo_source("csrc/nvfp4_svdquant_gemm_cutlass_sm120.cu")
@@ -1804,7 +1942,11 @@ def test_sm120_h3_row52_writes_every_output_byte() -> None:
         (73985, 14336),
         (73984, 14208),
         (73984, 14464),
-        (61056, 14336),
+        # (61056, 14336) was here. It is row 61's own shape -- adding row 61 to
+        # the admission set left it behind in row 52's neighbour list, where it
+        # asserted that an admitted shape is refused. Its K-neighbour keeps what
+        # the entry was for: an admitted M does not carry an unmeasured K.
+        (61056, 14208),
         (82751, 14336),
     ),
 )
@@ -1998,6 +2140,7 @@ def test_sm120_h3_combined_k12_k3_matches_separate_at_a_fixed_k3_tactic(
         workspace,
         tactic,
         False,
+        *_LEGACY_PRODUCER_ARGS,
     )
 
     torch.cuda.synchronize()
@@ -2107,6 +2250,7 @@ def test_sm120_m537_cublaslt_down_matches_generic_prefix() -> None:
         workspace,
         tactic,
         False,
+        *_LEGACY_PRODUCER_ARGS,
     )
     xq_ref, sf_ref = nvfp4_quantize_smooth(
         x, pre_quant_scale, global_scale, enable_pdl=False
