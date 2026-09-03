@@ -127,6 +127,7 @@ _GEOMETRY_SF_VEC: Final = 16
 _GEOMETRY_ELEM_BYTES: Final = 2
 _GEOMETRY_DOWN_WARPS: Final = 4
 _GEOMETRY_SHARED_LIMIT: Final = 48 * 1024
+_GEOMETRY_MMA_N: Final = 8
 
 
 def sm120_producer_geometry_is_valid(
@@ -166,19 +167,105 @@ def sm120_producer_geometry_is_valid(
     return shared_bytes <= _GEOMETRY_SHARED_LIMIT
 
 
-@functools.cache
-def sm120_producer_variants(m: int, k: int) -> tuple[tuple[tuple[int, int, int], int], ...]:
-    """Every (geometry, address policy) this exact shape can run.
+# The small-M producer is a second kernel with its own tiling, and its own
+# constraints. Both families are built for every tiling in their ladder; which
+# family and tiling a shape may use is arithmetic, and which is fastest is the
+# tuner's to find.
+SM120_SMALL_M_TILING_LADDER: Final[tuple[tuple[int, int, int], ...]] = (
+    (256, 16, 4),
+    (768, 8, 8),
+    (768, 16, 16),
+    (768, 32, 16),
+    (896, 16, 16),
+    (1024, 8, 4),
+    (1024, 8, 16),
+    (1024, 16, 16),
+)
 
-    Computed, so a shape nobody measured still reaches the fused prefix, and a
-    card nobody measured on still gets to rank the candidates itself.
+SM120_FAMILY_LARGE_M: Final = 0
+SM120_FAMILY_SMALL_M: Final = 1
+SM120_FAMILY_M537: Final = 2
+
+# The M537 producer reads L2T in a prepacked layout while every other family
+# reads it row-major. That is a property of the family, not of the shape: hand a
+# packed matrix to a row-major reader and it misreads rather than fails, which is
+# how a tactic that selected one producer while the caller packed for another
+# turns into a wrong answer instead of an error.
+SM120_FAMILY_PACKS_L2T: Final[frozenset[int]] = frozenset({SM120_FAMILY_M537})
+
+# The M537 producer is a family of kernels for one exact M, parameterised on K
+# and its own role split. It cannot generalise -- M is baked into how the roles
+# divide -- so it is enumerated for the M it was written for and nothing else.
+SM120_M537_M: Final = 537
+SM120_M537_TILING: Final[tuple[int, int, int]] = (1024, 24, 16)
+
+
+def sm120_m537_is_valid(m: int, k: int) -> bool:
+    """Whether the M537 producer family exists for this shape."""
+    return m == SM120_M537_M and k in (5120, 5376, 7168)
+
+
+def sm120_small_m_tiling_is_valid(
+    m: int, k: int, block_threads: int, down_tile_cols: int, rows_per_quant_block: int
+) -> bool:
+    """Mirror of SmallMLaunchGeometry's asserts, as a predicate."""
+    if m <= 0 or rows_per_quant_block <= 0 or block_threads % 32:
+        return False
+    down_warps = block_threads // 32
+    if down_warps <= 0:
+        return False
+    if k % down_warps or (k // down_warps) % 16:
+        return False
+    if k % (4 * _GEOMETRY_SF_VEC):
+        return False
+    if down_tile_cols % _GEOMETRY_MMA_N or down_tile_cols // _GEOMETRY_MMA_N <= 0:
+        return False
+    down_n_tiles = _GEOMETRY_RANK // down_tile_cols
+    if down_n_tiles * down_tile_cols != _GEOMETRY_RANK:
+        return False
+    padded_m = (m + 127) // 128 * 128
+    quant_blocks = (m + rows_per_quant_block - 1) // rows_per_quant_block
+    return quant_blocks * rows_per_quant_block <= padded_m
+
+
+@functools.cache
+def sm120_producer_variants(
+    m: int, k: int
+) -> tuple[tuple[int, tuple[int, int, int], int], ...]:
+    """Every (family, tiling, address policy) this exact shape can run.
+
+    Both producer families are enumerated from their own constraints, so a shape
+    nobody measured still reaches the fused prefix and a card nobody measured on
+    ranks the candidates itself. The address policy is a large-M axis only; the
+    small-M kernel forms its addresses differently and takes 0.
     """
-    return tuple(
-        (geometry, policy)
+    large = tuple(
+        (SM120_FAMILY_LARGE_M, geometry, policy)
         for geometry in SM120_PRODUCER_GEOMETRY_LADDER
         if sm120_producer_geometry_is_valid(m, k, *geometry)
         for policy in SM120_ADDRESS_POLICIES
     )
+    small = tuple(
+        (SM120_FAMILY_SMALL_M, tiling, 0)
+        for tiling in SM120_SMALL_M_TILING_LADDER
+        if sm120_small_m_tiling_is_valid(m, k, *tiling)
+    )
+    m537 = (
+        ((SM120_FAMILY_M537, SM120_M537_TILING, 0),)
+        if sm120_m537_is_valid(m, k)
+        else ()
+    )
+    return large + small + m537
+
+
+def sm120_variant_packs_l2t(m: int, k: int, variant: int) -> bool:
+    """Whether the producer this variant selects wants the packed L2T layout.
+
+    Read from the chosen family rather than from the shape: once the tuner picks
+    the producer, the shape no longer determines which layout is correct.
+    """
+    family, _, _ = sm120_decode_producer_variant(m, k, variant)
+    return family in SM120_FAMILY_PACKS_L2T
 
 
 def sm120_producer_variant_count(m: int, k: int) -> int:
@@ -207,15 +294,13 @@ def sm120_unpack_tactic(tactic: int) -> tuple[int, int]:
 
 def sm120_decode_producer_variant(
     m: int, k: int, variant: int
-) -> tuple[tuple[int, int, int], int]:
+) -> tuple[int, tuple[int, int, int], int]:
     """Resolve a variant index to the geometry and policy the launcher needs.
 
     Out of range falls back to the first admissible pair rather than failing: a
     persisted tactic must still run something correct after the ladder moves.
     """
     variants = sm120_producer_variants(m, k)
-    if not variants:
-        raise ValueError(f"no admissible producer geometry for m={m} k={k}")
     if not 0 <= variant < len(variants):
         return variants[0]
     return variants[variant]
@@ -413,6 +498,13 @@ def sm120_fused_prefix_uses_packed_l2t(
     return effective != "cublaslt"
 
 
+# The (M, K) projection of the frozen benchmark matrix -- the shapes this
+# backend has actually been measured on. It no longer decides anything: fused
+# admission is computed from the launch-geometry ladder
+# (_sm120_fused_linear_supported), so a shape outside this list is offered to
+# the tuner too. Kept as data because the tests and the route ladder need a
+# name for "the shapes we benchmark", and pinned against the registry by
+# test_fused_linear_mk_is_the_benchmark_projection so the two cannot drift.
 SM120_FUSED_LINEAR_MK: Final[frozenset[tuple[int, int]]] = frozenset(
     {
         (64, 3072),

@@ -1681,6 +1681,206 @@ inline cudaError_t launch_small_m_kernel(
   return cudaGetLastError();
 }
 
+
+
+template <int BlockThreads, int DownTileCols, int RowsPerQuantBlock>
+__global__ __launch_bounds__(BlockThreads) void
+nvfp4_smooth_quantize_lora_down_small_m_dyn_sm120_kernel(
+    quant::Type const* __restrict__ x, quant::Type const* __restrict__ pre_quant_scale,
+    float const* __restrict__ global_scale, std::uint64_t* __restrict__ xq,
+    std::uint8_t* __restrict__ sf, quant::Type const* __restrict__ l2t_smoothed,
+    quant::Type* __restrict__ down, int M, int K) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1200)
+  int const kPaddedM = (M + 127) / 128 * 128;
+  int const kQuantBlocks = (M + RowsPerQuantBlock - 1) / RowsPerQuantBlock;
+  constexpr int kDownWarps = BlockThreads / 32;
+  int const kSfCols = K / quant::SF_VEC_SIZE;
+  int const kDownKPerWarp = K / kDownWarps;
+  int const kL2PrefetchLines =
+      K * kRank * static_cast<int>(sizeof(quant::Type)) / kL2PrefetchBytes;
+  constexpr int kNFragments = DownTileCols / kMmaN;
+  constexpr int kDownNTiles = kRank / DownTileCols;
+  constexpr int kDownElements = 16 * DownTileCols;
+
+  int const block = static_cast<int>(blockIdx.x);
+  if (block < kQuantBlocks) {
+    for (int line = block * BlockThreads + static_cast<int>(threadIdx.x);
+         line < kL2PrefetchLines; line += kQuantBlocks * BlockThreads) {
+      std::uint8_t const* prefetch_address =
+          reinterpret_cast<std::uint8_t const*>(l2t_smoothed) +
+          line * kL2PrefetchBytes;
+      asm volatile("prefetch.global.L2 [%0];" : : "l"(prefetch_address));
+    }
+
+    float const scale = global_scale[0];
+    int const row_base = block * RowsPerQuantBlock;
+    int const kWorkItems = RowsPerQuantBlock * kSfCols;
+    for (int item = static_cast<int>(threadIdx.x); item < kWorkItems;
+         item += BlockThreads) {
+      int const row_offset = item / kSfCols;
+      int const sf_col = item - row_offset * kSfCols;
+      int const row = row_base + row_offset;
+      std::int64_t const sf_offset =
+          quant::get_sf_out_offset_128x4(row, sf_col, kSfCols);
+      if (row < M) {
+        std::int64_t const vec_offset =
+            static_cast<std::int64_t>(row) * kSfCols + sf_col;
+        quant::Bf16x8 x_lo;
+        quant::Bf16x8 x_hi;
+        quant::Bf16x8 pqs_lo;
+        quant::Bf16x8 pqs_hi;
+        quant::loadBf16x8(x + vec_offset * quant::FAST_ELTS_PER_THREAD, x_lo);
+        quant::loadBf16x8(
+            x + vec_offset * quant::FAST_ELTS_PER_THREAD + 8, x_hi);
+        quant::loadBf16x8(
+            pre_quant_scale + sf_col * quant::FAST_ELTS_PER_THREAD, pqs_lo);
+        quant::loadBf16x8(
+            pre_quant_scale + sf_col * quant::FAST_ELTS_PER_THREAD + 8, pqs_hi);
+        xq[vec_offset] = quant::quantizeSmoothed16(
+            x_lo, x_hi, pqs_lo, pqs_hi, scale, sf + sf_offset);
+      } else {
+        sf[sf_offset] = 0u;
+      }
+    }
+    int const kCoveredRows = kQuantBlocks * RowsPerQuantBlock;
+    int const kRemainingPaddingRows = kPaddedM - kCoveredRows;
+    std::int64_t const kRemainingPaddingItems =
+        static_cast<std::int64_t>(kRemainingPaddingRows) * kSfCols;
+    for (std::int64_t item =
+             static_cast<std::int64_t>(block) * BlockThreads + threadIdx.x;
+         item < kRemainingPaddingItems;
+         item += static_cast<std::int64_t>(kQuantBlocks) * BlockThreads) {
+      int const padding_row = static_cast<int>(item / kSfCols);
+      int const sf_col =
+          static_cast<int>(item - static_cast<std::int64_t>(padding_row) * kSfCols);
+      int const row = kCoveredRows + padding_row;
+      std::int64_t const sf_offset =
+          quant::get_sf_out_offset_128x4(row, sf_col, kSfCols);
+      sf[sf_offset] = 0u;
+    }
+    return;
+  }
+
+  int const down_tile = block - kQuantBlocks;
+  int const tile_m = down_tile / kDownNTiles;
+  int const tile_n = down_tile % kDownNTiles;
+  __shared__ __align__(8) float accumulator_tiles[kDownWarps][kDownElements];
+
+  int const warp = static_cast<int>(threadIdx.x) / 32;
+  int const lane = static_cast<int>(threadIdx.x) % 32;
+  int const group = lane / 4;
+  int const pair_col = (lane % 4) * 2;
+  float d[kNFragments][4];
+#pragma unroll
+  for (int fragment = 0; fragment < kNFragments; ++fragment) {
+    d[fragment][0] = 0.0f;
+    d[fragment][1] = 0.0f;
+    d[fragment][2] = 0.0f;
+    d[fragment][3] = 0.0f;
+  }
+
+  int const k_begin = warp * kDownKPerWarp;
+  int const k_end = k_begin + kDownKPerWarp;
+  int const a_row = tile_m * 16 + group;
+  int const b_col = tile_n * DownTileCols + group;
+#pragma unroll 1
+  for (int k_base = k_begin; k_base < k_end; k_base += 16) {
+    std::uint32_t a0 = 0u;
+    std::uint32_t a1 = 0u;
+    std::uint32_t a2 = 0u;
+    std::uint32_t a3 = 0u;
+    if (a_row < M) {
+      quant::Type const* a_base = x + a_row * K + k_base + pair_col;
+      a0 = base::load_bf16_pair(a_base);
+      a2 = base::load_bf16_pair(a_base + 8);
+    }
+    if (a_row + 8 < M) {
+      quant::Type const* a_upper = x + (a_row + 8) * K + k_base + pair_col;
+      a1 = base::load_bf16_pair(a_upper);
+      a3 = base::load_bf16_pair(a_upper + 8);
+    }
+
+    quant::Type const* b_base =
+        l2t_smoothed + (k_base + pair_col) * kRank + b_col;
+#pragma unroll
+    for (int fragment = 0; fragment < kNFragments; ++fragment) {
+      quant::Type const* b_fragment = b_base + fragment * kMmaN;
+      std::uint32_t const b0 =
+          base::pack_bf16_pair(b_fragment, b_fragment + kRank);
+      std::uint32_t const b1 = base::pack_bf16_pair(
+          b_fragment + 8 * kRank, b_fragment + 9 * kRank);
+      base::mma_m16n8k16_row_col(
+          d[fragment][0], d[fragment][1], d[fragment][2], d[fragment][3],
+          a0, a1, a2, a3, b0, b1);
+    }
+  }
+
+#pragma unroll
+  for (int fragment = 0; fragment < kNFragments; ++fragment) {
+    int const output0 =
+        group * DownTileCols + fragment * kMmaN + pair_col;
+    int const output1 = output0 + 8 * DownTileCols;
+    *reinterpret_cast<float2*>(&accumulator_tiles[warp][output0]) =
+        make_float2(d[fragment][0], d[fragment][1]);
+    *reinterpret_cast<float2*>(&accumulator_tiles[warp][output1]) =
+        make_float2(d[fragment][2], d[fragment][3]);
+  }
+  __syncthreads();
+
+  int const element = static_cast<int>(threadIdx.x);
+  if (element < kDownElements) {
+    float accum = 0.0f;
+#pragma unroll
+    for (int source_warp = 0; source_warp < kDownWarps; ++source_warp) {
+      accum += accumulator_tiles[source_warp][element];
+    }
+    int const row = tile_m * 16 + element / DownTileCols;
+    int const col = tile_n * DownTileCols + element % DownTileCols;
+    if (row < M) {
+      down[row * kRank + col] = __float2bfloat16_rn(accum);
+    }
+  }
+#else
+  if (threadIdx.x == 0 && blockIdx.x == 0) {
+    __trap();
+  }
+#endif
+}
+
+// Runtime-M/K small-M launch. Only the tiling stays in the type; the shape and
+// everything derived from it are arguments, so one instantiation per tiling
+// serves every shape whose K divides the warp split.
+template <int BlockThreads, int DownTileCols, int RowsPerQuantBlock>
+inline cudaError_t launch_small_m_dyn_kernel(
+    void const* x, void const* pre_quant_scale, float const* global_scale, void* xq,
+    void* sf, void const* l2t_smoothed, void* down, int m, int k, cudaStream_t stream) {
+  constexpr int kDownWarps = BlockThreads / 32;
+  constexpr int kNFragments = DownTileCols / kMmaN;
+  constexpr int kDownNTiles = kRank / DownTileCols;
+  if constexpr (BlockThreads % 32 || kDownWarps <= 0 || DownTileCols % kMmaN ||
+                kNFragments <= 0 || kDownNTiles * DownTileCols != kRank) {
+    return cudaErrorInvalidValue;
+  } else {
+    // What SmallMLaunchGeometry asserted at compile time is a precondition here.
+    if (m <= 0 || RowsPerQuantBlock <= 0) return cudaErrorInvalidValue;
+    if (k % kDownWarps || (k / kDownWarps) % 16) return cudaErrorInvalidValue;
+    if (k % (4 * quant::SF_VEC_SIZE)) return cudaErrorInvalidValue;
+    int const padded_m = (m + 127) / 128 * 128;
+    int const quant_blocks = (m + RowsPerQuantBlock - 1) / RowsPerQuantBlock;
+    if (quant_blocks * RowsPerQuantBlock > padded_m) return cudaErrorInvalidValue;
+    int const grid_blocks = quant_blocks + ((m + 15) / 16) * kDownNTiles;
+    nvfp4_smooth_quantize_lora_down_small_m_dyn_sm120_kernel<
+        BlockThreads, DownTileCols, RowsPerQuantBlock>
+        <<<grid_blocks, BlockThreads, 0, stream>>>(
+            static_cast<quant::Type const*>(x),
+            static_cast<quant::Type const*>(pre_quant_scale), global_scale,
+            static_cast<std::uint64_t*>(xq), static_cast<std::uint8_t*>(sf),
+            static_cast<quant::Type const*>(l2t_smoothed),
+            static_cast<quant::Type*>(down), m, k);
+    return cudaGetLastError();
+  }
+}
+
 }  // namespace smooth_quantize_lora_down_small_m_sm120_detail
 
 namespace smooth_quantize_lora_down_large_m_sm120_detail {
@@ -2839,6 +3039,60 @@ inline cudaError_t nvfp4_smooth_quantize_lora_down_dyn_sm120(
   return cudaErrorInvalidValue;
 }
 
+// Producer launch by family and tiling, with no shape lookup at all. The caller
+// enumerates what a shape may run from the same constraints the launchers check,
+// so this switch is over the two ladders rather than over shapes, and a shape
+// nobody wrote down reaches the same kernels as one that was.
+//   family 0 large-M (geometry a, b, c = block threads, tile M, tile K)
+//   family 1 small-M (tiling  a, b, c = block threads, down tile cols, rows/quant block)
+inline cudaError_t nvfp4_smooth_quantize_lora_down_family_sm120(
+    void const* x, void const* pre_quant_scale, float const* global_scale, void* xq,
+    void* sf, void const* l2t_smoothed, void* down, int m, int k, int family, int a,
+    int b, int c, int address_policy, cudaStream_t stream) {
+  namespace large_m = smooth_quantize_lora_down_large_m_sm120_detail;
+  namespace small_m = smooth_quantize_lora_down_small_m_sm120_detail;
+  using large_m::DynAddress;
+  if (family == 2) {
+    // One M, parameterised on K: the role split bakes M in, so this family
+    // enumerates for the M it was written for and nothing else.
+    if (m != 537) return cudaErrorInvalidValue;
+    if (k == 5120) {
+      return small_m::launch_m537_mixed_kernel<5120, 1024, 24, 16, 8>(
+          x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, stream);
+    }
+    if (k == 5376) {
+      return small_m::launch_m537_mixed_kernel<5376, 1024, 24, 16, 8>(
+          x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, stream);
+    }
+    if (k == 7168) {
+      return small_m::launch_m537_mixed_kernel<7168, 1024, 24, 16, 8>(
+          x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, stream);
+    }
+    return cudaErrorInvalidValue;
+  }
+  if (family == 1) {
+#define FI_SVDQ_SMALL_CASE(BT, DTC, RPQB)                                             \
+    if (a == (BT) && b == (DTC) && c == (RPQB)) {                                     \
+      return small_m::launch_small_m_dyn_kernel<BT, DTC, RPQB>(                       \
+          x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, m, k, stream); \
+    }
+    FI_SVDQ_SMALL_CASE(256, 16, 4)
+    FI_SVDQ_SMALL_CASE(768, 8, 8)
+    FI_SVDQ_SMALL_CASE(768, 16, 16)
+    FI_SVDQ_SMALL_CASE(768, 32, 16)
+    FI_SVDQ_SMALL_CASE(896, 16, 16)
+    FI_SVDQ_SMALL_CASE(1024, 8, 4)
+    FI_SVDQ_SMALL_CASE(1024, 8, 16)
+    FI_SVDQ_SMALL_CASE(1024, 16, 16)
+#undef FI_SVDQ_SMALL_CASE
+    return cudaErrorInvalidValue;
+  }
+  return nvfp4_smooth_quantize_lora_down_dyn_sm120(
+      x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, m, k, a, b, c,
+      stream, address_policy);
+}
+
+
 inline cudaError_t nvfp4_smooth_quantize_lora_down_sm120(
     void const* x, void const* pre_quant_scale, float const* global_scale, void* xq, void* sf,
     void const* l2t_smoothed, void* down, int m, int k, cudaStream_t stream,
@@ -3048,12 +3302,12 @@ inline cudaError_t nvfp4_smooth_quantize_lora_down_sm120(
         x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, stream);
   }
   if (m == 1935 && k == 5120) {
-    return small_m::launch_small_m_kernel<1935, 5120, 256, 16>(
-        x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, stream);
+    return small_m::launch_small_m_dyn_kernel<256, 16, /*RowsPerQuantBlock=*/4>(
+        x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, 1935, 5120, stream);
   }
   if (m == 1935 && k == 7168) {
-    return small_m::launch_small_m_kernel<1935, 7168, 256, 16>(
-        x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, stream);
+    return small_m::launch_small_m_dyn_kernel<256, 16, /*RowsPerQuantBlock=*/4>(
+        x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, 1935, 7168, stream);
   }
   if (m == 1935 && k == 14336) {
     // Row 57 is the only Batch-4 small-M shape on the large-M producer, and its
@@ -3153,8 +3407,8 @@ inline cudaError_t nvfp4_smooth_quantize_lora_down_sm120(
   //   (512, 1536)      11.79        10.24 us    13.2%
   if (k == 1536) {
     if (m == 512) {
-      return small_m::launch_small_m_kernel<512, 1536, 768, 32, 16>(
-          x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, stream);
+      return small_m::launch_small_m_dyn_kernel<768, 32, 16>(
+          x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, 512, 1536, stream);
     }
     if (m == 7800) {
       return large_m::launch_large_m_variant<7800, 1536, 224, 48, 128>(
@@ -3164,8 +3418,8 @@ inline cudaError_t nvfp4_smooth_quantize_lora_down_sm120(
 
   if (k == 3072) {
     if (m == 256) {
-      return small_m::launch_small_m_kernel<256, 3072, 768, 8, 8>(
-          x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, stream);
+      return small_m::launch_small_m_dyn_kernel<768, 8, 8>(
+          x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, 256, 3072, stream);
     }
     if (m == 6889) {
       return large_m::launch_large_m_variant<6889, 3072, 224, 48, 128>(
@@ -3180,8 +3434,8 @@ inline cudaError_t nvfp4_smooth_quantize_lora_down_sm120(
           geometry_variant, x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, stream);
     }
     if (m == 1024) {
-      return small_m::launch_small_m_kernel<1024, 3072, 1024, 16, 16>(
-          x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, stream);
+      return small_m::launch_small_m_dyn_kernel<1024, 16, 16>(
+          x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, 1024, 3072, stream);
     }
     if (m == 4096) {
       return large_m::launch_large_m_variant<4096, 3072, 384, 32, 256>(
@@ -3215,16 +3469,16 @@ inline cudaError_t nvfp4_smooth_quantize_lora_down_sm120(
   //   (1935, 5376)      36.86         57.34 us   cuBLASLt prefix
   if (k == 12288) {
     if (m == 64) {
-      return small_m::launch_small_m_kernel<64, 12288, 1024, 8, 4>(
-          x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, stream);
+      return small_m::launch_small_m_dyn_kernel<1024, 8, 4>(
+          x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, 64, 12288, stream);
     }
     if (m == 256) {
-      return small_m::launch_small_m_kernel<256, 12288, 1024, 8, 16>(
-          x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, stream);
+      return small_m::launch_small_m_dyn_kernel<1024, 8, 16>(
+          x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, 256, 12288, stream);
     }
     if (m == 512) {
-      return small_m::launch_small_m_kernel<512, 12288, 768, 16, 16>(
-          x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, stream);
+      return small_m::launch_small_m_dyn_kernel<768, 16, 16>(
+          x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, 512, 12288, stream);
     }
     if (m == 1024) {
       return large_m::launch_large_m_variant<1024, 12288, 192, 16, 512>(
@@ -3233,18 +3487,18 @@ inline cudaError_t nvfp4_smooth_quantize_lora_down_sm120(
   }
 
   if (m == 512 && k == 5120) {
-    return small_m::launch_small_m_kernel<512, 5120, 1024, 16, 16>(
-        x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, stream);
+    return small_m::launch_small_m_dyn_kernel<1024, 16, 16>(
+          x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, 512, 5120, stream);
   }
 
   if (m == 537 && k == 14336) {
-    return small_m::launch_small_m_kernel<537, 14336, 896, 16, 16>(
-        x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, stream);
+    return small_m::launch_small_m_dyn_kernel<896, 16, 16>(
+          x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, 537, 14336, stream);
   }
 
   if (m == 1935 && k == 5376) {
-    return small_m::launch_small_m_kernel<1935, 5376, 896, 16, 16>(
-        x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, stream);
+    return small_m::launch_small_m_dyn_kernel<896, 16, 16>(
+          x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, 1935, 5376, stream);
   }
 
   return cudaErrorInvalidValue;

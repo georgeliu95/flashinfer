@@ -54,6 +54,21 @@ _SM120_FUSED_LINEAR_MK = _sm120_routes.SM120_FUSED_LINEAR_MK
 _sm120_fused_prefix_route = _sm120_routes.sm120_fused_prefix_route
 
 
+_sm120_producer_variants = _sm120_routes.sm120_producer_variants
+
+
+_sm120_decode_producer_variant = _sm120_routes.sm120_decode_producer_variant
+
+
+_sm120_variant_packs_l2t = _sm120_routes.sm120_variant_packs_l2t
+
+
+_sm120_pack_tactic = _sm120_routes.sm120_pack_tactic
+
+
+_sm120_unpack_tactic = _sm120_routes.sm120_unpack_tactic
+
+
 _SM120_LINEAR_ROUTE_ABI_VERSION = _sm120_routes.SM120_LINEAR_ROUTE_ABI_VERSION
 
 
@@ -202,10 +217,28 @@ def _sm120_fused_linear_l2t(
 
 
 def _sm120_fused_linear_supported(m: int, k: int, rank: int) -> bool:
-    """Return whether a shape may offer the fused K12 route to the autotuner."""
+    """Return whether a shape may offer the fused K12 route to the autotuner.
+
+    Computed, not looked up. A shape can offer the fused route when a producer
+    can launch it -- when its geometry ladder is non-empty -- and the fused
+    producer stages rank 32 only, carrying its own compile-time rank rather
+    than taking one as a build parameter the way the GEMM half does.
+
+    This replaced a 51-entry table whose contents were exactly the (M, K)
+    projection of the 71 benchmark shapes, so on everything ever measured the
+    two agree. Off that matrix they do not, and the fused route was checked
+    there before this changed: on 2048x3072x3072, 3000x3072x3072 and
+    1024x5120x5120 the fused K12+K3 launch is bit-identical to separate
+    launches of the same producer and tactic, all four outputs, with an
+    in-matrix shape carried alongside as the control.
+
+    Offering is not choosing. A shape nobody benchmarked now reaches the tuner
+    as a candidate instead of being excluded by a list, and the tuner drops it
+    if it loses.
+    """
     if rank != SVDQUANT_LORA_RANK_GRANULARITY:
         return False
-    return (m, k) in _SM120_FUSED_LINEAR_MK
+    return bool(_sm120_producer_variants(m, k))
 
 
 
@@ -238,27 +271,85 @@ def _get_nvfp4_svdquant_module_for_device(device: torch.device):
     return get_nvfp4_svdquant_module()
 
 
+_SM120_WORKSPACE_BUDGET_FRACTION: Final = 0.25
+
+
+def _sm120_workspace_budget_bytes(device_index: Optional[int]) -> int:
+    """Largest per-tactic workspace this card can back for one shape, right now.
+
+    The autotuner provisions one buffer per shape covering every tactic it may
+    select, so a single Split-K row asking for O(splits*m*n*4B) sets the size
+    for the whole shape.
+
+    Against FREE memory, not total, and not cached. Sizing this as a fraction
+    of total was measured wrong on 82752x28672x5376: the widest request there
+    is 8.84 GiB, comfortably under a quarter of a 71 GiB card, but by the time
+    the buffer is provisioned the problem's own operands hold 65 GiB and 5.74
+    GiB is left. A total-memory budget admits the tactic and the allocation
+    fails -- which is the OOM the shape-keyed exposure filter used to prevent,
+    reintroduced by pricing the wrong quantity.
+
+    Reading free memory makes the admitted set depend on what else is resident.
+    That is the honest dependency: whether a buffer can be backed is a fact
+    about the moment it is allocated, not about the part number.
+    """
+    if device_index is None:
+        return 0
+    free, _total = torch.cuda.mem_get_info(device_index)
+    return int(free * _SM120_WORKSPACE_BUDGET_FRACTION)
+
+
+_SM120_WORKSPACE_BUDGET_CACHE: dict = {}
+
+
+def _sm120_shape_workspace_budget(device: Optional[torch.device], key) -> int:
+    """The budget this shape was sized against, decided once and then held.
+
+    Sizing and selection are separate calls, and free memory moves between
+    them. If selection re-read it, the autotuner could admit a tactic whose
+    workspace the already-provisioned buffer cannot hold, which the C++
+    ICHECK_GE then refuses at launch. Deciding once per shape keeps the two
+    halves talking about the same number.
+    """
+    if device is None:
+        return 0
+    cached = _SM120_WORKSPACE_BUDGET_CACHE.get(key)
+    if cached is None:
+        cached = _sm120_workspace_budget_bytes(device.index)
+        _SM120_WORKSPACE_BUDGET_CACHE[key] = cached
+    return cached
+
+
 def _nvfp4_svdquant_valid_tactics(
     module,
     m: int,
     n: int,
     k: int,
     rank: int,
+    device: Optional[torch.device] = None,
 ) -> List[int]:
-    """Return implementable tactics after the SM120 profitability filter."""
+    """Tactics this shape can run, bounded by what the card can back.
+
+    `can_implement` is the correctness boundary and the workspace budget is a
+    legality boundary on top of it. There is deliberately no profitability
+    filter here: which of these candidates is fastest is a measurement, and the
+    autotuner is the thing that measures. Passing ``device=None`` asks for the
+    unbounded set, which is what the CPU-only tests want.
+    """
     all_tactics = range(module.nvfp4_svdquant_gemm_tactic_num())
     can_implement = getattr(module, "nvfp4_svdquant_gemm_can_implement", None)
     if can_implement is None:
         return list(all_tactics)
     tactics = [t for t in all_tactics if can_implement(m, n, k, rank, t)]
-    tactic_row = getattr(module, "nvfp4_svdquant_gemm_tactic_row", None)
-    if tactic_row is not None:
-        tactics = [
-            t
-            for t in tactics
-            if _sm120_tactic_exposed(m, n, k, int(tactic_row(t)))
-        ]
-    return tactics
+    workspace_size = getattr(module, "nvfp4_svdquant_gemm_workspace_size", None)
+    if device is None or workspace_size is None or not tactics:
+        return tactics
+    budget = _sm120_shape_workspace_budget(device, (device.index, m, n, k, rank))
+    affordable = [t for t in tactics if int(workspace_size(m, n, k, t)) <= budget]
+    if affordable:
+        return affordable
+    # A shape whose every candidate overruns the budget still has to run.
+    return [min(tactics, key=lambda t: int(workspace_size(m, n, k, t)))]
 
 
 
@@ -278,15 +369,17 @@ def _nvfp4_svdquant_gemm_runners(
 
 
 def _sm120_linear_tactics(module, inputs: List[torch.Tensor]) -> List[int]:
-    """The consumer rows this shape admits, correctness- and cost-filtered.
+    """Consumer rows crossed with the producer configurations this shape admits.
 
-    A tactic is one K3 row and nothing else. It briefly also carried a producer
-    geometry in its high bits, but the geometries that axis offered were never
-    instantiated on the C++ side, so every shape is back to the single axis the
-    kernel actually implements.
+    The producer half indexes ``sm120_producer_variants``, which is computed from
+    the launch geometry's own constraints rather than read from a table -- so a
+    shape nobody measured still gets the fused prefix, and a card nobody measured
+    on ranks the candidates itself.
     """
     m, n, k, rank = _sm120_linear_inputs_shape(inputs)
-    return _nvfp4_svdquant_valid_tactics(module, m, n, k, rank)
+    rows = _nvfp4_svdquant_valid_tactics(module, m, n, k, rank, inputs[0].device)
+    variants = range(len(_sm120_producer_variants(m, k)))
+    return [_sm120_pack_tactic(row, v) for v in variants for row in rows]
 
 
 def _sm120_linear_inputs_shape(inputs: List[torch.Tensor]) -> tuple[int, int, int, int]:
@@ -360,12 +453,23 @@ def _sm120_fused_linear_runner(enable_pdl: bool, device: torch.device):
                 out,
                 workspace_buffer,
             ) = inputs
-            # The L2T layout prepared here and the prefix the C++ dispatch
-            # takes have to describe the same route, so both read it from the
-            # ladder rather than from the tactic: the tactic selects the K3
-            # consumer row only.
-            route = _sm120_fused_prefix_route(x.shape[0], x.shape[1])
-            fused_l2t_smoothed = _sm120_fused_linear_l2t(x, l2t_smoothed, route)
+            # The tactic names a consumer row and a producer configuration.
+            # The geometry and address policy go down explicitly, so the C++
+            # side needs no table to turn an index back into a launch.
+            m_rt, k_rt = x.shape[0], x.shape[1]
+            _, producer_variant = _sm120_unpack_tactic(tactic)
+            family, tiling, address_policy = _sm120_decode_producer_variant(
+                m_rt, k_rt, producer_variant
+            )
+            # The layout follows the producer the tactic selected, not the
+            # shape: the M537 family indexes L2T prepacked and every other
+            # family reads it row-major, and handing one the other's matrix
+            # misreads it rather than failing.
+            fused_l2t_smoothed = (
+                _cached_sm120_m537_l2t(l2t_smoothed)
+                if _sm120_variant_packs_l2t(m_rt, k_rt, producer_variant)
+                else l2t_smoothed
+            )
             module.nvfp4_svdquant_linear_sm120(
                 x,
                 pre_quant_scale,
@@ -383,6 +487,11 @@ def _sm120_fused_linear_runner(enable_pdl: bool, device: torch.device):
                 workspace_buffer,
                 tactic,
                 enable_pdl,
+                family,
+                tiling[0],
+                tiling[1],
+                tiling[2],
+                address_policy,
             )
             return out
 
@@ -399,7 +508,7 @@ def _sm120_cutlass_linear_runner(enable_pdl: bool, device: torch.device):
             profile: OptimizationProfile,
         ) -> List[int]:
             return _nvfp4_svdquant_valid_tactics(
-                module, *_sm120_linear_inputs_shape(inputs)
+                module, *_sm120_linear_inputs_shape(inputs), device
             )
 
         def forward(
@@ -702,70 +811,6 @@ def _choose_sm120_linear_runner(
     return runner, tactic
 
 
-_SM120_STATIC_KERNEL_TILES = {
-    23: (128, 64, True),
-    24: (128, 32, True),
-    25: (64, 128, False),
-    27: (128, 32, True),
-    28: (64, 32, True),
-}
-
-
-_SM120_WIDE_STATIC_KERNELS = frozenset({29, 30})
-
-
-def _sm120_tactic_exposed(m: int, n: int, k: int, packed_row: int) -> bool:
-    """Shape-aware exposure of SM120 runtime-tactic rows to the autotuner.
-
-    `can_implement` is the correctness boundary; this is a cost boundary.
-
-    It was introduced as a profitability boundary, on the grounds that with all
-    72 rows exposed "few-sample profiling on millisecond-scale kernels
-    mis-selects on near-ties" -- that is, to compensate for the selector. That
-    premise no longer holds: `_sm120_select_linear_tactic` now ranks under the
-    metric the report is written in. So the filter was priced again against the
-    unpruned field, ten shapes, every candidate measured under `graph_cupti_span`
-    (artifacts/selector-metric-20260821).
-
-    Removing it buys nothing. On the six large-M shapes it cuts the field from
-    166 candidates to 36, and on four of those the unpruned winner is a row it
-    prunes -- but the unpruned winner is faster by -0.33% to +0.44%, signs
-    mixed, entirely inside the cross-session floor of the measurement itself
-    (mean 0.06%, worst 1.65%). Those rows are ties, not wins.
-
-    What removing it costs is real: selection on `82752x28672x5376` goes from
-    17.8 s to 67.0 s, and the selector is marginally less reliable on the wider
-    field. So it stays, as a cost boundary, and the thresholds below keep the
-    admission-matrix evidence they were built from:
-
-    - swap spikes and the 64-row driver only ever win at M <= 512;
-    - forced Split-K only wins on long-K problems with an underfilled grid;
-    - raster/swizzle variants won only at M <= 8192 and mis-selected above;
-    - the small-M static-scheduler rows won only when every CTA gets exactly
-      one tile (one wave) and regressed at seven waves, so they are exposed
-      only inside the one-wave envelope of their own tile grid;
-    - the 256-wide static rows do not follow that pattern and are exposed
-      everywhere, see _SM120_WIDE_STATIC_KERNELS.
-    """
-    kernel_id = packed_row & 0xFF
-    splits = (packed_row >> 8) & 0xFF
-    raster = (packed_row >> 16) & 0xFF
-    swizzle = (packed_row >> 24) & 0xFF
-    if kernel_id in _SM120_WIDE_STATIC_KERNELS:  # 256-wide static rows 81-82
-        return True
-    if kernel_id in _SM120_STATIC_KERNEL_TILES:  # static-scheduler rows 75-77 and 79-80
-        tile_m, tile_n, swap = _SM120_STATIC_KERNEL_TILES[kernel_id]
-        pm, pn = (n, m) if swap else (m, n)
-        tiles = -(pm // -tile_m) * -(pn // -tile_n)
-        return m <= 512 and tiles <= 110
-    if kernel_id >= 16:  # small-N swap spikes + 64-row driver (rows 64-74)
-        return m <= 512
-    if splits > 1:  # forced Split-K rows 16-31 on legacy Stream-K kernels
-        output_tiles = ((m + 127) // 128) * ((n + 127) // 128)
-        return k >= 8192 and output_tiles <= 220
-    if raster != 0 or swizzle > 1:  # raster/swizzle rows 32-63
-        return m <= 8192
-    return True  # legacy defaults (rows 0-15)
 
 
 def _svdquant_tuning_config(backend_key: str) -> TuningConfig:
@@ -790,7 +835,7 @@ def _sm120_max_workspace_bytes(
         return cached
     module = _get_nvfp4_svdquant_module_for_device(device)
     required = 0
-    for t in _nvfp4_svdquant_valid_tactics(module, m, n, k, rank):
+    for t in _nvfp4_svdquant_valid_tactics(module, m, n, k, rank, device):
         required = max(required, module.nvfp4_svdquant_gemm_workspace_size(m, n, k, t))
     _SM120_WORKSPACE_BYTES_CACHE[key] = required
     return required
@@ -811,7 +856,7 @@ def _nvfp4_svdquant_gemm_runner(enable_pdl: bool, device: torch.device):
             m, k = a.shape[0], a.shape[1] * 2
             n = b.shape[0]
             rank = d.shape[1]
-            return _nvfp4_svdquant_valid_tactics(module, m, n, k, rank)
+            return _nvfp4_svdquant_valid_tactics(module, m, n, k, rank, device)
 
         def forward(
             self,

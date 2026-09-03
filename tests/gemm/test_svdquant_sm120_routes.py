@@ -16,6 +16,7 @@ from types import MappingProxyType
 import pytest
 
 from flashinfer.gemm.svdquant_sm120_routes import (
+    sm120_producer_variants,
     PREFIX_ROUTE_OVERRIDE_ENV,
     SM120_TACTIC_ABI_VERSION,
     SM120_FUSED_LINEAR_MK,
@@ -295,11 +296,10 @@ def test_packed_l2t_matches_the_producers_that_read_the_packed_layout() -> None:
         f"packed set {sorted(SM120_PACKED_L2T_NATIVE_MK)} does not match the "
         f"M537-mixed producers {sorted(mixed)}"
     )
-    native = _native_producer_shapes(header)
     for key, (_, admitted) in SM120_PREFIX_ROUTE_LADDER.items():
         if "native" not in admitted:
             continue
-        assert key in native, f"{key} admits native with no compiled producer"
+        assert _has_native_producer(*key), f"{key} admits native with no producer"
         assert (key in SM120_PACKED_L2T_NATIVE_MK) == (key in mixed), key
 
 
@@ -382,6 +382,24 @@ def test_no_module_ships_a_shape_keyed_tactic_table() -> None:
     )
 
 
+
+def _has_native_producer(m: int, k: int) -> bool:
+    """Can the producer actually launch this (M, K)?
+
+    This used to be read off per-shape kernel instantiations in the C++ header
+    (_native_producer_shapes below). The runtime-M/K conversion replaced those
+    with one launcher that takes the geometry as arguments -- which is what let
+    110 instantiations collapse to 34 -- so scanning for them now reports their
+    absence rather than a coverage gap. What has to hold instead is that the
+    shape computes a legal geometry at all.
+
+    Reachability is deliberately NOT folded in here: the FFI still carries its
+    own shape guard, and the tests assert against _ffi_guard_shapes() right
+    beside this, so a shape that computes a geometry but cannot get through the
+    entry point still fails.
+    """
+    return bool(sm120_producer_variants(m, k))
+
 def _native_producer_shapes(header: str) -> set[tuple[int, int]]:
     """Every exact (M, K) the C++ producer dispatcher can actually launch.
 
@@ -456,12 +474,24 @@ def test_the_ffi_guard_admits_exactly_the_compiled_producers() -> None:
     # pick and the FFI will refuse, which is how the six swept producers first
     # failed (artifacts/producer-gap-20260822).
     guard = _ffi_guard_shapes()
-    native = _native_producer_shapes(_producer_header())
-    assert guard - native == set(), (
-        f"{sorted(guard - native)} pass the FFI check but have no producer"
+    unbacked = sorted(shape for shape in guard if not _has_native_producer(*shape))
+    assert unbacked == [], (
+        f"{unbacked} pass the FFI check but have no producer"
     )
-    assert native - guard == set(), (
-        f"{sorted(native - guard)} have a producer the FFI check will reject"
+    # The other direction. It used to read as "we compiled a producer for a
+    # shape the FFI will not admit", which was a real waste when producers were
+    # per-shape templates. Every legal (M, K) computes a geometry now, so that
+    # difference would be every shape outside the guard and would say nothing.
+    # Scoped to what this backend actually claims to support, the waste it
+    # guarded against is still a thing worth refusing.
+    claimed = set(SM120_FUSED_LINEAR_MK)
+    unreachable = sorted(
+        shape for shape in claimed
+        if _has_native_producer(*shape) and shape not in guard
+        and SM120_PREFIX_ROUTE_LADDER.get(shape, ("", ()))[0] != "cublaslt"
+    )
+    assert unreachable == [], (
+        f"{unreachable} have a producer the FFI check will reject"
     )
 
 
@@ -472,7 +502,10 @@ def test_every_fused_admission_has_a_prefix_that_can_run() -> None:
     # When: the admission set is checked against both.
     # Then: nothing is admitted that has neither, which would make the C++
     # dispatcher return cudaErrorInvalidValue for a route the tuner can pick.
-    reachable = _native_producer_shapes(_producer_header()) & _ffi_guard_shapes()
+    # Reachable = the FFI lets it in AND the shape computes a geometry to launch.
+    reachable = {
+        shape for shape in _ffi_guard_shapes() if _has_native_producer(*shape)
+    }
     cublaslt = {
         key for key, entry in SM120_PREFIX_ROUTE_LADDER.items() if entry[0] == "cublaslt"
     }
@@ -511,7 +544,7 @@ def test_swept_producers_are_admitted_and_route_native(m: int, k: int) -> None:
     assert (m, k) in SM120_FUSED_LINEAR_MK
     assert sm120_fused_prefix_route(m, k) == "native"
     assert not sm120_fused_prefix_uses_packed_l2t(m, k, 32)
-    assert (m, k) in _native_producer_shapes(_producer_header())
+    assert _has_native_producer(m, k)
     assert (m, k) in _ffi_guard_shapes()
 
 
@@ -531,7 +564,7 @@ def test_prefixes_where_fusing_measured_slower_are_offered_anyway(m: int, k: int
     # reject, and the source-side judgement that put it there never re-checks
     # itself. The measured costs live beside each dispatcher entry.
     assert (m, k) in SM120_FUSED_LINEAR_MK
-    assert (m, k) in _native_producer_shapes(_producer_header())
+    assert _has_native_producer(m, k)
     assert (m, k) in _ffi_guard_shapes()
 
 
@@ -545,9 +578,8 @@ def test_every_production_prefix_has_a_fused_producer() -> None:
     # decided by measurement, per shape, per card.
     from flashinfer.testing.svdq_model_shapes import MODEL_SHAPE_CASES
 
-    native = _native_producer_shapes(_producer_header())
     prefixes = {(case[0], case[2]) for case in MODEL_SHAPE_CASES}
-    missing = sorted(prefixes - native)
+    missing = sorted(p for p in prefixes if not _has_native_producer(*p))
     assert missing == [], f"{missing} have no fused producer"
     assert prefixes <= set(SM120_FUSED_LINEAR_MK)
     assert prefixes <= _ffi_guard_shapes()
@@ -579,5 +611,20 @@ def test_every_production_prefix_has_a_fused_producer() -> None:
 
 
 
+
+
+
+
+def test_fused_linear_mk_is_the_benchmark_projection() -> None:
+    """The named shape list must stay the benchmark matrix, not drift into a gate.
+
+    SM120_FUSED_LINEAR_MK used to decide fused admission. It does not any more --
+    _sm120_fused_linear_supported computes that from the launch geometry -- so
+    what is left is a name for the shapes this backend was measured on. If the
+    two ever diverge, the list has started encoding a decision again.
+    """
+    from flashinfer.testing.svdq_model_shapes import MODEL_SHAPE_CASES
+
+    assert set(SM120_FUSED_LINEAR_MK) == {(m, k) for m, _, k in MODEL_SHAPE_CASES}
 
 

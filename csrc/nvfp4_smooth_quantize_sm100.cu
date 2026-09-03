@@ -198,7 +198,7 @@ void nvfp4_quantize_smooth_lora_down_geometry_sm120(
 void nvfp4_quantize_smooth_lora_down_dyn_sm120(
     TensorView x, TensorView pqs, TensorView global_scale,
     TensorView l2t_smoothed, TensorView xq, TensorView sf, TensorView down,
-    int block_threads, int tile_m, int tile_k, int address_policy) {
+    int family, int tiling0, int tiling1, int tiling2, int address_policy) {
   CHECK_INPUT_AND_TYPE(x, dl_bfloat16);
   CHECK_INPUT_AND_TYPE(pqs, dl_bfloat16);
   CHECK_INPUT_AND_TYPE(global_scale, dl_float32);
@@ -209,10 +209,10 @@ void nvfp4_quantize_smooth_lora_down_dyn_sm120(
   int const m = static_cast<int>(x.size(0));
   int const k = static_cast<int>(x.size(1));
   cudaStream_t stream = get_stream(x.device());
-  cudaError_t status = flashinfer::gemm::nvfp4_smooth_quantize_lora_down_dyn_sm120(
+  cudaError_t status = flashinfer::gemm::nvfp4_smooth_quantize_lora_down_family_sm120(
       x.data_ptr(), pqs.data_ptr(), static_cast<float const*>(global_scale.data_ptr()),
       xq.data_ptr(), sf.data_ptr(), l2t_smoothed.data_ptr(), down.data_ptr(),
-      m, k, block_threads, tile_m, tile_k, stream, address_policy);
+      m, k, family, tiling0, tiling1, tiling2, address_policy, stream);
   TVM_FFI_ICHECK_EQ(status, cudaSuccess)
       << "nvfp4_quantize_smooth_lora_down_dyn_sm120 failed: "
       << cudaGetErrorString(status);

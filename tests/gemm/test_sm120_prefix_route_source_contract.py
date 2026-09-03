@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 
 from flashinfer.gemm.svdquant_sm120_routes import (
+    sm120_producer_variants,
     PREFIX_ROUTE_OVERRIDE_ENV,
     SM120_PREFIX_ROUTE_LADDER,
 )
@@ -174,13 +175,14 @@ def test_no_rung_admits_a_route_it_cannot_run() -> None:
         assert "native_alt" not in admitted, key
         if "native" in admitted:
             m, k = key
-            compiled = (
-                f"launch_small_m_kernel<{m}, {k}," in body
-                or f"launch_large_m_kernel<{m}, {k}," in body
-                or (m == 537 and f"launch_m537_mixed_kernel<{k}," in body)
-                or (m == 512 and f"launch_m512_kernel<{k}," in body)
+            # Was: look for this shape's own launch_*_kernel<M, K, ...> in the
+            # dispatcher body. The runtime-M/K conversion replaced the per-shape
+            # instantiations with one launcher taking the geometry as arguments,
+            # so a shape is backed when it computes a geometry, not when a
+            # template bearing its numbers appears in the source.
+            assert sm120_producer_variants(m, k), (
+                f"{key} admits native but computes no producer geometry"
             )
-            assert compiled, f"{key} admits native with no producer in the dispatcher"
 
 
 def test_native_alt_grammar_survives_its_own_retirement() -> None:

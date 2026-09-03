@@ -4,6 +4,7 @@ These tests exercise the pure host-side routing logic (backend selection by comp
 capability and the SM120 rank-32 gate) and run on any machine: no GPU, no JIT build.
 """
 
+import math
 from types import SimpleNamespace
 
 import pytest
@@ -26,15 +27,43 @@ def test_backend_for_capability_rejects_unsupported(major, minor):
         svdquant_sm120_cutlass._svdquant_backend_for_capability(major, minor)
 
 
-def _fake_tensor(shape, dtype, is_cuda=True):
-    """Duck-typed stand-in exposing only what _check_mm_nvfp4_svdquant_problem reads."""
-    return SimpleNamespace(
-        ndim=len(shape),
-        shape=tuple(shape),
-        dtype=dtype,
-        is_cuda=is_cuda,
-        device="cuda:0" if is_cuda else "cpu",
-    )
+
+class _FakeTensor:
+    """Minimal stand-in for the tensor surface the public entries actually read.
+
+    These tests grew SimpleNamespace fakes and then chased AttributeErrors one
+    attribute at a time as the entry points came to read more of the tensor
+    surface -- dtype, then numel, then size. A small class states the surface
+    once, so a new read fails loudly here instead of somewhere downstream.
+    """
+
+    def __init__(self, shape, dtype=None, device="cuda:0", contiguous=True, **kwargs):
+        # torch.empty takes either a size tuple or bare ints.
+        self.shape = (shape,) if isinstance(shape, int) else tuple(shape)
+        self.ndim = len(self.shape)
+        self.dtype = dtype if dtype is not None else torch.float32
+        self.device = device
+        self.is_cuda = str(device).startswith("cuda")
+        self.kwargs = kwargs
+        self._contiguous = contiguous
+
+    def numel(self):
+        return math.prod(self.shape) if self.shape else 0
+
+    def size(self, dim=None):
+        return self.shape if dim is None else self.shape[dim]
+
+    def is_contiguous(self):
+        return self._contiguous
+
+    def __repr__(self):
+        return f"_FakeTensor(shape={self.shape}, dtype={self.dtype})"
+
+def _fake_tensor(shape, dtype, is_cuda=True, contiguous=True):
+    """Duck-typed stand-in for what _check_mm_nvfp4_svdquant_problem reads."""
+    return _FakeTensor(shape, dtype=dtype,
+                       device="cuda:0" if is_cuda else "cpu",
+                       contiguous=contiguous)
 
 
 def _problem(m=256, n=256, k=256, rank=32):
@@ -49,10 +78,39 @@ def _problem(m=256, n=256, k=256, rank=32):
 
 
 @pytest.mark.parametrize("rank", [64, 96, 128])
-def test_sm120_rejects_rank_above_32(monkeypatch, rank):
+def test_ranks_above_32_clear_the_shared_problem_check(monkeypatch, rank):
+    """The shared check admits any positive multiple of 32; the rank gate is elsewhere.
+
+    This used to assert that _check_mm_nvfp4_svdquant_problem refuses rank > 32
+    on SM120, matching "rank 32 only". It never did -- that message comes from
+    svdquant_linear in this backend, while the shared check only enforces the
+    granularity -- and the premise has since stopped being true anyway: the
+    collective takes its LoRA rank as a build parameter, so a module compiled
+    for rank 64 serves it. What decides a rank now is which module you built
+    and which entry point you call, not the architecture.
+    """
     monkeypatch.setattr(svdquant_sm120_cutlass, "get_compute_capability", lambda device: (12, 0))
-    with pytest.raises(ValueError, match="rank 32 only"):
+    assert gemm_svdquant._check_mm_nvfp4_svdquant_problem(*_problem(rank=rank)) is True
+
+
+@pytest.mark.parametrize("rank", [8, 48, 33])
+def test_ranks_off_the_granularity_are_refused(monkeypatch, rank):
+    """The granularity itself is still a hard boundary, on every architecture."""
+    monkeypatch.setattr(svdquant_sm120_cutlass, "get_compute_capability", lambda device: (12, 0))
+    with pytest.raises(ValueError, match="multiple of 32"):
         gemm_svdquant._check_mm_nvfp4_svdquant_problem(*_problem(rank=rank))
+
+
+def test_fused_linear_admission_is_rank_32_only(monkeypatch):
+    """The fused K12 route is the part that is still rank-32 only.
+
+    Its producer carries its own constexpr rank, so unlike the GEMM half it did
+    not become a build parameter. This is the boundary the deleted test was
+    reaching for.
+    """
+    for rank in (64, 96, 128):
+        assert not svdquant_sm120_cutlass._sm120_fused_linear_supported(64, 3072, rank)
+    assert svdquant_sm120_cutlass._sm120_fused_linear_supported(64, 3072, 32)
 
 
 def test_sm120_accepts_rank_32(monkeypatch):
@@ -64,9 +122,12 @@ def test_sm120_linear_rejects_rank_above_32_before_route_dispatch(monkeypatch):
     monkeypatch.setattr(
         svdquant_sm120_cutlass, "get_compute_capability", lambda device: (12, 0)
     )
-    x = SimpleNamespace(ndim=2, shape=(64, 3072), device="cuda:0")
-    weight = SimpleNamespace(ndim=2, shape=(3072, 1536))
-    l2t = SimpleNamespace(ndim=2, shape=(3072, 64))
+    x = _FakeTensor((64, 3072), dtype=torch.bfloat16)
+    weight = _FakeTensor((3072, 1536), dtype=torch.uint8)
+    l2t = _FakeTensor((3072, 64), dtype=torch.bfloat16)
+    # pre_quant_scale is read for its dtype before the rank is ever looked at,
+    # so it cannot be a None placeholder however early the rejection happens.
+    pre_quant_scale = _FakeTensor((3072,), dtype=torch.bfloat16)
 
     with pytest.raises(ValueError, match="rank 32 only"):
         gemm_svdquant.svdquant_linear(
@@ -74,7 +135,7 @@ def test_sm120_linear_rejects_rank_above_32_before_route_dispatch(monkeypatch):
             weight,
             None,
             None,
-            None,
+            pre_quant_scale,
             l2t,
             None,
             None,
@@ -102,13 +163,20 @@ def test_rank_not_multiple_of_32_rejected_everywhere(monkeypatch):
 
 def test_module_getter_routes_by_capability(monkeypatch):
     calls = []
+    # Patch where the name is looked up, not where it is defined:
+    # svdquant_sm120_cutlass imported get_nvfp4_svdquant_module into its own
+    # namespace, so patching gemm_svdquant leaves the bound name untouched and
+    # the real getter runs -- which then tries to build an SM100 module on
+    # whatever card the tests are on.
     monkeypatch.setattr(
-        gemm_svdquant, "get_nvfp4_svdquant_module", lambda: calls.append("sm100") or "M100"
+        svdquant_sm120_cutlass,
+        "get_nvfp4_svdquant_module",
+        lambda: calls.append("sm100") or "M100",
     )
     monkeypatch.setattr(
         svdquant_sm120_cutlass,
         "get_nvfp4_svdquant_sm120_module",
-        lambda: calls.append("sm120") or "M120",
+        lambda lora_rank=32: calls.append("sm120") or "M120",
     )
 
     monkeypatch.setattr(svdquant_sm120_cutlass, "get_compute_capability", lambda device: (10, 3))
@@ -156,7 +224,10 @@ def _seed_cache(tuner, op_name, runner, shapes, config, tactic):
 
     _, _, _, profile = tuner.search_cache(op_name, [runner], shapes, config)
     key = AutoTuner._get_cache_key(op_name, runner, shapes, config, ())
-    tuner.profiling_cache[key] = (0, tactic, profile)
+    # (tactic, profile). The runner id used to lead this tuple; AutoTuner reads
+    # it as a pair now, so seeding the old shape raises on lookup rather than
+    # missing, which is why this read as a cache-crossing failure.
+    tuner.profiling_cache[key] = (tactic, profile)
     return key
 
 
@@ -271,8 +342,10 @@ def test_get_valid_tactics_filters_by_can_implement(monkeypatch):
     )
     monkeypatch.setattr(
         svdquant_sm120_cutlass, "_get_nvfp4_svdquant_module_for_device",
-        lambda device: fake_module)
-    runner = gemm_svdquant._nvfp4_svdquant_gemm_runner(False, "dev")
+        lambda device, lora_rank=32: fake_module)
+    # The two-argument runner is this backend's; gemm_svdquant keeps upstream's
+    # one-argument version, and the module split left these pointing at it.
+    runner = svdquant_sm120_cutlass._nvfp4_svdquant_gemm_runner(False, "dev")
     inputs = [
         SimpleNamespace(shape=(64, 1536)),   # a [m, k/2]
         SimpleNamespace(shape=(3072, 1536)),  # b [n, k/2]
@@ -287,33 +360,52 @@ def test_get_valid_tactics_unfiltered_without_query(monkeypatch):
     fake_module = SimpleNamespace(nvfp4_svdquant_gemm_tactic_num=lambda: 4)
     monkeypatch.setattr(
         svdquant_sm120_cutlass, "_get_nvfp4_svdquant_module_for_device",
-        lambda device: fake_module)
-    runner = gemm_svdquant._nvfp4_svdquant_gemm_runner(False, "dev")
+        lambda device, lora_rank=32: fake_module)
+    # The two-argument runner is this backend's; gemm_svdquant keeps upstream's
+    # one-argument version, and the module split left these pointing at it.
+    runner = svdquant_sm120_cutlass._nvfp4_svdquant_gemm_runner(False, "dev")
     assert runner.get_valid_tactics([None] * 6, profile=None) == [0, 1, 2, 3]
 
 
-def _pack_row(kernel_id, splits=1, raster=0, swizzle=1, streamk=0):
-    return (kernel_id | (splits << 8) | (raster << 16) | (swizzle << 24)
-            | (streamk << 32))
+def test_sm120_candidate_set_carries_no_shape_fitted_pruning(monkeypatch):
+    """Beyond can_implement, the candidate set must not vary with the shape.
+
+    What stood here pinned a filter that pruned tactics by fitted thresholds --
+    `m <= 512` for the swap and 64-row driver rows, `k >= 8192` plus an output
+    tile count for Split-K, `m <= 8192` for raster/swizzle, a one-wave envelope
+    for the static-scheduler rows. Every one of those numbers was measured on a
+    single SM120 card and then applied to every SM120 card, and the filter's own
+    docstring priced its benefit at -0.33% to +0.44% with mixed signs, inside
+    the measurement floor. It bought scan time, and scan time is not a cost we
+    are paying for.
+
+    The bound that replaced it reads the card, not the shape. So on a card that
+    can back every request, the candidate set is exactly the can_implement set
+    -- on the very shapes the old thresholds singled out.
+    """
+    fake_module = SimpleNamespace(
+        nvfp4_svdquant_gemm_tactic_num=lambda: 8,
+        nvfp4_svdquant_gemm_can_implement=lambda m, n, k, rank, t: True,
+        nvfp4_svdquant_gemm_workspace_size=lambda m, n, k, t: 1 << 20,
+    )
+    monkeypatch.setattr(
+        svdquant_sm120_cutlass, "_sm120_workspace_budget_bytes",
+        lambda device_index: 1 << 40)
+    every = list(range(8))
+    # The shapes the deleted thresholds treated differently from one another.
+    for m, n, k in [(64, 3072, 3072), (512, 3072, 3072), (1024, 3072, 3072),
+                    (7800, 3072, 3072), (64, 3072, 12288), (4096, 3072, 12288),
+                    (27280, 3072, 14336), (82752, 28672, 5376)]:
+        assert svdquant_sm120_cutlass._nvfp4_svdquant_valid_tactics(
+            fake_module, m, n, k, 32, SimpleNamespace(index=0)) == every, (m, n, k)
 
 
-@pytest.mark.parametrize("m,exposed", [(64, True), (512, True),
-                                       (1024, False), (7800, False)])
-def test_sm120_exposure_spike_and_driver_rows_small_m_only(m, exposed):
-    for kid in (16, 18, 20, 21):
-        assert svdquant_sm120_cutlass._sm120_tactic_exposed(
-            m, 3072, 3072, _pack_row(kid)) is exposed
+# No _pack_row helper here any more: the candidate bound reads a tactic's
+# workspace size, never its packed kernel id, raster or swizzle fields.
 
 
-def test_sm120_exposure_splitk_rows_long_k_underfilled_only():
-    row = _pack_row(2, splits=2, streamk=1)
-    assert svdquant_sm120_cutlass._sm120_tactic_exposed(64, 3072, 12288, row)
-    assert svdquant_sm120_cutlass._sm120_tactic_exposed(256, 3072, 12288, row)
-    # short K: never profitable
-    assert not svdquant_sm120_cutlass._sm120_tactic_exposed(64, 12288, 3072, row)
-    # long K but the grid is already full
-    assert not svdquant_sm120_cutlass._sm120_tactic_exposed(4096, 3072, 12288, row)
-    assert not svdquant_sm120_cutlass._sm120_tactic_exposed(27280, 3072, 14336, row)
+
+
 
 
 
@@ -508,129 +600,20 @@ def test_sm120_linear_op_name_separates_pdl_in_the_persistent_key(
     )
 
 
-def test_sm120_multibackend_tuning_avoids_cutedsl_cloned_buffer_tail_fault():
-    """CuTeDSL tail shapes are valid eagerly but unsafe on cloned input batches."""
-    single = svdquant_sm120_cutlass._svdquant_tuning_config_for_runners(
-        "sm120", [object()]
-    )
-    multibackend = svdquant_sm120_cutlass._svdquant_tuning_config_for_runners(
-        "sm120", [object(), object()], cutedsl_cold_l2_safe=False
-    )
-    aligned_multibackend = svdquant_sm120_cutlass._svdquant_tuning_config_for_runners(
-        "sm120", [object(), object()], cutedsl_cold_l2_safe=True
-    )
-
-    assert single.use_cuda_graph
-    assert single.use_cold_l2_cache
-    assert not multibackend.use_cuda_graph, (
-        "joint CuTeDSL/CUTLASS profiling must use eager launches for tail-safe tuning"
-    )
-    assert not multibackend.use_cold_l2_cache, (
-        "joint tuning must not rotate CuTeDSL across cloned raw-pointer buffers"
-    )
-    assert aligned_multibackend.use_cold_l2_cache, (
-        "tile-aligned shapes keep cold-L2 candidate selection fidelity"
-    )
+# Removed: test_sm120_multibackend_tuning_avoids_cutedsl_cloned_buffer_tail_fault
+# exercised _svdquant_tuning_config_for_runners, which guarded the CuTeDSL
+# runner sharing a tuning record with this one. That runner is deliberately
+# not part of this backend, so the hazard it covered cannot arise here.
 
 
-@pytest.mark.parametrize("m,exposed", [(512, True), (4096, True),
-                                       (7800, True), (32760, False)])
-def test_sm120_exposure_raster_swizzle_rows_bounded_m(m, exposed):
-    assert svdquant_sm120_cutlass._sm120_tactic_exposed(
-        m, 1536, 1536, _pack_row(0, raster=1)) is exposed
-    assert svdquant_sm120_cutlass._sm120_tactic_exposed(
-        m, 1536, 1536, _pack_row(8, swizzle=2)) is exposed
 
 
-def test_sm120_exposure_legacy_default_rows_everywhere():
-    for m in (64, 512, 7800, 32760, 75600):
-        assert svdquant_sm120_cutlass._sm120_tactic_exposed(
-            m, 5120, 5120, _pack_row(1))
-        assert svdquant_sm120_cutlass._sm120_tactic_exposed(
-            m, 5120, 5120, _pack_row(3, streamk=1))
 
 
-def test_sm120_exposure_static_scheduler_rows_one_wave_only():
-    # the measured one-wave winner shapes stay exposed on their own kernel
-    assert svdquant_sm120_cutlass._sm120_tactic_exposed(256, 3072, 3072, _pack_row(23))
-    assert svdquant_sm120_cutlass._sm120_tactic_exposed(64, 3072, 3072, _pack_row(24))
-    assert svdquant_sm120_cutlass._sm120_tactic_exposed(512, 1536, 1536, _pack_row(25))
-    # static sibling of the K256 fill-geometry tile: 48 CTAs at the target,
-    # but 192 CTAs at the information sentinel where static only ties.
-    assert svdquant_sm120_cutlass._sm120_tactic_exposed(64, 3072, 3072, _pack_row(27))
-    assert not svdquant_sm120_cutlass._sm120_tactic_exposed(512, 1536, 1536, _pack_row(27))
-    # 64x32x256-swap production row80: 96 CTAs at the target, but a
-    # multi-wave grid must remain hidden from production autotuning.
-    assert svdquant_sm120_cutlass._sm120_tactic_exposed(64, 3072, 3072, _pack_row(28))
-    assert not svdquant_sm120_cutlass._sm120_tactic_exposed(64, 12288, 3072, _pack_row(28))
-    assert not svdquant_sm120_cutlass._sm120_tactic_exposed(512, 1536, 1536, _pack_row(28))
-    # small M but a multi-wave tile grid of the row's own kernel: pruned
-    assert not svdquant_sm120_cutlass._sm120_tactic_exposed(64, 12288, 3072, _pack_row(24))
-    assert not svdquant_sm120_cutlass._sm120_tactic_exposed(64, 12288, 3072, _pack_row(27))
-    assert not svdquant_sm120_cutlass._sm120_tactic_exposed(512, 12288, 3072, _pack_row(23))
-    # large M: pruned regardless of the tile grid
-    assert not svdquant_sm120_cutlass._sm120_tactic_exposed(7800, 1536, 1536, _pack_row(25))
-
-def test_sm120_exposure_wide_static_rows_are_unconditional():
-    """The 256-wide static rows are not a one-wave family and are not pruned.
-
-    Kernel 29 was admitted by `m == 537 and n == 5376 and k in (5120, 7168)`,
-    which is exactly the one-wave envelope of its own 256x128 swap grid, and
-    kernel 30 fell through to the `m <= 512` catch-all. Fourteen shapes outside
-    those bounds carried a hand-measured pin instead, because the filter hid
-    their winner from the autotuner.
-
-    Measured on SM120 (110 SMs) across the 71 registered shapes
-    (artifacts/stage0-exposure-20260821/winmap-full.json): the best row the
-    filter left visible costs up to +14.34% against the pin, and on six shapes
-    the visible row is the faster one. The winning region is neither one wave
-    nor a large-M half-plane, so both rows are exposed and the measurement
-    decides.
-    """
-    for kernel_id in (29, 30):
-        row = _pack_row(kernel_id)
-        # inside the old kernel-29 envelope, unchanged
-        assert svdquant_sm120_cutlass._sm120_tactic_exposed(537, 5376, 5120, row)
-        assert svdquant_sm120_cutlass._sm120_tactic_exposed(537, 5376, 7168, row)
-        # the shapes the old bound hid, each one a hand-pinned winner
-        assert svdquant_sm120_cutlass._sm120_tactic_exposed(537, 5376, 5376, row)
-        assert svdquant_sm120_cutlass._sm120_tactic_exposed(1935, 5376, 5120, row)
-        assert svdquant_sm120_cutlass._sm120_tactic_exposed(82752, 28672, 5376, row)
-    # the small-M static tiles keep their one-wave bound: widening is scoped to
-    # the two 256-wide rows, not to the static-scheduler family as a whole.
-    assert not svdquant_sm120_cutlass._sm120_tactic_exposed(1935, 5376, 5120, _pack_row(23))
-    assert 29 not in svdquant_sm120_cutlass._SM120_STATIC_KERNEL_TILES
-    assert svdquant_sm120_cutlass._SM120_WIDE_STATIC_KERNELS == frozenset({29, 30})
 
 
-def test_get_valid_tactics_applies_exposure_pruning(monkeypatch):
-    """With the row decode exported, unprofitable rows are pruned by shape."""
-    rows = {0: _pack_row(0), 1: _pack_row(2, splits=2, streamk=1),
-            2: _pack_row(16), 3: _pack_row(20)}
-    fake_module = SimpleNamespace(
-        nvfp4_svdquant_gemm_tactic_num=lambda: 4,
-        nvfp4_svdquant_gemm_can_implement=lambda m, n, k, rank, t: True,
-        nvfp4_svdquant_gemm_tactic_row=lambda t: rows[t],
-    )
-    monkeypatch.setattr(
-        svdquant_sm120_cutlass, "_get_nvfp4_svdquant_module_for_device",
-        lambda device: fake_module)
-    runner = gemm_svdquant._nvfp4_svdquant_gemm_runner(False, "dev")
 
-    def inputs(m, k):
-        return [
-            SimpleNamespace(shape=(m, k // 2)),
-            SimpleNamespace(shape=(3072, k // 2)),
-            None, None, None,
-            SimpleNamespace(shape=(m, 32)),
-        ]
 
-    # small M, short K: spikes and driver stay, split-K row is pruned
-    assert runner.get_valid_tactics(inputs(64, 3072), profile=None) == [0, 2, 3]
-    # small M, long K: everything stays
-    assert runner.get_valid_tactics(inputs(64, 12288), profile=None) == [0, 1, 2, 3]
-    # large M: only the legacy default row remains
-    assert runner.get_valid_tactics(inputs(32760, 3072), profile=None) == [0]
 
 
 def test_lora_ladder_gen_rungs_are_guarded_variants():
@@ -719,16 +702,6 @@ def test_row80_stage_override_gen_is_guarded_variant():
             gen(row80_stages=invalid)
 
 
-def test_sm120_exposure_k256_swap_streamk_rows_small_m_only():
-    """Kernel 22 (128x64x256-swap Stream-K) rows, including its native split
-    rows, are exposed only in the small-M regime like the other spikes."""
-    for row in (_pack_row(22, streamk=1),
-                _pack_row(22, splits=2, streamk=1),
-                _pack_row(22, splits=4, streamk=1)):
-        for m in (64, 256, 512):
-            assert svdquant_sm120_cutlass._sm120_tactic_exposed(m, 3072, 3072, row)
-        for m in (1024, 4096, 32760):
-            assert not svdquant_sm120_cutlass._sm120_tactic_exposed(m, 3072, 3072, row)
 
 @pytest.mark.parametrize(
     "m,n,k",
@@ -750,7 +723,11 @@ def test_sm120_linear_always_reaches_the_tuner(monkeypatch, m, n, k):
     allocated = []
 
     def fake_empty(shape, **kwargs):
-        tensor = SimpleNamespace(shape=tuple(shape), kwargs=kwargs)
+        # The public entry validates dtype and sizes before choosing a route,
+        # so a stand-in has to answer those too.
+        # torch.empty accepts either a size tuple or bare ints, and the code
+        # under test uses both spellings; tuple() on a bare int raises.
+        tensor = _FakeTensor(shape, **kwargs)
         allocated.append(tensor)
         return tensor
 
@@ -781,7 +758,8 @@ def test_sm120_linear_always_reaches_the_tuner(monkeypatch, m, n, k):
         svdquant_sm120_cutlass, "get_compute_capability", lambda device: (12, 0)
     )
     monkeypatch.setattr(
-        svdquant_sm120_cutlass, "get_nvfp4_svdquant_sm120_module", lambda: module
+        svdquant_sm120_cutlass, "get_nvfp4_svdquant_sm120_module",
+        lambda lora_rank=32: module
     )
     monkeypatch.setattr(gemm_svdquant.torch, "empty", fake_empty)
     monkeypatch.setattr(
@@ -815,7 +793,11 @@ def test_sm120_linear_always_reaches_the_tuner(monkeypatch, m, n, k):
         backend="cutlass-sm120",
     )
 
-    assert out is allocated[-1]
+    # Identify the output by its shape, not by being the last allocation: the
+    # workspace buffer is allocated too, and which of them comes last is not
+    # part of the contract this test is about.
+    outputs = [t for t in allocated if t.shape == (m, n)]
+    assert outputs and out is outputs[-1]
     assert launched and launched[0][1] == 7, "the tactic must be the tuner's answer"
     assert Tuner.seen, "the tuner was never consulted"
     svdquant_sm120_cutlass._SM120_LINEAR_DISPATCH_CACHE.clear()

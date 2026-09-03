@@ -460,6 +460,12 @@ void nvfp4_quantize_smooth_lora_down_sm120(TensorView x, TensorView pqs,
 void nvfp4_quantize_smooth_lora_down_geometry_sm120(
     TensorView x, TensorView pqs, TensorView global_scale, TensorView l2t_smoothed,
     TensorView xq, TensorView sf, TensorView down, int geometry_variant);
+// Producer entry that takes the geometry as numbers rather than as an index
+// into a ladder both languages have to agree on; see nvfp4_smooth_quantize_sm100.cu.
+void nvfp4_quantize_smooth_lora_down_dyn_sm120(
+    TensorView x, TensorView pqs, TensorView global_scale, TensorView l2t_smoothed,
+    TensorView xq, TensorView sf, TensorView down, int family, int tiling0, int tiling1,
+    int tiling2, int address_policy);
 
 
 void nvfp4_quantize_smooth_lora_down_overlap_sm120(
@@ -641,7 +647,8 @@ void nvfp4_svdquant_gemm(
 void dispatch_svdquant_producer_sm120(
     TensorView x, TensorView pqs, TensorView global_scale, TensorView l2t_smoothed,
     TensorView xq, TensorView a_sf, TensorView down, TensorView workspace_buffer,
-    int producer_variant = 0) {
+    int producer_variant = 0, int producer_family = -1, int tiling0 = 0, int tiling1 = 0,
+    int tiling2 = 0, int address_policy = 0) {
   bool const measured_cublaslt_lora_down =
       x.ndim() == 2 &&
       ((x.size(0) == 512 && x.size(1) == 5120) ||
@@ -667,21 +674,25 @@ void dispatch_svdquant_producer_sm120(
   // large-M kernel. A test pins that disjointness, because it is what makes
   // this decomposition unambiguous: indices below the route count name a route,
   // and the rest name a geometry on the default route.
-  int const route_count = static_cast<int>(
-      flashinfer::gemm::svdquant_sm120_prefix_route::producer_variants(
-          static_cast<int>(x.size(0)), static_cast<int>(x.size(1)))
-          .size());
-  int const geometry_variant =
-      producer_variant < route_count ? 0 : producer_variant - route_count + 1;
+  // The geometry arrives as numbers rather than as an index into a ladder the
+  // two languages have to keep in step. An unset geometry means the caller has
+  // no opinion, so the shape's own pinned launch still applies.
+  if (producer_family >= 0) {
+    nvfp4_quantize_smooth_lora_down_dyn_sm120(x, pqs, global_scale, l2t_smoothed, xq, a_sf,
+                                              down, producer_family, tiling0, tiling1,
+                                              tiling2, address_policy);
+    return;
+  }
   nvfp4_quantize_smooth_lora_down_geometry_sm120(x, pqs, global_scale, l2t_smoothed, xq,
-                                                 a_sf, down, geometry_variant);
+                                                 a_sf, down, 0);
 }
 
 void nvfp4_svdquant_linear_sm120(
     TensorView x, TensorView pqs, TensorView global_scale, TensorView l2t_smoothed, TensorView b,
     TensorView b_sf, TensorView alpha, TensorView l1, Optional<TensorView> const& bias,
     TensorView xq, TensorView a_sf, TensorView down, TensorView out, TensorView workspace_buffer,
-    int64_t tactic, bool enable_pdl) {
+    int64_t tactic, bool enable_pdl, int64_t producer_family, int64_t tiling0,
+    int64_t tiling1, int64_t tiling2, int64_t address_policy) {
   bool const use_case7_persisting_l2 =
       x.ndim() == 2 && x.size(0) == 27280 && x.size(1) == 14336;
   cudaStream_t const stream = get_stream(x.device());
@@ -722,7 +733,11 @@ void nvfp4_svdquant_linear_sm120(
   int const producer_variant = prefix_route::producer_variant_of(tactic);
   int const k3_row = prefix_route::k3_row_of(tactic);
   dispatch_svdquant_producer_sm120(x, pqs, global_scale, l2t_smoothed, xq, a_sf, down,
-                                   workspace_buffer, producer_variant);
+                                   workspace_buffer, producer_variant,
+                                   static_cast<int>(producer_family),
+                                   static_cast<int>(tiling0), static_cast<int>(tiling1),
+                                   static_cast<int>(tiling2),
+                                   static_cast<int>(address_policy));
   if (configure_case7_persisting_l2) {
     std::size_t const max_budget =
         static_cast<std::size_t>(max_persisting_l2_bytes);
