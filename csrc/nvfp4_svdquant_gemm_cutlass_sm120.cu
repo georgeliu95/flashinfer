@@ -17,7 +17,8 @@
 //   nvfp4_svdquant_gemm : out = alpha * (A @ Bᵀ) + (D @ L1ᵀ) [+ bias], the residual NVFP4 GEMM
 //                         fused with the rank-32 LoRA-up via a 2nd bf16 mma.sync into the same
 //                         fp32 register accumulator (custom CUTLASS SM120 block-scaled
-//                         collective). The LoRA rank is fixed to 32 on SM120.
+//                         collective). The LoRA rank is a build parameter of the module
+//                         (SVDQ_SM120_LORA_RANK, default 32); see nvfp4_svdquant_gemm_lora_rank.
 //   nvfp4_svdquant_gemm_tactic_num : length of the flattened runtime tactic table (compiled
 //                                    kernels x scheduler variants) for the autotuner.
 //   nvfp4_svdquant_gemm_can_implement : per-tactic host-side feasibility query (includes the
@@ -511,7 +512,7 @@ void nvfp4_quantize_smooth_lora_down_cublaslt_sm120(
 // out = alpha * (A @ Bᵀ) + (D @ L1ᵀ) [+ bias]. a = quant(x_hat) [m, k/2] uint8, b [n, k/2] uint8
 // (packed e2m1), a_sf/b_sf swizzled UE4M3 block scales, alpha f32[1] (residual dequant scale).
 // D [m, 32] = x_hat @ L2ᵀ (bf16) and L1 [n, 32] = svdquant_lora_b / alpha (bf16; 1/alpha folded so
-// the epilogue out = alpha * acc yields the LoRA). The SM120 backend supports LoRA rank 32 only;
+// the epilogue out = alpha * acc yields the LoRA). One module serves one LoRA rank;
 // any other rank is rejected. out [m, n] bf16, allocated by the caller.
 void nvfp4_svdquant_gemm_impl(
     TensorView a, TensorView b, TensorView a_sf, TensorView b_sf,
@@ -552,8 +553,13 @@ void nvfp4_svdquant_gemm_impl(
   TVM_FFI_ICHECK(d.ndim() == 2 && d.size(0) == m)
       << "d must have shape [m, r] (rank-r LoRA-down output)";
   int64_t const loraRank = d.size(1);
-  TVM_FFI_ICHECK_EQ(loraRank, 32)
-      << "the SM120 SVDQuant backend supports LoRA rank 32 only, got " << loraRank;
+  // Legality only. Which ranks this module can actually stage is a per-tactic
+  // property -- a module built for rank 64 still serves rank 32 on its K128
+  // tactics -- so the decision belongs to can_implement, not to a module-wide
+  // equality test. Infeasibility surfaces below as "no feasible fallback
+  // tactic", or from run_tactic_impl when an explicit tactic is passed.
+  TVM_FFI_ICHECK(loraRank > 0 && loraRank % 32 == 0)
+      << "the LoRA rank (d.shape[1]) must be a positive multiple of 32, got " << loraRank;
   TVM_FFI_ICHECK_EQ(reinterpret_cast<std::uintptr_t>(d.data_ptr()) % 16, 0)
       << "d must be 16-byte aligned for TMA";
   TVM_FFI_ICHECK(l1.ndim() == 2 && l1.size(0) == n && l1.size(1) == loraRank)
@@ -592,7 +598,9 @@ void nvfp4_svdquant_gemm_impl(
           : static_cast<int>(tactic);
   TVM_FFI_ICHECK_GE(tacticId, 0)
       << "no feasible NVFP4 SVDQuant SM120 fallback tactic for m=" << m << ", n=" << n
-      << ", k=" << k << ", rank=" << loraRank;
+      << ", k=" << k << ", rank=" << loraRank << " (this module was built for LoRA rank "
+      << flashinfer::gemm::svdquant_sm120::kSvdqSm120ModuleLoRaRank
+      << "; a rank above what a tile can stage has no tactic here)";
 
   size_t const requiredWorkspaceBytes = flashinfer::gemm::nvfp4_svdquant_gemm_workspace_size(
       static_cast<int>(m), static_cast<int>(n), static_cast<int>(k), tacticId);
@@ -782,6 +790,13 @@ int64_t nvfp4_svdquant_gemm_tactic_num() {
   return flashinfer::gemm::svdquant_sm120::kNvfp4SvdquantGemmSm120NumTactics;
 }
 
+// The LoRA rank this module was built for. Callers use it to tell "this backend
+// cannot do rank r" apart from "no tactic fits this shape", and to key a tuned
+// cache, since a different rank is a different module.
+int64_t nvfp4_svdquant_gemm_lora_rank() {
+  return flashinfer::gemm::svdquant_sm120::kSvdqSm120ModuleLoRaRank;
+}
+
 bool nvfp4_svdquant_gemm_can_implement(int64_t m, int64_t n, int64_t k, int64_t lora_rank,
                                        int64_t tactic) {
   return flashinfer::gemm::nvfp4_svdquant_gemm_can_implement(
@@ -835,6 +850,8 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(nvfp4_svdquant_producer_probe_sm120,
 #endif
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(nvfp4_svdquant_gemm_tactic_num,
                               torch_ext::nvfp4_svdquant_gemm_tactic_num);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(nvfp4_svdquant_gemm_lora_rank,
+                              torch_ext::nvfp4_svdquant_gemm_lora_rank);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(nvfp4_svdquant_gemm_can_implement,
                               torch_ext::nvfp4_svdquant_gemm_can_implement);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(nvfp4_svdquant_gemm_fallback_tactic,

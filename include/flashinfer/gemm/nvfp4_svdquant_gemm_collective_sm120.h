@@ -201,7 +201,8 @@ template <
   class TransformB_,
   Sm120LoRaPath LoRaPath_ = Sm120LoRaPath::kByteExactMainloop,
   bool Row80ProductionTraits_ = false,
-  bool CompileInlineDown_ = true>
+  bool CompileInlineDown_ = true,
+  int LoRaK_ = 32>
 struct CollectiveMmaLoRaSm120 {
   //
   // Type Aliases (identical to the stock SM120 block-scaled collective)
@@ -394,8 +395,14 @@ struct CollectiveMmaLoRaSm120 {
 
   static constexpr uint32_t ResidualTmaBytes = ResidualTmaBytesMK + ResidualTmaBytesNK;
 
-  // === LoRA-up: bf16 D[M,32] (A-side) and L1[N,32] (B-side), rank fixed to 32 on SM120. ===
-  static constexpr int LoRaK = 32;  // 2 bf16 K=16 mma.sync atoms.
+  // === LoRA-up: bf16 D[M,r] (A-side) and L1[N,r] (B-side), r = LoRaK. ===
+  // The LoRA math below is written against LoRaK throughout -- the mma atom count
+  // (LoRaK / LoRaAtomK), the TMA box extents, and the smem overlay views all follow it.
+  // What bounds it is storage, asserted where the operands are staged: a rank tile has
+  // to fit the residual stage it overlays (see the AStageBf16Elems asserts below), so
+  // K128 tiles carry rank 32 and K256 tiles have room for 64.
+  static constexpr int LoRaK = LoRaK_;
+  static_assert(LoRaK > 0 && LoRaK % 32 == 0, "LoRA rank must be a positive multiple of 32");
 
   using ElementD  = cutlass::bfloat16_t;
   using ElementL1 = cutlass::bfloat16_t;
@@ -409,7 +416,7 @@ struct CollectiveMmaLoRaSm120 {
   // K-blocks contribute zero to the LoRA MMA).
   static constexpr int LoRaStorageK = static_cast<int>(
       size<2>(TileShape{}) * sizeof_bits<ElementA>::value / sizeof_bits<cutlass::bfloat16_t>::value);
-  static_assert(LoRaStorageK >= LoRaK, "one stage must hold at least the rank-32 tile");
+  static_assert(LoRaStorageK >= LoRaK, "one stage must hold at least the rank tile");
 
   static constexpr int AStageBf16Elems = static_cast<int>(
       cutlass::bits_to_bytes(size(take<0,2>(SmemLayoutA{})) * sizeof_bits<ElementA>::value) /
@@ -889,7 +896,7 @@ struct CollectiveMmaLoRaSm120 {
         make_shape(shape<1>(TileShapeSFB{}), shape<2>(TileShapeSFB{})),
         _1{});
 
-    // The gmem view is (M/N, LoRaK, L): rank is fixed to 32 on SM120 (validated in
+    // The gmem view is (M/N, LoRaK, L): the rank is this collective's LoRaK (validated in
     // can_implement), so no out-of-bounds chunk handling is needed.
     Tensor tensor_d = make_tensor(args.ptr_D, make_layout(make_shape(M, Int<LoRaK>{}, L), args.dD));
     Tensor tensor_l1 = make_tensor(args.ptr_L1, make_layout(make_shape(N, Int<LoRaK>{}, L), args.dL1));
@@ -972,7 +979,7 @@ struct CollectiveMmaLoRaSm120 {
       return implementable;
     }
     if (args.lora_rank != LoRaK) {
-      CUTLASS_TRACE_HOST("  CAN IMPLEMENT: SM120 fused SVDQuant requires lora_rank == 32\n");
+      CUTLASS_TRACE_HOST("  CAN IMPLEMENT: this SM120 config stages a different LoRA rank\n");
       return false;
     }
     if (args.ptr_D == nullptr || args.ptr_L1 == nullptr) {
@@ -995,6 +1002,12 @@ struct CollectiveMmaLoRaSm120 {
     constexpr int kInlineK = 5120;
     constexpr int kInlineRank = 32;
     constexpr int kDownCols = 32;
+    // This producer writes a rank-32 down projection. The shape guard below keys
+    // on inline_down_m/k and never looks at the rank, so on a collective staging
+    // a different rank it would fill the wrong extent silently rather than fail.
+    if constexpr (LoRaK != kInlineRank) {
+      return;
+    }
     constexpr int kDownElements = 16 * kDownCols;
     constexpr int kDownTiles = (kInlineM + 15) / 16;
     if (params.inline_down_m != kInlineM ||

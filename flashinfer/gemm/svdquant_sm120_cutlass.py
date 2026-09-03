@@ -100,9 +100,23 @@ _sm120_tactic_abi_version = _sm120_routes.sm120_tactic_abi_version
 
 
 @functools.cache
-def get_nvfp4_svdquant_sm120_module():
-    """JIT-build and load the SM120 CUTLASS NVFP4 SVDQuant module."""
-    return gen_gemm_sm120_module_cutlass_nvfp4_svdquant().build_and_load()
+def get_nvfp4_svdquant_sm120_module(lora_rank: int = SVDQUANT_LORA_RANK_GRANULARITY):
+    """JIT-build and load the SM120 CUTLASS NVFP4 SVDQuant module.
+
+    One module serves one LoRA rank, the way upstream's cute-dsl path compiles a
+    specialization per rank. ``lora_rank=32`` is the production build and passes
+    no extra flag, so it stays byte-identical to a build that never knew about
+    this argument -- and keeps its tuned cache.
+
+    A rank a given tile cannot stage still compiles that tile at rank 32; the
+    collective's ``can_implement`` then refuses it, so the autotuner simply sees
+    a smaller candidate plane rather than a build failure. Today only the K256
+    tiles (11 of 31 configs) stage rank 64, because the byte-exact path overlays
+    the rank tile on a residual stage worth TileK/4 bf16 columns.
+    """
+    return gen_gemm_sm120_module_cutlass_nvfp4_svdquant(
+        lora_rank=lora_rank
+    ).build_and_load()
 
 
 def _svdquant_backend_for_capability(major: int, minor: int) -> str:
@@ -249,7 +263,9 @@ def _sm120_fused_linear_supported(m: int, k: int, rank: int) -> bool:
 
 
 
-def _svdquant_op_name(backend_key: str) -> str:
+def _svdquant_op_name(
+    backend_key: str, lora_rank: int = SVDQUANT_LORA_RANK_GRANULARITY
+) -> str:
     """Autotune-cache namespace per backend (and per tactic ABI on SM120).
 
     SM100 keeps the original name so existing tuning caches stay valid; other
@@ -260,14 +276,22 @@ def _svdquant_op_name(backend_key: str) -> str:
     if backend_key == "sm100":
         return "nvfp4_svdquant_gemm"
     if backend_key == "sm120":
-        return f"nvfp4_svdquant_gemm_sm120_v{_SM120_TACTIC_ABI_VERSION}"
+        # Tactic ids are stable across ranks by construction, but which of them
+        # can_implement admits is not, so a record must not cross ranks. Rank 32
+        # keeps the historical name and its existing cache.
+        rank_tag = (
+            "" if lora_rank == SVDQUANT_LORA_RANK_GRANULARITY else f"_r{lora_rank}"
+        )
+        return f"nvfp4_svdquant_gemm_sm120_v{_SM120_TACTIC_ABI_VERSION}{rank_tag}"
     return f"nvfp4_svdquant_gemm_{backend_key}"
 
 
-def _get_nvfp4_svdquant_module_for_device(device: torch.device):
+def _get_nvfp4_svdquant_module_for_device(
+    device: torch.device, lora_rank: int = SVDQUANT_LORA_RANK_GRANULARITY
+):
     backend = _svdquant_backend_for_capability(*get_compute_capability(device))
     if backend == "sm120":
-        return get_nvfp4_svdquant_sm120_module()
+        return get_nvfp4_svdquant_sm120_module(lora_rank)
     return get_nvfp4_svdquant_module()
 
 
@@ -363,7 +387,7 @@ def _nvfp4_svdquant_gemm_runners(
     rank: int,
 ) -> List[TunableRunner]:
     """Build the per-shape candidate set; first runner is the eager fallback."""
-    return [_nvfp4_svdquant_gemm_runner(enable_pdl, device)]
+    return [_nvfp4_svdquant_gemm_runner(enable_pdl, device, rank)]
 
 
 
@@ -833,7 +857,7 @@ def _sm120_max_workspace_bytes(
     cached = _SM120_WORKSPACE_BYTES_CACHE.get(key)
     if cached is not None:
         return cached
-    module = _get_nvfp4_svdquant_module_for_device(device)
+    module = _get_nvfp4_svdquant_module_for_device(device, rank)
     required = 0
     for t in _nvfp4_svdquant_valid_tactics(module, m, n, k, rank, device):
         required = max(required, module.nvfp4_svdquant_gemm_workspace_size(m, n, k, t))
@@ -841,8 +865,11 @@ def _sm120_max_workspace_bytes(
     return required
 
 
-def _nvfp4_svdquant_gemm_runner(enable_pdl: bool, device: torch.device):
-    module = _get_nvfp4_svdquant_module_for_device(device)
+def _nvfp4_svdquant_gemm_runner(
+    enable_pdl: bool, device: torch.device,
+    lora_rank: int = SVDQUANT_LORA_RANK_GRANULARITY,
+):
+    module = _get_nvfp4_svdquant_module_for_device(device, lora_rank)
 
     class Nvfp4SvdquantGemmRunner(TunableRunner):
         def get_valid_tactics(
@@ -925,7 +952,7 @@ def mm_nvfp4_svdquant(
     runners = _nvfp4_svdquant_gemm_runners(enable_pdl, a.device, m, n, k, rank)
     inputs = [a, b, a_sf, b_sf, alpha, d, l1, bias, out, workspace_buffer]
     runner, tactic = tuner.choose_one(
-        _svdquant_op_name("sm120"),
+        _svdquant_op_name("sm120", rank),
         runners,
         _svdquant_tuning_config("sm120"),
         inputs,
