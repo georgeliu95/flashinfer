@@ -51,9 +51,6 @@ from .gemm_svdquant import (
 _SM120_FUSED_LINEAR_MK = _sm120_routes.SM120_FUSED_LINEAR_MK
 
 
-_sm120_fused_prefix_route = _sm120_routes.sm120_fused_prefix_route
-
-
 _sm120_producer_variants = _sm120_routes.sm120_producer_variants
 
 
@@ -85,9 +82,6 @@ _SM120_LINEAR_ROUTE_V9_MKR = _sm120_routes.SM120_LINEAR_ROUTE_V9_MKR
 
 
 _SM120_TACTIC_ABI_VERSION = _sm120_routes.SM120_TACTIC_ABI_VERSION
-
-
-_sm120_fused_prefix_uses_packed_l2t = _sm120_routes.sm120_fused_prefix_uses_packed_l2t
 
 
 _sm120_linear_route_abi_version = _sm120_routes.sm120_linear_route_abi_version
@@ -204,24 +198,6 @@ def _cached_sm120_m537_l2t(
     while len(_SM120_M537_PACKED_L2T_CACHE) > _SM120_M537_PACKED_L2T_CACHE_CAPACITY:
         _SM120_M537_PACKED_L2T_CACHE.popitem(last=False)
     return packed
-
-
-def _sm120_fused_linear_l2t(
-    x: torch.Tensor,
-    l2t_smoothed: torch.Tensor,
-    route: str | None = None,
-) -> torch.Tensor:
-    """Return the L2T layout required by the producer about to be dispatched.
-
-    ``route`` comes from the producer half of the packed tactic. It is threaded
-    rather than re-derived because the layout chosen here and the route the C++
-    dispatch takes must be the same one; disagreeing is silent.
-    """
-    m, k = x.shape
-    rank = l2t_smoothed.shape[1]
-    if _sm120_fused_prefix_uses_packed_l2t(m, k, rank, route):
-        return _cached_sm120_m537_l2t(l2t_smoothed)
-    return l2t_smoothed
 
 
 def _sm120_fused_linear_supported(m: int, k: int, rank: int) -> bool:

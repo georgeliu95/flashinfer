@@ -17,16 +17,12 @@ import pytest
 
 from flashinfer.gemm.svdquant_sm120_routes import (
     sm120_producer_variants,
-    PREFIX_ROUTE_OVERRIDE_ENV,
+    sm120_variant_packs_l2t,
+    SM120_FAMILY_M537,
     SM120_FUSED_LINEAR_MK,
     SM120_LINEAR_ROUTE_ABI_OVERRIDES,
     SM120_LINEAR_ROUTE_V6_MKR,
-    SM120_PACKED_L2T_NATIVE_MK,
-    SM120_PREFIX_ROUTE_LADDER,
-    sm120_fused_prefix_route,
-    sm120_fused_prefix_uses_packed_l2t,
     sm120_linear_route_abi_version,
-    sm120_prefix_route_overrides,
 )
 
 
@@ -70,198 +66,6 @@ def test_route_abi_override_manifest_has_no_base_version_entries() -> None:
     assert override_versions == {6, 7, 8, 9}
 
 
-@pytest.mark.parametrize(
-    "m,k,rank,expected",
-    [
-        (537, 5376, 32, True),
-        (537, 5120, 32, False),
-        (537, 5376, 64, False),
-        (1935, 5376, 32, False),
-    ],
-)
-def test_packed_l2t_is_a_fused_prefix_specific_contract(
-    m: int,
-    k: int,
-    rank: int,
-    expected: bool,
-) -> None:
-    # Given: M537 routes can use either cuBLASLt or the packed custom prefix.
-    # When: the combined-prefix layout contract is selected.
-    uses_packed_l2t = sm120_fused_prefix_uses_packed_l2t(m, k, rank)
-    # Then: only the custom M537/K5376/rank-32 prefix requests packing.
-    assert uses_packed_l2t is expected
-
-
-def test_default_prefix_routes_reproduce_the_measured_gate(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # Given: the ladder replaced a literal cuBLASLt-prefix shape list in C++.
-    # When: the effective route is read with no override in the environment.
-    # Then: exactly the seven recorded cuBLASLt shapes still take that prefix.
-    monkeypatch.delenv(PREFIX_ROUTE_OVERRIDE_ENV, raising=False)
-    cublaslt_shapes = {
-        key
-        for key in SM120_PREFIX_ROUTE_LADDER
-        if sm120_fused_prefix_route(*key) == "cublaslt"
-    }
-    assert cublaslt_shapes == {
-        (512, 5120),
-        (537, 5120),
-        (537, 7168),
-        (537, 14336),
-        (1935, 5120),
-        (1935, 5376),
-        (1935, 7168),
-    }
-    # And: every ladder default is itself an admitted route for that shape.
-    for key, (default, admitted) in SM120_PREFIX_ROUTE_LADDER.items():
-        assert default in admitted, key
-    # And: a shape with no ladder entry keeps the native producer.
-    assert sm120_fused_prefix_route(6913, 14336) == "native"
-    assert sm120_prefix_route_overrides() == {}
-
-
-def test_closed_ladder_admits_only_explicit_control_arms(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # Given: every alternate rung regressed on SM120 (110 SMs) in round 2, so each shape
-    # is now pinned to its measured default and the ladder is closed.
-    # When: an override spells out the defaults of two rungs explicitly.
-    # Then: it parses and is a no-op, which is how a control arm stays expressible
-    # without leaving a live path back to a refuted route.
-    monkeypatch.setenv(
-        PREFIX_ROUTE_OVERRIDE_ENV, "537:5120=cublaslt, 1935:14336=native"
-    )
-    assert sm120_fused_prefix_route(537, 5120) == "cublaslt"
-    assert sm120_fused_prefix_route(1935, 14336) == "native"
-    # And: unnamed neighbours are untouched.
-    assert sm120_fused_prefix_route(537, 5376) == "native"
-    assert sm120_fused_prefix_route(1935, 5376) == "cublaslt"
-    assert sm120_fused_prefix_route(537, 7168) == "cublaslt"
-    # And: the ladder itself is never mutated by an override.
-    assert SM120_PREFIX_ROUTE_LADDER[(537, 5120)][0] == "cublaslt"
-
-
-def test_refuted_rungs_are_measurable_again_without_moving_a_default(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # Given: the native rung lost on every cuBLASLt-routed shape, twice -- once
-    # on a hand-picked geometry in round 2, and again in 2026-08 against the
-    # fastest survivor of the producer's entire legal geometry field. A verdict
-    # that firm is worth keeping as the default. It is not worth making
-    # unrepeatable: each of these shapes now has a compiled native producer, and
-    # a rung nothing can select is a kernel that exists only in the binary.
-    # When: each refuted native rung is requested explicitly.
-    # Then: it is accepted, and the default is unchanged, so re-measuring costs
-    # an environment variable while shipping the loser still costs a code edit.
-    for m, k in (
-        (537, 5120),
-        (537, 7168),
-        (537, 14336),
-        (1935, 5120),
-        (1935, 7168),
-        (1935, 5376),
-        (512, 5120),
-    ):
-        monkeypatch.setenv(PREFIX_ROUTE_OVERRIDE_ENV, f"{m}:{k}=native")
-        assert sm120_fused_prefix_route(m, k) == "native"
-        monkeypatch.delenv(PREFIX_ROUTE_OVERRIDE_ENV)
-        assert sm120_fused_prefix_route(m, k) == "cublaslt"
-        assert SM120_PREFIX_ROUTE_LADDER[(m, k)][0] == "cublaslt"
-
-
-def test_rungs_with_no_compiled_route_are_still_inadmissible(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # Given: admitting a rung is a claim that something can run it.
-    # When: rungs whose implementation was retired or never built are requested.
-    # Then: they are rejected by admission, not by syntax, so a stale campaign
-    # script fails legibly rather than silently selecting a route that is gone.
-    for spec in (
-        "1935:14336=cublaslt",  # 448.51 us vs 424.22 us, refuted
-        "1935:14336=native_alt",  # 456.70 us vs 424.22 us, geometry removed
-        "537:5376=cublaslt",  # round-1 control for the settled rows 44/46 flips
-    ):
-        monkeypatch.setenv(PREFIX_ROUTE_OVERRIDE_ENV, spec)
-        with pytest.raises(ValueError, match="does not admit"):
-            sm120_fused_prefix_route(537, 5120)
-
-
-@pytest.mark.parametrize(
-    "spec",
-    [
-        "537:5120",  # no '='
-        "537=native",  # not a full key
-        "537:5376:32=native",  # too many key fields
-        "537:x=native",  # non-integral key
-        "537:5120=cutlass",  # unknown route
-        "537:5120=",  # empty route
-        "537:5120=native_alt",  # no alternate geometry compiled for this shape
-        "1024:5120=native",  # shape with no A/B ladder
-        "537:5120=cublaslt,537:5120=cublaslt",  # repeated shape
-        "537:5120=cublaslt,",  # empty trailing entry
-    ],
-)
-def test_prefix_route_override_rejects_malformed_specs(
-    monkeypatch: pytest.MonkeyPatch,
-    spec: str,
-) -> None:
-    # Given: a route seam can change numerics, not just speed.
-    # When: a malformed or inadmissible override entry is supplied.
-    # Then: the lookup raises instead of selecting an uncompiled route.
-    monkeypatch.setenv(PREFIX_ROUTE_OVERRIDE_ENV, spec)
-    with pytest.raises(ValueError):
-        sm120_fused_prefix_route(537, 5120)
-
-
-@pytest.mark.parametrize(
-    "spec,m,k,expected",
-    [
-        (None, 537, 5376, True),
-        (None, 537, 5120, False),
-        (None, 537, 7168, False),
-        (None, 1935, 14336, False),
-        ("537:5376=native", 537, 5376, True),
-        ("537:5120=cublaslt", 537, 5120, False),
-    ],
-)
-def test_packed_l2t_layout_follows_the_effective_prefix_route(
-    monkeypatch: pytest.MonkeyPatch,
-    spec: str | None,
-    m: int,
-    k: int,
-    expected: bool,
-) -> None:
-    # Given: the M537 native producer indexes L2T with the prepacked layout while
-    # the cuBLASLt prefix consumes the row-major one.
-    # When: the packing decision is read with the closed ladder, both with the
-    # seam unset and with a rung's own default spelled out as a control arm.
-    # Then: it follows the effective route, so neither side misreads L2T, and the
-    # only packed Batch-4 shape left is row 45/47's native (537, 5376) producer.
-    if spec is None:
-        monkeypatch.delenv(PREFIX_ROUTE_OVERRIDE_ENV, raising=False)
-    else:
-        monkeypatch.setenv(PREFIX_ROUTE_OVERRIDE_ENV, spec)
-    assert sm120_fused_prefix_uses_packed_l2t(m, k, 32) is expected
-    # And: packing is still rank-32 only, whatever the route.
-    assert sm120_fused_prefix_uses_packed_l2t(m, k, 64) is False
-
-
-def test_prefix_route_containers_are_immutable(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # Given: the ladder and its overrides are shared process-wide.
-    # When: their public containers are inspected.
-    # Then: no caller can mutate another caller's route decisions in place.
-    assert isinstance(SM120_PREFIX_ROUTE_LADDER, MappingProxyType)
-    assert isinstance(SM120_PACKED_L2T_NATIVE_MK, frozenset)
-    monkeypatch.setenv(PREFIX_ROUTE_OVERRIDE_ENV, "537:5120=cublaslt")
-    overrides = sm120_prefix_route_overrides()
-    assert isinstance(overrides, MappingProxyType)
-    with pytest.raises(TypeError):
-        overrides[(537, 7168)] = "native"  # type: ignore[index]
-
-
 def _m537_mixed_producer_shapes(header: str) -> set[tuple[int, int]]:
     """(M, K) whose native producer is the M537 mixed kernel, which indexes the
     prepacked L2T layout. M=537 now carries two producer families, so which
@@ -275,28 +79,6 @@ def _m537_mixed_producer_shapes(header: str) -> set[tuple[int, int]]:
         (537, int(match.group(1)))
         for match in re.finditer(r"launch_m537_\w*kernel<\s*(\d+)", body)
     }
-
-
-def test_packed_l2t_matches_the_producers_that_read_the_packed_layout() -> None:
-    # Given: handing a row-major L2T to a producer that indexes the prepacked one
-    # is silent numerical corruption, not a crash, so the packing set has to track
-    # which kernel family each native route actually reaches.
-    # When: the set is compared against the M537-mixed instantiations in the
-    # dispatcher, and against every rung that can route natively.
-    # Then: they agree exactly. (537, 14336) is the case that broke the old
-    # M-based rule: it routes natively now, and its producer is a small_m kernel
-    # that reads row-major L2T, so it must NOT be packed.
-    header = _producer_header()
-    mixed = _m537_mixed_producer_shapes(header)
-    assert set(SM120_PACKED_L2T_NATIVE_MK) == mixed, (
-        f"packed set {sorted(SM120_PACKED_L2T_NATIVE_MK)} does not match the "
-        f"M537-mixed producers {sorted(mixed)}"
-    )
-    for key, (_, admitted) in SM120_PREFIX_ROUTE_LADDER.items():
-        if "native" not in admitted:
-            continue
-        assert _has_native_producer(*key), f"{key} admits native with no producer"
-        assert (key in SM120_PACKED_L2T_NATIVE_MK) == (key in mixed), key
 
 
 def test_the_two_formerly_pinned_problems_keep_their_fused_admission() -> None:
@@ -489,9 +271,7 @@ def test_the_ffi_guard_admits_exactly_the_compiled_producers() -> None:
     unreachable = sorted(
         shape
         for shape in claimed
-        if _has_native_producer(*shape)
-        and shape not in guard
-        and SM120_PREFIX_ROUTE_LADDER.get(shape, ("", ()))[0] != "cublaslt"
+        if _has_native_producer(*shape) and shape not in guard
     )
     assert unreachable == [], f"{unreachable} have a producer the FFI check will reject"
 
@@ -504,13 +284,12 @@ def test_every_fused_admission_has_a_prefix_that_can_run() -> None:
     # Then: nothing is admitted that has neither, which would make the C++
     # dispatcher return cudaErrorInvalidValue for a route the tuner can pick.
     # Reachable = the FFI lets it in AND the shape computes a geometry to launch.
+    # The second term used to be the ladder's cuBLASLt column, for shapes that
+    # had the prefix but no native producer. The prefix is a producer family now
+    # and is offered exactly where the native families are, so a shape reachable
+    # by one is reachable by the other and the ladder term has nothing to add.
     reachable = {shape for shape in _ffi_guard_shapes() if _has_native_producer(*shape)}
-    cublaslt = {
-        key
-        for key, entry in SM120_PREFIX_ROUTE_LADDER.items()
-        if entry[0] == "cublaslt"
-    }
-    orphans = sorted(set(SM120_FUSED_LINEAR_MK) - reachable - cublaslt)
+    orphans = sorted(set(SM120_FUSED_LINEAR_MK) - reachable)
     assert orphans == [], (
         f"{orphans} are admitted to the fused route but have no native producer "
         "and no cuBLASLt prefix rung"
@@ -543,10 +322,16 @@ def test_swept_producers_are_admitted_and_route_native(m: int, k: int) -> None:
     # Then: it is admitted, it routes native, and it does not claim the packed
     # L2T layout, which belongs to the M537 mixed producer alone.
     assert (m, k) in SM120_FUSED_LINEAR_MK
-    assert sm120_fused_prefix_route(m, k) == "native"
-    assert not sm120_fused_prefix_uses_packed_l2t(m, k, 32)
     assert _has_native_producer(m, k)
     assert (m, k) in _ffi_guard_shapes()
+    # "routes native and does not claim the packed L2T layout" used to be two
+    # table lookups. The producer is chosen per tactic now, so the same claim is
+    # made about the variants themselves: none of these shapes offers the M537
+    # family, which is the only one that reads L2T prepacked.
+    variants = sm120_producer_variants(m, k)
+    assert variants, f"({m}, {k}) computes no producer geometry"
+    assert all(family != SM120_FAMILY_M537 for family, _, _ in variants)
+    assert not any(sm120_variant_packs_l2t(m, k, v) for v in range(len(variants)))
 
 
 @pytest.mark.parametrize(
