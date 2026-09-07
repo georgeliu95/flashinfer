@@ -117,50 +117,6 @@ def _parse_measured_gate() -> set[tuple[int, int]]:
     return shapes
 
 
-def test_measured_gate_matches_the_ladder_default_column() -> None:
-    # Given: the seam only ever modifies the measured gate, never replaces it.
-    # When: the literal gate is parsed and compared with the ladder's defaults.
-    # Then: the two agree, which is also what the C++ reconciliation enforces.
-    ladder_defaults = {
-        key
-        for key, (default, _) in SM120_PREFIX_ROUTE_LADDER.items()
-        if default == "cublaslt"
-    }
-    assert _parse_measured_gate() == ladder_defaults
-
-
-def test_linear_gate_applies_the_seam_through_the_reconciliation() -> None:
-    # Given: a drifting gate would hand a prepacked matrix to the wrong prefix.
-    # When: the TVM-FFI entry point is inspected.
-    # Then: the measured gate feeds the reconciliation rather than being replaced.
-    source = LINEAR_SOURCE.read_text()
-    gate = source.split("bool const use_cublaslt_lora_down =", 1)[1].split(";", 1)[0]
-    assert _QUALIFIED + "resolve_cublaslt_prefix" in gate
-    assert "measured_cublaslt_lora_down" in gate
-    assert '#include "flashinfer/gemm/svdquant_sm120_prefix_route.h"' in source
-    # And: an override-selected shape can actually enter the cuBLASLt prefix.
-    admission = source.split("void nvfp4_quantize_smooth_lora_down_cublaslt_sm120(", 1)[
-        1
-    ].split("cuBLASLt SM120 LoRA-down requires an admitted exact", 1)[0]
-    assert _QUALIFIED + "uses_cublaslt_prefix" in admission
-
-
-def test_linear_source_call_sites_are_fully_qualified() -> None:
-    # Given: the TVM-FFI entry points live in namespace torch_ext, which the TU
-    # opens only after closing flashinfer::gemm, so unqualified lookup of the
-    # ladder namespace does not compile there.
-    # When: every prefix-route reference in the TU is located.
-    # Then: each one carries the full flashinfer::gemm:: qualification.
-    source = LINEAR_SOURCE.read_text()
-    assert source.index("}  // namespace gemm") < source.index("namespace torch_ext {")
-    references = [
-        match.start() for match in re.finditer(r"svdquant_sm120_prefix_route::", source)
-    ]
-    assert references, "the seam must still be wired into the TU"
-    for start in references:
-        assert source[start - len("flashinfer::gemm::") : start] == "flashinfer::gemm::"
-
-
 def test_no_rung_admits_a_route_it_cannot_run() -> None:
     # Given: every alternate rung this ladder carried regressed on SM120 (110 SMs), and
     # every default is still the measured winner. The ladder is no longer closed

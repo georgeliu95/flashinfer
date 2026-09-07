@@ -11,7 +11,6 @@ import torch
 
 from flashinfer.gemm import svdquant_sm120_routes as _sm120_routes
 from flashinfer.gemm.svdquant_sm120_routes import SM120_FUSED_LINEAR_MK
-from flashinfer.gemm.svdquant_sm120_routes import sm120_fused_prefix_route
 from flashinfer.gemm import svdquant_sm120_cutlass
 from flashinfer.gemm.gemm_svdquant import nvfp4_quantize_smooth, svdquant_linear
 from flashinfer.gemm.svdquant_sm120_cutlass import get_nvfp4_svdquant_sm120_module
@@ -348,6 +347,41 @@ def test_sm120_fused_k1_k2_rejects_non_exact_shape() -> None:
         )
 
 
+def _run_prefix_separately(
+    module, m, k, variant, x, pqs, gs, l2t, xq, sf, down, workspace
+):
+    """Run, on its own, exactly the prefix the fused route will run.
+
+    The arm used to branch on ``sm120_fused_prefix_route(m, k)`` -- a table
+    lookup -- while the fused arm passed no producer at all and let a second
+    copy of that table, in C++, decide. The two agreed only because both read
+    the same ladder. Now the producer is named once, here, and handed to both
+    arms, so the comparison is between one implementation launched two ways
+    rather than between whatever two tables happened to say.
+    """
+    family, tiling, policy = _sm120_routes.sm120_decode_producer_variant(m, k, variant)
+    if family == _sm120_routes.SM120_FAMILY_CUBLASLT:
+        module.nvfp4_quantize_smooth_lora_down_cublaslt_sm120(
+            x, pqs, gs, l2t, xq, sf, down, workspace
+        )
+    else:
+        module.nvfp4_quantize_smooth_lora_down_dyn_sm120(
+            x,
+            pqs,
+            gs,
+            l2t,
+            xq,
+            sf,
+            down,
+            family,
+            tiling[0],
+            tiling[1],
+            tiling[2],
+            policy,
+        )
+    return (family, tiling[0], tiling[1], tiling[2], policy)
+
+
 @pytest.mark.parametrize(
     ("m", "n", "k", "tactic"),
     (
@@ -445,27 +479,20 @@ def test_sm120_combined_k12_k3_matches_separate_launches(
     # by (family, tiling, address policy) rather than by the shape's pinned
     # template, so both arms are driven from the same decoded variant here --
     # reading it is what keeps this test honest when a route changes.
-    if sm120_fused_prefix_route(m, k) == "cublaslt":
-        module.nvfp4_quantize_smooth_lora_down_cublaslt_sm120(
-            x,
-            pre_quant_scale,
-            global_scale,
-            l2t_smoothed,
-            separate[0],
-            separate[1],
-            separate[2],
-            workspace,
-        )
-    else:
-        module.nvfp4_quantize_smooth_lora_down_sm120(
-            x,
-            pre_quant_scale,
-            global_scale,
-            l2t_smoothed,
-            separate[0],
-            separate[1],
-            separate[2],
-        )
+    producer_args = _run_prefix_separately(
+        module,
+        m,
+        k,
+        tactic >> _sm120_routes.SM120_PRODUCER_SHIFT,
+        x,
+        pre_quant_scale,
+        global_scale,
+        l2t_smoothed,
+        separate[0],
+        separate[1],
+        separate[2],
+        workspace,
+    )
     module.nvfp4_svdquant_gemm(
         separate[0],
         weight_fp4,
@@ -497,7 +524,7 @@ def test_sm120_combined_k12_k3_matches_separate_launches(
         workspace,
         tactic,
         False,
-        *_LEGACY_PRODUCER_ARGS,
+        *producer_args,
     )
 
     torch.cuda.synchronize()
@@ -1729,11 +1756,18 @@ def test_sm120_batch4_gap_closure_routes_are_exact() -> None:
     assert svdquant_sm120_cutlass._sm120_fused_linear_supported(m, k, rank)
     _assert_admission_tracks_the_ladder(m + 1, k, rank)
 
+    # This K set used to appear twice in the combined source -- once as the
+    # cuBLASLt entry's own admission list, once as the "measured faster" gate in
+    # the dispatcher -- and the assertion pinned the two copies to each other.
+    # Neither exists now: the prefix is a producer family the tactic names, so
+    # there is no list to keep in step. What still has to hold is that this
+    # shape can reach that prefix at all.
     combined = _read_repo_source("csrc/nvfp4_svdquant_gemm_cutlass_sm120.cu")
-    exact_k_set = "x.size(1) == 5120 || x.size(1) == 7168 || x.size(1) == 14336"
-    assert combined.count(exact_k_set) == 2
-    assert "k == 5120 || k == 7168 || k == 14336" in combined
-    assert "k == 5120 ? 2 : k == 5376 ? 4 : k == 7168 ? 5 : 0" in combined
+    assert (
+        "x.size(1) == 5120 || x.size(1) == 7168 || x.size(1) == 14336" not in combined
+    )
+    families = {family for family, _, _ in _sm120_routes.sm120_producer_variants(m, k)}
+    assert _sm120_routes.SM120_FAMILY_CUBLASLT in families
 
 
 def test_sm120_batch4_k5376_fused_routes_are_exact() -> None:
@@ -1776,9 +1810,13 @@ def test_sm120_batch4_k5376_fused_routes_are_exact() -> None:
         )
     ffi = _read_repo_source("csrc/nvfp4_smooth_quantize_sm100.cu")
     assert ffi.count("m == 6913 && k == 5376") == 1
+    # Same story: the duplicated cuBLASLt admission list is gone, so what is
+    # asserted is its absence plus the reachability the list used to grant.
     combined = _read_repo_source("csrc/nvfp4_svdquant_gemm_cutlass_sm120.cu")
-    assert combined.count("x.size(1) == 5120 || x.size(1) == 5376 ||") == 2
-    assert "x.size(0) == 537 || x.size(0) == 1935" in combined
+    assert "x.size(1) == 5120 || x.size(1) == 5376 ||" not in combined
+    for m_k in (537, 1935):
+        families = {f for f, _, _ in _sm120_routes.sm120_producer_variants(m_k, 5376)}
+        assert _sm120_routes.SM120_FAMILY_CUBLASLT in families
 
 
 def test_sm120_m537_prepacked_warp_rows_have_exact_shape_admission() -> None:
@@ -2162,6 +2200,14 @@ def test_sm120_h3_combined_k12_k3_matches_separate_at_a_fixed_k3_tactic(
     )
 
 
+def _cublaslt_producer_args(m: int, k: int):
+    """The (family, tiling..., policy) tuple that names the cuBLASLt prefix."""
+    for family, tiling, policy in _sm120_routes.sm120_producer_variants(m, k):
+        if family == _sm120_routes.SM120_FAMILY_CUBLASLT:
+            return (family, tiling[0], tiling[1], tiling[2], policy)
+    raise AssertionError(f"({m}, {k}) offers no cuBLASLt producer")
+
+
 def test_sm120_m537_cublaslt_down_matches_generic_prefix() -> None:
     """SM120 (110 SMs)-only acceptance for row 44's cuBLASLt LoRA-down path."""
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0):
@@ -2219,7 +2265,11 @@ def test_sm120_m537_cublaslt_down_matches_generic_prefix() -> None:
         workspace,
         tactic,
         False,
-        *_LEGACY_PRODUCER_ARGS,
+        # This test is about the cuBLASLt prefix, so it asks for it by name. It
+        # used to pass no producer and rely on a shape ladder to divert 537x5120
+        # onto that prefix -- which is exactly the implicit routing being
+        # removed, and it broke silently the moment the ladder went.
+        *_cublaslt_producer_args(m, k),
     )
     xq_ref, sf_ref = nvfp4_quantize_smooth(
         x, pre_quant_scale, global_scale, enable_pdl=False

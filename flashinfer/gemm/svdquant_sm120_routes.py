@@ -185,6 +185,13 @@ SM120_SMALL_M_TILING_LADDER: Final[tuple[tuple[int, int, int], ...]] = (
 SM120_FAMILY_LARGE_M: Final = 0
 SM120_FAMILY_SMALL_M: Final = 1
 SM120_FAMILY_M537: Final = 2
+# The cuBLASLt prefix is a producer like any other, not a route decided by a
+# table. It used to be selected by an 8-shape "measured faster" list mirrored in
+# three places; those shapes are where it was *measured*, not where it *runs* --
+# it is a library GEMM and takes any shape the quantizer does. Enumerating it
+# here hands the choice to the autotuner, which is the only thing that can know
+# whether it wins on a card nobody measured.
+SM120_FAMILY_CUBLASLT: Final = 3
 
 # The M537 producer reads L2T in a prepacked layout while every other family
 # reads it row-major. That is a property of the family, not of the shape: hand a
@@ -255,7 +262,11 @@ def sm120_producer_variants(
         if sm120_m537_is_valid(m, k)
         else ()
     )
-    return large + small + m537
+    # Offered wherever a native producer is, and last, so the variant indices of
+    # every shape that had one before keep their meaning.
+    native = large + small + m537
+    cublaslt = ((SM120_FAMILY_CUBLASLT, (0, 0, 0), 0),) if native else ()
+    return native + cublaslt
 
 
 def sm120_variant_packs_l2t(m: int, k: int, variant: int) -> bool:
