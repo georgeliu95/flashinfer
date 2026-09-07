@@ -10,6 +10,7 @@ import pytest
 from flashinfer.gemm import gemm_svdquant
 
 from flashinfer.gemm import svdquant_sm120_cutlass
+from flashinfer.gemm import svdquant_sm120_routes as _sm120_routes
 
 
 class _FakeTensor:
@@ -42,6 +43,22 @@ class _FakeTensor:
 
     def __repr__(self):
         return f"_FakeTensor(shape={self.shape}, dtype={self.dtype})"
+
+
+def _packing_tactic(m: int, k: int) -> int:
+    """A tactic whose producer variant is the one that indexes L2T prepacked.
+
+    A tactic used to be a consumer row and nothing else, so this test could name
+    one as a bare integer. It now carries a producer variant too, and whether the
+    L2T matrix is prepacked follows that variant rather than the shape -- so the
+    integer has to be derived from the same ladder the runner decodes, not
+    written down. Hardcoding it is how this test came to pass a variant that does
+    not pack at all.
+    """
+    variants = range(len(_sm120_routes.sm120_producer_variants(m, k)))
+    packing = [v for v in variants if _sm120_routes.sm120_variant_packs_l2t(m, k, v)]
+    assert packing, f"({m}, {k}) has no L2T-packing producer variant"
+    return _sm120_routes.sm120_pack_tactic(0, packing[0])
 
 
 def test_table_miss_packs_m537_l2t_only_inside_fused_runner(
@@ -101,7 +118,7 @@ def test_table_miss_packs_m537_l2t_only_inside_fused_runner(
 
     def choose_runner(tuner, runners, tuning_config, inputs, **kwargs):
         chooser_inputs.append(inputs)
-        return runner, 81
+        return runner, _packing_tactic(537, 5376)
 
     monkeypatch.setattr(
         svdquant_sm120_cutlass, "_choose_sm120_linear_runner", choose_runner
@@ -124,6 +141,11 @@ def test_table_miss_packs_m537_l2t_only_inside_fused_runner(
         "global_scale",
         bias="bias",
         enable_pdl=False,
+        # The fused SM120 route is reached by name, not by capability:
+        # svdquant_linear only enters it on backend == "cutlass-sm120".
+        # Without this the call falls through to the generic path and dies in
+        # nvfp4_quantize_smooth, which is not what this test is about.
+        backend="cutlass-sm120",
     )
 
     assert out is allocated[-1]
