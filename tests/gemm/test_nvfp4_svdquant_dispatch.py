@@ -126,29 +126,29 @@ def test_sm120_accepts_rank_32(monkeypatch):
     assert gemm_svdquant._check_mm_nvfp4_svdquant_problem(*_problem(rank=32)) is True
 
 
-def test_sm120_linear_rejects_rank_above_32_before_route_dispatch(monkeypatch):
-    monkeypatch.setattr(
-        svdquant_sm120_cutlass, "get_compute_capability", lambda device: (12, 0)
-    )
-    x = _FakeTensor((64, 3072), dtype=torch.bfloat16)
-    weight = _FakeTensor((3072, 1536), dtype=torch.uint8)
-    l2t = _FakeTensor((3072, 64), dtype=torch.bfloat16)
-    # pre_quant_scale is read for its dtype before the rank is ever looked at,
-    # so it cannot be a None placeholder however early the rejection happens.
-    pre_quant_scale = _FakeTensor((3072,), dtype=torch.bfloat16)
+def test_sm120_fused_route_declines_rank_64_but_the_entry_still_serves_it():
+    """Rank 64 is served on SM120; only the *fused* prefix declines it.
 
-    with pytest.raises(ValueError, match="rank 32 only"):
-        gemm_svdquant.svdquant_linear(
-            x,
-            weight,
-            None,
-            None,
-            pre_quant_scale,
-            l2t,
-            None,
-            None,
-            enable_pdl=False,
+    This replaces a test that asserted svdquant_linear raises "rank 32 only" for
+    rank > 32 on SM120. That rejection was never implemented -- the string never
+    existed outside a docstring -- and it is now the wrong contract: the LoRA
+    rank is a build parameter of the GEMM half, so rank 64 is a supported rank,
+    verified end to end on SM120 (4096x3072x3072 and 512x5120x5120 at 52.6 and
+    52.7 dB SQNR through the public entry).
+
+    What *is* true is narrower: the fused K12 prefix carries its own
+    compile-time rank of 32, so it must not offer itself for anything else. The
+    shape then takes the unfused route rather than being refused.
+    """
+    m, k = 64, 3072
+    assert svdquant_sm120_cutlass._sm120_fused_linear_supported(m, k, 32)
+    for rank in (64, 96, 128):
+        assert not svdquant_sm120_cutlass._sm120_fused_linear_supported(m, k, rank), (
+            f"the fused prefix stages rank 32 only, but offered itself for {rank}"
         )
+    # Declining the fused route is not rejecting the problem: the public check
+    # accepts any positive multiple of 32.
+    assert gemm_svdquant._check_mm_nvfp4_svdquant_problem(*_problem(rank=64)) is True
 
 
 @pytest.mark.parametrize("rank", [32, 64, 128])
