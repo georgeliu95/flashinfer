@@ -555,17 +555,11 @@ void nvfp4_quantize_smooth_lora_down_cublaslt_sm120(TensorView x, TensorView pqs
   CHECK_DEVICE(l2t_smoothed, x);
   CHECK_DEVICE(down, x);
   CHECK_DEVICE(workspace_buffer, x);
-  TVM_FFI_ICHECK(
-      x.ndim() == 2 &&
-      ((((x.size(0) == 512 || x.size(0) == 7800) && x.size(1) == 5120) ||
-        (x.size(0) == 537 && (x.size(1) == 5120 || x.size(1) == 7168 || x.size(1) == 14336)) ||
-        (x.size(0) == 1935 && (x.size(1) == 5120 || x.size(1) == 5376 || x.size(1) == 7168))) ||
-       // A/B seam only: an exact shape the ladder has explicitly moved onto this
-       // prefix for a matched measurement. Inert with the variable unset, so the
-       // admitted set above is unchanged in production.
-       flashinfer::gemm::svdquant_sm120_prefix_route::uses_cublaslt_prefix(
-           static_cast<int>(x.size(0)), static_cast<int>(x.size(1)))))
-      << "cuBLASLt SM120 LoRA-down requires an admitted exact (M, K)";
+  // No shape list. This prefix is a cuBLASLt GEMM plus the same quantizer every
+  // other producer uses, so what it can run is what they can run; the nine
+  // shapes named here were the ones it had been measured on, which is a
+  // different question and belongs to the autotuner.
+  TVM_FFI_ICHECK(x.ndim() == 2) << "x must be 2-D [m, k]";
 
   cudaStream_t stream = get_stream(x.device());
   if (x.size(0) == 537 || x.size(0) == 1935) {
@@ -719,35 +713,26 @@ void nvfp4_svdquant_gemm(TensorView a, TensorView b, TensorView a_sf, TensorView
 void dispatch_svdquant_producer_sm120(TensorView x, TensorView pqs, TensorView global_scale,
                                       TensorView l2t_smoothed, TensorView xq, TensorView a_sf,
                                       TensorView down, TensorView workspace_buffer,
-                                      int producer_variant = 0, int producer_family = -1,
-                                      int tiling0 = 0, int tiling1 = 0, int tiling2 = 0,
-                                      int address_policy = 0) {
-  bool const measured_cublaslt_lora_down =
-      x.ndim() == 2 &&
-      ((x.size(0) == 512 && x.size(1) == 5120) ||
-       (x.size(0) == 537 && (x.size(1) == 5120 || x.size(1) == 7168 || x.size(1) == 14336)) ||
-       (x.size(0) == 1935 && (x.size(1) == 5120 || x.size(1) == 5376 || x.size(1) == 7168)));
-  // A/B seam only. With SVDQ_SM120_PREFIX_ROUTE unset this is the measured gate
-  // above, verbatim; the reconciliation also fails loudly if the gate and the
-  // ladder that drives the Python-side LoRA-down layout ever disagree.
-  bool const use_cublaslt_lora_down =
-      x.ndim() == 2 && flashinfer::gemm::svdquant_sm120_prefix_route::resolve_cublaslt_prefix(
-                           static_cast<int>(x.size(0)), static_cast<int>(x.size(1)),
-                           measured_cublaslt_lora_down, producer_variant);
-  if (use_cublaslt_lora_down) {
+                                      int producer_family = -1, int tiling0 = 0, int tiling1 = 0,
+                                      int tiling2 = 0, int address_policy = 0) {
+  // The cuBLASLt prefix is producer family 3, chosen by the tactic like every
+  // other producer. It used to be gated by an 8-shape "measured faster" list
+  // here, reconciled against a second copy in the route ladder -- both were
+  // fitted on one card, and the cross-SKU numbers say such a fit does not
+  // transport: three shapes flip sign between two SM120 parts. Which prefix
+  // wins is a measurement, and the autotuner is the thing that measures.
+  //
+  // Removing it also closes a hazard the two tables created together. The
+  // variant index in a tactic names a producer geometry on the Python side; the
+  // route ladder read the same field as an index into ITS list, so an ordinary
+  // geometry variant of 1 or 2 could silently flip the prefix on a ladder shape
+  // -- handing the prepacked L2T matrix to a prefix that reads it row-major.
+  // One meaning for the field, one dispatch, no reconciliation.
+  if (producer_family == 3) {
     nvfp4_quantize_smooth_lora_down_cublaslt_sm120(x, pqs, global_scale, l2t_smoothed, xq, a_sf,
                                                    down, workspace_buffer);
     return;
   }
-  // The producer variant carries two axes that never both exist on one shape:
-  // the ROUTE ladder admits more than one entry only on shapes whose producer
-  // is the small-M or M537 kernel, and the GEOMETRY ladder exists only on the
-  // large-M kernel. A test pins that disjointness, because it is what makes
-  // this decomposition unambiguous: indices below the route count name a route,
-  // and the rest name a geometry on the default route.
-  // The geometry arrives as numbers rather than as an index into a ladder the
-  // two languages have to keep in step. An unset geometry means the caller has
-  // no opinion, so the shape's own pinned launch still applies.
   if (producer_family >= 0) {
     nvfp4_quantize_smooth_lora_down_dyn_sm120(x, pqs, global_scale, l2t_smoothed, xq, a_sf, down,
                                               producer_family, tiling0, tiling1, tiling2,
@@ -794,12 +779,11 @@ void nvfp4_svdquant_linear_sm120(TensorView x, TensorView pqs, TensorView global
   // consumer half is the K3 row. Python resolved the same producer half to pick
   // the L2T layout before this call, so layout and dispatch cannot disagree.
   namespace prefix_route = flashinfer::gemm::svdquant_sm120_prefix_route;
-  int const producer_variant = prefix_route::producer_variant_of(tactic);
   int const k3_row = prefix_route::k3_row_of(tactic);
-  dispatch_svdquant_producer_sm120(
-      x, pqs, global_scale, l2t_smoothed, xq, a_sf, down, workspace_buffer, producer_variant,
-      static_cast<int>(producer_family), static_cast<int>(tiling0), static_cast<int>(tiling1),
-      static_cast<int>(tiling2), static_cast<int>(address_policy));
+  dispatch_svdquant_producer_sm120(x, pqs, global_scale, l2t_smoothed, xq, a_sf, down,
+                                   workspace_buffer, static_cast<int>(producer_family),
+                                   static_cast<int>(tiling0), static_cast<int>(tiling1),
+                                   static_cast<int>(tiling2), static_cast<int>(address_policy));
   if (configure_case7_persisting_l2) {
     std::size_t const max_budget = static_cast<std::size_t>(max_persisting_l2_bytes);
     std::size_t const xq_budget = max_budget > sf_bytes ? max_budget - sf_bytes : 0;
