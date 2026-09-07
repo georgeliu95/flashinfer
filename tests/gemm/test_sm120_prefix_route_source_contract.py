@@ -12,11 +12,6 @@ from pathlib import Path
 
 import pytest
 
-from flashinfer.gemm.svdquant_sm120_routes import (
-    sm120_producer_variants,
-    PREFIX_ROUTE_OVERRIDE_ENV,
-    SM120_PREFIX_ROUTE_LADDER,
-)
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 LADDER_HEADER = REPO_ROOT / "include/flashinfer/gemm/svdquant_sm120_prefix_route.h"
@@ -40,29 +35,6 @@ _LARGE_M_DOWN_WARPS = _RANK // 8
 _SM120_110SM_SM_COUNT = 110
 
 
-def _parse_cpp_ladder() -> dict[tuple[int, int], tuple[str, frozenset[str]]]:
-    text = LADDER_HEADER.read_text()
-    body = text.split("inline constexpr LadderEntry kLadder[] = {", 1)[1].split(
-        "};", 1
-    )[0]
-    ladder: dict[tuple[int, int], tuple[str, frozenset[str]]] = {}
-    for match in _LADDER_ENTRY.finditer(body):
-        m, k, route, cublaslt, native, native_alt = match.groups()
-        admitted = {
-            name
-            for name, allowed in (
-                ("cublaslt", cublaslt),
-                ("native", native),
-                ("native_alt", native_alt),
-            )
-            if allowed == "true"
-        }
-        key = (int(m), int(k))
-        assert key not in ladder, f"duplicate C++ ladder entry {key}"
-        ladder[key] = (_ROUTE_NAMES[route], frozenset(admitted))
-    return ladder
-
-
 def _large_m_geometry(m: int, k: int, block_threads: int, tile_m: int, tile_k: int):
     """Recompute the producer header's compile-time launch contract in Python."""
     quant_threads = block_threads - _LARGE_M_DOWN_WARPS * 32
@@ -83,75 +55,6 @@ def _large_m_geometry(m: int, k: int, block_threads: int, tile_m: int, tile_k: i
     assert k < 8192 or grid_blocks * block_threads >= prefetch_lines
     assert shared_bytes <= 48 * 1024
     return grid_blocks, shared_bytes
-
-
-def test_cpp_and_python_prefix_ladders_agree() -> None:
-    # Given: the route decision is made in C++ and the L2T layout in Python.
-    # When: both ladders are compared entry by entry.
-    # Then: neither side can drift into reading a layout the other did not write.
-    assert _parse_cpp_ladder() == dict(SM120_PREFIX_ROUTE_LADDER)
-
-
-def test_both_sides_read_the_same_environment_variable() -> None:
-    # Given: one diagnostic toggle drives both sides of the seam.
-    # When: the C++ variable name is read out of the ladder header.
-    # Then: it matches the name the Python route lookup consults.
-    header = LADDER_HEADER.read_text()
-    match = re.search(r'inline constexpr char kEnvName\[\] = "([^"]+)"', header)
-    assert match is not None
-    assert match.group(1) == PREFIX_ROUTE_OVERRIDE_ENV
-
-
-def _parse_measured_gate() -> set[tuple[int, int]]:
-    """Recover the literal cuBLASLt-prefix shape set from the TVM-FFI gate."""
-    source = LINEAR_SOURCE.read_text()
-    gate = source.split("bool const measured_cublaslt_lora_down =", 1)[1].split(";", 1)[
-        0
-    ]
-    groups = re.split(r"x\.size\(0\) == (\d+)", gate)[1:]
-    shapes: set[tuple[int, int]] = set()
-    for index in range(0, len(groups), 2):
-        m = int(groups[index])
-        for k in re.findall(r"x\.size\(1\) == (\d+)", groups[index + 1]):
-            shapes.add((m, int(k)))
-    return shapes
-
-
-def test_no_rung_admits_a_route_it_cannot_run() -> None:
-    # Given: every alternate rung this ladder carried regressed on SM120 (110 SMs), and
-    # every default is still the measured winner. The ladder is no longer closed
-    # though: the cuBLASLt-routed shapes admit their native rung again, because
-    # each of them now has a compiled native producer and a route nothing can
-    # select cannot be re-measured.
-    # When: each rung's admitted set is read.
-    # Then: it always contains its own default, never contains the retired
-    # native_alt, and any extra route it admits is one the C++ dispatcher can
-    # actually reach -- admission is a claim that something will run.
-    for key, (default, admitted) in SM120_PREFIX_ROUTE_LADDER.items():
-        assert default in admitted, key
-        assert "native_alt" not in admitted, key
-        if "native" in admitted:
-            m, k = key
-            # Was: look for this shape's own launch_*_kernel<M, K, ...> in the
-            # dispatcher body. The runtime-M/K conversion replaced the per-shape
-            # instantiations with one launcher taking the geometry as arguments,
-            # so a shape is backed when it computes a geometry, not when a
-            # template bearing its numbers appears in the source.
-            assert sm120_producer_variants(m, k), (
-                f"{key} admits native but computes no producer geometry"
-            )
-
-
-def test_native_alt_grammar_survives_its_own_retirement() -> None:
-    # Given: keeping the spelling stable across rounds is worth more than pruning
-    # the enumerator, because campaign scripts are written against the grammar.
-    # When: the parser and the admission check are read out of the ladder header.
-    # Then: native_alt still parses, and is rejected by admission rather than syntax.
-    header = LADDER_HEADER.read_text()
-    assert 'if (text == "native_alt")' in header
-    assert not any(
-        "native_alt" in admitted for _, admitted in SM120_PREFIX_ROUTE_LADDER.values()
-    )
 
 
 @pytest.mark.parametrize(

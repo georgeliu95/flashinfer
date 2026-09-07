@@ -13,7 +13,6 @@ shape-keyed tactic table reappears in this package.
 """
 
 import functools
-import os
 from collections.abc import Mapping
 from types import MappingProxyType
 from typing import Final, TypeAlias
@@ -317,8 +316,6 @@ def sm120_decode_producer_variant(
     return variants[variant]
 
 
-PREFIX_ROUTE_OVERRIDE_ENV: Final = "SVDQ_SM120_PREFIX_ROUTE"
-
 PrefixRoute: TypeAlias = str
 PrefixRouteKey: TypeAlias = tuple[int, int]
 
@@ -332,105 +329,9 @@ PrefixRouteKey: TypeAlias = tuple[int, int]
 # round 2 and refuted, so each shape now admits only its measured default. The
 # C++ header records the per-rung medians. The table is retained for the
 # gate/layout reconciliation, not as a live A/B instrument.
-SM120_PREFIX_ROUTE_LADDER: Final[
-    Mapping[PrefixRouteKey, tuple[PrefixRoute, frozenset[PrefixRoute]]]
-] = MappingProxyType(
-    {
-        # Mirrors include/flashinfer/gemm/svdquant_sm120_prefix_route.h. Every
-        # default is the measured winner and none of them move. The native rung
-        # is admissible on the cuBLASLt-routed entries because each now has a
-        # compiled native producer: selecting it still takes an explicit
-        # SVDQ_SM120_PREFIX_ROUTE, but the losing arm can be re-measured instead
-        # of re-argued. The margins are recorded in the C++ header.
-        (512, 5120): ("cublaslt", frozenset({"cublaslt", "native"})),
-        (537, 5120): ("cublaslt", frozenset({"cublaslt", "native"})),
-        (537, 7168): ("cublaslt", frozenset({"cublaslt", "native"})),
-        (537, 14336): ("cublaslt", frozenset({"cublaslt", "native"})),
-        (537, 5376): ("native", frozenset({"native"})),
-        (1935, 5120): ("cublaslt", frozenset({"cublaslt", "native"})),
-        (1935, 7168): ("cublaslt", frozenset({"cublaslt", "native"})),
-        (1935, 5376): ("cublaslt", frozenset({"cublaslt", "native"})),
-        (1935, 14336): ("native", frozenset({"native"})),
-    }
-)
 
 # Shapes whose native producer is the M537 mixed kernel, which indexes L2T with
 # the prepacked layout. Row-major L2T on those routes would be misread.
-SM120_PACKED_L2T_NATIVE_MK: Final[frozenset[PrefixRouteKey]] = frozenset(
-    {(537, 5120), (537, 5376), (537, 7168)}
-)
-
-_NO_PREFIX_ROUTE_OVERRIDES: Final[Mapping[PrefixRouteKey, PrefixRoute]] = (
-    MappingProxyType({})
-)
-
-
-def _parse_prefix_route_overrides(spec: str) -> Mapping[PrefixRouteKey, PrefixRoute]:
-    """Parse ``m:k=route`` entries separated by commas.
-
-    A/B-only diagnostic: the shape must appear in the ladder and the route must be
-    admitted for that shape, so the seam can select between implementations that
-    were already compiled for an exact shape but can never invent one.
-    """
-    overrides: dict[PrefixRouteKey, PrefixRoute] = {}
-    for entry in spec.split(","):
-        item = entry.strip()
-        if not item:
-            raise ValueError(f"{PREFIX_ROUTE_OVERRIDE_ENV} entry {item!r} is empty")
-        key_text, separator, route = item.partition("=")
-        if not separator:
-            raise ValueError(
-                f"{PREFIX_ROUTE_OVERRIDE_ENV} entry {item!r} must be m:k=route"
-            )
-        fields = key_text.split(":")
-        if len(fields) != 2:
-            raise ValueError(
-                f"{PREFIX_ROUTE_OVERRIDE_ENV} entry {item!r} must name m:k"
-            )
-        try:
-            key = (int(fields[0]), int(fields[1]))
-        except ValueError as error:
-            raise ValueError(
-                f"{PREFIX_ROUTE_OVERRIDE_ENV} entry {item!r} is not integral"
-            ) from error
-        ladder = SM120_PREFIX_ROUTE_LADDER.get(key)
-        if ladder is None:
-            raise ValueError(
-                f"{PREFIX_ROUTE_OVERRIDE_ENV} entry {item!r} names "
-                f"{key}, which has no A/B ladder"
-            )
-        if route.strip() not in ladder[1]:
-            raise ValueError(
-                f"{PREFIX_ROUTE_OVERRIDE_ENV} entry {item!r} names a route that "
-                f"{key} does not admit"
-            )
-        if key in overrides:
-            raise ValueError(
-                f"{PREFIX_ROUTE_OVERRIDE_ENV} entry {item!r} repeats {key}"
-            )
-        overrides[key] = route.strip()
-    return MappingProxyType(overrides)
-
-
-@functools.lru_cache(maxsize=8)
-def _cached_prefix_route_overrides(spec: str) -> Mapping[PrefixRouteKey, PrefixRoute]:
-    return _parse_prefix_route_overrides(spec)
-
-
-def sm120_prefix_route_overrides() -> Mapping[PrefixRouteKey, PrefixRoute]:
-    """Return the active ``SVDQ_SM120_PREFIX_ROUTE`` overrides (empty when unset)."""
-    spec = os.environ.get(PREFIX_ROUTE_OVERRIDE_ENV)
-    if not spec or not spec.strip():
-        return _NO_PREFIX_ROUTE_OVERRIDES
-    return _cached_prefix_route_overrides(spec)
-
-
-def sm120_fused_prefix_route(m: int, k: int) -> PrefixRoute:
-    """Return the effective fused-prefix implementation for one exact shape."""
-    ladder = SM120_PREFIX_ROUTE_LADDER.get((m, k))
-    if ladder is None:
-        return "native"
-    return sm120_prefix_route_overrides().get((m, k), ladder[0])
 
 
 # --- the producer axis of a packed tactic ------------------------------------
@@ -468,28 +369,6 @@ def sm120_fused_prefix_route(m: int, k: int) -> PrefixRoute:
 
 # The geometry each exact large-M shape is pinned to today, which is always
 # variant 0 so an unselected shape runs what it has always run.
-
-
-def sm120_fused_prefix_uses_packed_l2t(
-    m: int,
-    k: int,
-    rank: int,
-    route: PrefixRoute | None = None,
-) -> bool:
-    """Return whether the combined fused prefix requires the M537 L2T layout.
-
-    ``route`` is the producer the caller is about to dispatch. It must be passed
-    whenever a tactic selected the producer, because the layout and the dispatch
-    have to describe the same route: the M537 native producer indexes L2T with
-    the prepacked layout and the cuBLASLt prefix reads the row-major one, so a
-    mismatched pair misreads the matrix rather than failing. Omitting it falls
-    back to the ladder's effective route, which is correct only when nothing
-    overrode it.
-    """
-    if rank != 32 or (m, k) not in SM120_PACKED_L2T_NATIVE_MK:
-        return False
-    effective = sm120_fused_prefix_route(m, k) if route is None else route
-    return effective != "cublaslt"
 
 
 # The (M, K) projection of the frozen benchmark matrix -- the shapes this

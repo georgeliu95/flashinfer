@@ -562,15 +562,14 @@ void nvfp4_quantize_smooth_lora_down_cublaslt_sm120(TensorView x, TensorView pqs
   TVM_FFI_ICHECK(x.ndim() == 2) << "x must be 2-D [m, k]";
 
   cudaStream_t stream = get_stream(x.device());
-  if (x.size(0) == 537 || x.size(0) == 1935) {
-    // Keep XQ/SF hot for the immediately following residual GEMM. The M537 and
-    // M1935 LoRA-down paths read enough X data to evict them after quantize.
-    run_lora_down_cublaslt(x, l2t_smoothed, down, workspace_buffer, stream);
-    nvfp4_quantize_smooth(x, pqs, global_scale, xq, sf, false);
-  } else {
-    nvfp4_quantize_smooth(x, pqs, global_scale, xq, sf, false);
-    run_lora_down_cublaslt(x, l2t_smoothed, down, workspace_buffer, stream);
-  }
+  // Two shapes used to swap these calls, to keep XQ/SF hot for the residual GEMM
+  // that follows. That was worth measuring and it was measured -- on two values
+  // of M, on one card. It is an ordering hint, not a correctness property, and
+  // naming shapes inside a kernel entry is what this backend is removing
+  // everywhere else. If the ordering is worth having it should come back as a
+  // tactic axis the autotuner can rank on the card in front of it.
+  nvfp4_quantize_smooth(x, pqs, global_scale, xq, sf, false);
+  run_lora_down_cublaslt(x, l2t_smoothed, down, workspace_buffer, stream);
 }
 #endif
 
@@ -750,7 +749,12 @@ void nvfp4_svdquant_linear_sm120(TensorView x, TensorView pqs, TensorView global
                                  TensorView workspace_buffer, int64_t tactic, bool enable_pdl,
                                  int64_t producer_family, int64_t tiling0, int64_t tiling1,
                                  int64_t tiling2, int64_t address_policy) {
-  bool const use_case7_persisting_l2 = x.ndim() == 2 && x.size(0) == 27280 && x.size(1) == 14336;
+  // Was: `x.size(0) == 27280 && x.size(1) == 14336`. One shape, one card, wired
+  // into the entry point as a literal. Same objection as every other table this
+  // backend has shed -- a persisting-L2 window that helps on one part is not
+  // known to help on another, and nothing here can tell. Off for everyone until
+  // it is something the tuner selects.
+  bool const use_case7_persisting_l2 = false;
   cudaStream_t const stream = get_stream(x.device());
   std::size_t const sf_bytes = static_cast<std::size_t>(a_sf.numel()) * get_element_size(a_sf);
   int max_persisting_l2_bytes = 0;
