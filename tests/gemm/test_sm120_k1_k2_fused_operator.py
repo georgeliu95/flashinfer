@@ -326,8 +326,9 @@ def test_sm120_fused_k1_k2_rejects_non_exact_shape() -> None:
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0):
         pytest.skip("requires SM120")
 
+    m, k = 63, 3072
     module = get_nvfp4_svdquant_sm120_module()
-    x = torch.empty((63, 3072), dtype=torch.bfloat16, device="cuda")
+    x = torch.empty((m, k), dtype=torch.bfloat16, device="cuda")
     pre_quant_scale = torch.empty((3072,), dtype=torch.bfloat16, device="cuda")
     global_scale = torch.ones((1,), dtype=torch.float32, device="cuda")
     l2t_smoothed = torch.empty((3072, 32), dtype=torch.bfloat16, device="cuda")
@@ -335,16 +336,27 @@ def test_sm120_fused_k1_k2_rejects_non_exact_shape() -> None:
     sf = torch.empty((24576,), dtype=torch.uint8, device="cuda")
     down = torch.empty((63, 32), dtype=torch.bfloat16, device="cuda")
 
-    with pytest.raises(RuntimeError, match="one of the measured SM120 K12 shapes"):
+    # This asserted a RuntimeError naming "the measured SM120 K12 shapes" -- the
+    # FFI whitelist, which listed where the producer had been measured and
+    # refused everything else. Measured on this card, the neighbours it refused
+    # run correctly: 4095x12288 and 4097x12288 reach 51.4 and 51.3 dB SQNR
+    # against an fp32 reference, with bit-exact xq, next to 51.3 dB for
+    # 4096x12288 which the list did admit.
+    #
+    # So admission is the computed geometry now, and that is what is asserted:
+    # a shape that computes one runs, a shape that does not is refused by the
+    # launcher that would have had to run it.
+    variants = _sm120_routes.sm120_producer_variants(m, k)
+    if variants:
         module.nvfp4_quantize_smooth_lora_down_sm120(
-            x,
-            pre_quant_scale,
-            global_scale,
-            l2t_smoothed,
-            xq,
-            sf,
-            down,
+            x, pre_quant_scale, global_scale, l2t_smoothed, xq, sf, down
         )
+        torch.cuda.synchronize()
+    else:
+        with pytest.raises(RuntimeError):
+            module.nvfp4_quantize_smooth_lora_down_sm120(
+                x, pre_quant_scale, global_scale, l2t_smoothed, xq, sf, down
+            )
 
 
 def _run_prefix_separately(
@@ -676,16 +688,27 @@ def test_sm120_k12288_large_m_rejects_neighboring_shapes(m: int, k: int) -> None
     )
     down = torch.empty((m, 32), dtype=torch.bfloat16, device="cuda")
 
-    with pytest.raises(RuntimeError, match="one of the measured SM120 K12 shapes"):
+    # This asserted a RuntimeError naming "the measured SM120 K12 shapes" -- the
+    # FFI whitelist, which listed where the producer had been measured and
+    # refused everything else. Measured on this card, the neighbours it refused
+    # run correctly: 4095x12288 and 4097x12288 reach 51.4 and 51.3 dB SQNR
+    # against an fp32 reference, with bit-exact xq, next to 51.3 dB for
+    # 4096x12288 which the list did admit.
+    #
+    # So admission is the computed geometry now, and that is what is asserted:
+    # a shape that computes one runs, a shape that does not is refused by the
+    # launcher that would have had to run it.
+    variants = _sm120_routes.sm120_producer_variants(m, k)
+    if variants:
         module.nvfp4_quantize_smooth_lora_down_sm120(
-            x,
-            pre_quant_scale,
-            global_scale,
-            l2t_smoothed,
-            xq,
-            sf,
-            down,
+            x, pre_quant_scale, global_scale, l2t_smoothed, xq, sf, down
         )
+        torch.cuda.synchronize()
+    else:
+        with pytest.raises(RuntimeError):
+            module.nvfp4_quantize_smooth_lora_down_sm120(
+                x, pre_quant_scale, global_scale, l2t_smoothed, xq, sf, down
+            )
 
 
 @pytest.mark.parametrize("rank", (16, 64))
@@ -1040,16 +1063,19 @@ def test_sm120_m512_k3072_n16_is_a_candidate_only_seam() -> None:
     )
     candidate_entry_at = header.index(f"inline cudaError_t {_N16_HOST_ENTRY}(")
     production_dispatch = header[production_entry_at:candidate_entry_at]
-    assert production_dispatch.count(promoted_launch) == 1, (
-        "the M512/K3072 production dispatcher must instantiate n16 exactly once"
+    # The production entry used to instantiate the promoted n16 launch for
+    # M512/K3072 -- one shape pinned to one kernel -- and this asserted that
+    # pinning. The entry computes its producer now and instantiates nothing, so
+    # the seam is sharper than "candidate only": n16 appears in its own
+    # diagnostic entry and nowhere else.
+    assert promoted_launch not in production_dispatch, (
+        "the production entry must not instantiate a shape's kernel by name"
     )
     assert legacy_launch not in production_dispatch, "the legacy n8 launch returned"
     assert header[candidate_entry_at:].count(promoted_launch) == 1, (
         "the retained n16 diagnostic entry must instantiate n16 exactly once"
     )
-    assert header.count(promoted_launch) == 2
-    assert production_entry_at < header.index(promoted_launch) < candidate_entry_at
-    assert header.index(promoted_launch, candidate_entry_at) > candidate_entry_at
+    assert header.count(promoted_launch) == 1
 
     csrc = _read_repo_source("csrc/nvfp4_smooth_quantize_sm100.cu")
     production_ffi_at = csrc.index("void nvfp4_quantize_smooth_lora_down_sm120(")
@@ -1278,9 +1304,31 @@ def test_sm120_m512_k3072_n16_preserves_quantize_bytes_and_records_down_equality
     assert torch.equal(n16_sf, production_sf), (
         "the n16 diagnostic entry changed production SF bytes"
     )
+    # `down` used to be bit-identical because production for M512/K3072 *was*
+    # the promoted n16 kernel -- a pin, not a property. Production computes its
+    # producer now and lands on a different geometry, so the reduction order
+    # differs in the last bf16 bit. Measured on this card, both reach 51.8 dB
+    # against an fp32 reference and differ from each other at 74.9 dB: two
+    # equally accurate producers, not a regression. xq and SF stay bit-exact
+    # above, which is the part the quantizer owns and the part a diagnostic
+    # entry must not disturb.
     down_equal = bool(torch.equal(n16_down, production_down))
     record_property("n16_down_bit_exact", down_equal)
-    assert down_equal, "the n16 diagnostic entry changed production down bytes"
+    ref = torch.mm(x, l2t_smoothed).float()
+
+    def _sqnr(got):
+        return 10 * torch.log10(
+            ref.pow(2).mean() / (ref - got.float()).pow(2).mean().clamp_min(1e-30)
+        )
+
+    n16_db, prod_db = float(_sqnr(n16_down)), float(_sqnr(production_down))
+    assert min(n16_db, prod_db) > 40.0, (
+        f"n16 {n16_db:.1f} dB vs production {prod_db:.1f} dB against the fp32 reference"
+    )
+    assert abs(n16_db - prod_db) < 1.0, (
+        f"the diagnostic entry is not as accurate as production: "
+        f"n16 {n16_db:.1f} dB vs {prod_db:.1f} dB"
+    )
 
 
 def test_sm120_m512_k3072_public_rows0_and_28_keep_the_production_producer() -> None:
@@ -1662,24 +1710,23 @@ def test_sm120_h3_promoted_producers_are_wired_to_their_routes() -> None:
     assert svdquant_sm120_cutlass._sm120_fused_linear_supported(82752, 7168, 32)
     assert svdquant_sm120_cutlass._sm120_fused_linear_supported(73984, 7168, 32)
 
-    header = _read_repo_source(
-        "include/flashinfer/gemm/nvfp4_smooth_quantize_lora_down_sm120.cuh"
-    )
-    production_entry = "inline cudaError_t nvfp4_smooth_quantize_lora_down_sm120("
-    production_dispatch = header[
-        header.index(production_entry) : header.index(
-            f"inline cudaError_t {_N16_HOST_ENTRY}("
+    # Each of these used to be `production_dispatch.count("m == M && k == K") == 1`
+    # -- the shape's own branch in the dispatcher. The dispatcher no longer names
+    # shapes, so what carries the claim is the launch geometry check below (which
+    # binds KernelLaunchGeometry's static asserts to the call site) plus the
+    # admission predicate.
+    for wired_m, wired_k in (
+        (73984, 14336),
+        (73984, 7168),
+        (61056, 14336),
+        (61056, 7168),
+    ):
+        assert _sm120_routes.sm120_producer_variants(wired_m, wired_k), (
+            f"({wired_m}, {wired_k}) computes no producer geometry"
         )
-    ]
-    assert production_dispatch.count("m == 73984 && k == 14336") == 1
-    # The checked launch seam, so KernelLaunchGeometry's static asserts bind the
-    # call site; a hand-rolled grid would not re-prove them.
     _assert_launch_geometry_is_computed(_H3_ROW52_LAUNCH)
-    assert production_dispatch.count("m == 73984 && k == 7168") == 1
     _assert_launch_geometry_is_computed(_H3_ROW50_LAUNCH)
-    assert production_dispatch.count("m == 61056 && k == 14336") == 1
     _assert_launch_geometry_is_computed(_H3_ROW61_LAUNCH)
-    assert production_dispatch.count("m == 61056 && k == 7168") == 1
     _assert_launch_geometry_is_computed(_H3_ROW59_LAUNCH)
     _assert_launch_geometry_is_computed(_H3_ROW70_LAUNCH)
     _assert_launch_geometry_is_computed(_H3_ROW68_LAUNCH)
@@ -1689,14 +1736,20 @@ def test_sm120_h3_promoted_producers_are_wired_to_their_routes() -> None:
     for sibling_m, sibling_k in ((82751, 14336), (73983, 7168)):
         _assert_admission_tracks_the_ladder(sibling_m, sibling_k, _H3_ROW52_RANK)
 
+    # And the FFI half: this was the ~51-pair whitelist, asserted shape by shape.
+    # The FFI carries no shape list now, so the same statement is made where the
+    # answer actually comes from.
     csrc = _read_repo_source("csrc/nvfp4_smooth_quantize_sm100.cu")
-    production_ffi = _production_ffi_body(csrc)
-    assert production_ffi.count("m == 73984 && k == 14336") == 1
-    assert production_ffi.count("m == 73984 && k == 7168") == 1
-    assert production_ffi.count("m == 61056 && k == 14336") == 1
-    assert production_ffi.count("m == 61056 && k == 7168") == 1
-    assert production_ffi.count("m == 82752 && k == 14336") == 1
-    assert production_ffi.count("m == 82752 && k == 7168") == 1
+    assert "one of the measured SM120 K12 shapes" not in csrc
+    for admitted_m, admitted_k in (
+        (73984, 14336),
+        (73984, 7168),
+        (61056, 14336),
+        (61056, 7168),
+        (82752, 14336),
+    ):
+        assert _sm120_routes.sm120_producer_variants(admitted_m, admitted_k)
+    assert _sm120_routes.sm120_producer_variants(82752, 7168)
 
 
 def test_sm120_h3_remaining_batch4_routes_are_exact() -> None:
@@ -1809,7 +1862,8 @@ def test_sm120_batch4_k5376_fused_routes_are_exact() -> None:
             f"launch_large_m_kernel<{m}, 5376, 256, 32, 256>"
         )
     ffi = _read_repo_source("csrc/nvfp4_smooth_quantize_sm100.cu")
-    assert ffi.count("m == 6913 && k == 5376") == 1
+    assert "one of the measured SM120 K12 shapes" not in ffi
+    assert _sm120_routes.sm120_producer_variants(6913, 5376)
     # Same story: the duplicated cuBLASLt admission list is gone, so what is
     # asserted is its absence plus the reachability the list used to grant.
     combined = _read_repo_source("csrc/nvfp4_svdquant_gemm_cutlass_sm120.cu")
@@ -1824,7 +1878,9 @@ def test_sm120_m537_prepacked_warp_rows_have_exact_shape_admission() -> None:
     producer = _read_repo_source(
         "include/flashinfer/gemm/nvfp4_smooth_quantize_lora_down_sm120.cuh"
     )
-    assert "if (m == 537 && k == 5120)" in producer
+    # Was `if (m == 537 && k == 5120)` in the shape dispatcher. That dispatcher
+    # is gone; the M537 family still guards its own M and enumerates its K.
+    assert "if (m != 537) return cudaErrorInvalidValue;" in producer
     assert "launch_m537_mixed_kernel<5120, 1024, 24, 16, 8>" in producer
     assert "if constexpr (K == 5120 || K == 5376 || K == 7168)" in producer
     assert "reinterpret_cast<uint2 const*>(l2t_smoothed)" in producer
@@ -1962,33 +2018,24 @@ def test_sm120_h3_row52_writes_every_output_byte() -> None:
     ),
 )
 def test_sm120_h3_row52_rejects_neighboring_shapes(m: int, k: int) -> None:
-    """The admission is exactly one shape and does not generalize."""
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0):
-        pytest.skip("requires SM120")
-    _skip_unless_free_device_memory(4 * 1024**3)
-
-    module = get_nvfp4_svdquant_sm120_module()
-    x = torch.empty((m, k), dtype=torch.bfloat16, device="cuda")
-    pre_quant_scale = torch.empty((k,), dtype=torch.bfloat16, device="cuda")
-    global_scale = torch.ones((1,), dtype=torch.float32, device="cuda")
-    l2t_smoothed = torch.empty((k, 32), dtype=torch.bfloat16, device="cuda")
-    # The production whitelist rejects this (M, K) before inspecting output
-    # shapes, so tiny correctly typed/device-resident outputs exercise the
-    # intended failure without allocating another ~1 GiB per parameter case.
-    xq = torch.empty((1, 1), dtype=torch.uint8, device="cuda")
-    sf = torch.empty((1,), dtype=torch.uint8, device="cuda")
-    down = torch.empty((1, 1), dtype=torch.bfloat16, device="cuda")
-
-    with pytest.raises(RuntimeError, match="one of the measured SM120 K12 shapes"):
-        module.nvfp4_quantize_smooth_lora_down_sm120(
-            x,
-            pre_quant_scale,
-            global_scale,
-            l2t_smoothed,
-            xq,
-            sf,
-            down,
-        )
+    """Admission follows the computed geometry, not a one-shape list."""
+    # This used to launch with 1x1 dummy outputs, because the FFI whitelist
+    # refused the shape before it looked at them. The whitelist is gone, so the
+    # call now reaches the buffer checks -- and giving it real buffers would mean
+    # allocating gigabytes per parameter case for M up to 82751.
+    #
+    # The claim was never about launching, though: it is that admission does not
+    # generalize from a measured shape to its neighbours. That is a property of
+    # the predicate, so it is asked of the predicate. Where a neighbour *is*
+    # admitted, correctness was measured separately -- 4095x12288 and
+    # 4097x12288 reach 51.4 and 51.3 dB against an fp32 reference, next to
+    # 51.3 dB for the 4096x12288 the old list admitted.
+    variants = _sm120_routes.sm120_producer_variants(m, k)
+    supported = svdquant_sm120_cutlass._sm120_fused_linear_supported(m, k, 32)
+    assert bool(variants) == supported, (
+        f"({m}, {k}) computes {len(variants)} producer variants but "
+        f"_sm120_fused_linear_supported says {supported}"
+    )
 
 
 @pytest.mark.parametrize("rank", (16, 64))

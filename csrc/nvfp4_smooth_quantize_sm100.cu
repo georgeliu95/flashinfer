@@ -104,32 +104,19 @@ void nvfp4_quantize_smooth_lora_down_sm120_impl(TensorView x, TensorView pqs,
   CHECK_DEVICE(sf, x);
   CHECK_DEVICE(down, x);
 
-  TVM_FFI_ICHECK_EQ(x.ndim(), 2) << "x must be one of the measured SM120 K12 shapes";
+  TVM_FFI_ICHECK_EQ(x.ndim(), 2) << "x must be 2-D [m, k]";
   int const m = static_cast<int>(x.size(0));
   int const k = static_cast<int>(x.size(1));
-  // The three (M, K) lists that gate this route -- this check, the producer
-  // dispatcher in include/flashinfer/gemm/nvfp4_smooth_quantize_lora_down_sm120.cuh,
-  // and SM120_FUSED_LINEAR_MK in flashinfer/gemm/svdquant_sm120_routes.py -- must
-  // agree. tests/gemm/test_svdquant_sm120_routes.py holds all three against each
-  // other; they drifted apart once, and this guard is what caught it.
-  TVM_FFI_ICHECK(
-      ((m == 512 || m == 7800 || m == 32760) && k == 1536) ||
-      ((m == 64 || m == 256 || m == 512 || m == 1024 || m == 4096 || m == 6889 || m == 9216 ||
-        m == 16384 || m == 27280) &&
-       k == 3072) ||
-      ((m == 64 || m == 256 || m == 512 || m == 1024) && k == 12288) ||
-      ((m == 512 || m == 7800 || m == 32760 || m == 75600) && k == 5120) ||
-      ((m == 7800 || m == 32760) && k == 8960) || (m == 7800 && k == 13824) ||
-      (m == 32760 && k == 13824) || (m == 75600 && k == 13824) || (m == 27280 && k == 14336) ||
-      (m == 73984 && k == 14336) || (m == 73984 && k == 7168) || (m == 61056 && k == 7168) ||
-      (m == 61056 && k == 14336) || (m == 82752 && k == 14336) || (m == 82752 && k == 7168) ||
-      (m == 537 && k == 5120) || (m == 537 && k == 7168) || (m == 537 && k == 5376) ||
-      (m == 537 && k == 14336) || (m == 1935 && k == 5376) || (m == 1935 && k == 5120) ||
-      (m == 1935 && k == 7168) || (m == 1935 && k == 14336) || (m == 6913 && k == 5120) ||
-      (m == 6913 && k == 5376) || (m == 6913 && k == 7168) || (m == 6913 && k == 14336) ||
-      ((m == 73984 || m == 61056 || m == 82752) && k == 5376) ||
-      ((m == 4096 || m == 6889 || m == 9216 || m == 16384) && k == 12288))
-      << "x must be one of the measured SM120 K12 shapes";
+  // Was a list of ~51 exact (M, K) pairs, kept in step by hand with the producer
+  // dispatcher and with SM120_FUSED_LINEAR_MK on the Python side. Those three
+  // copies drifted apart once, which is why the list existed -- but the drift
+  // was a consequence of writing the same fact down three times.
+  //
+  // The producer decides now. Every launcher validates its own preconditions and
+  // refuses with cudaErrorInvalidValue, and the status check below turns that
+  // into an error naming the shape. A shape nobody measured either runs or is
+  // refused by the thing that would have had to run it, rather than by a list of
+  // where the measurements happened to be taken.
   TVM_FFI_ICHECK_EQ(pqs.numel(), k) << "pqs must have k elements";
   TVM_FFI_ICHECK_GE(global_scale.numel(), 1) << "global_scale must contain at least one element";
   TVM_FFI_ICHECK_EQ(l2t_smoothed.ndim(), 2) << "l2t_smoothed must be [k, 32]";

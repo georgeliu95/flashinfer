@@ -2672,6 +2672,31 @@ inline cudaError_t launch_large_m_variant(int geometry_variant, void const* x,
 // Runtime-M/K entry. Geometry is still a template parameter -- shared memory and
 // every unroll constant come from it -- so this switch is over the ladder, not
 // over shapes. One instantiation per (geometry, LongK) serves every shape.
+// The instantiated candidate ladders, written once. `dyn`/`family` expand them
+// to dispatch; the default entry below expands the same lists to enumerate. They
+// mirror SM120_PRODUCER_GEOMETRY_LADDER / SM120_SMALL_M_TILING_LADDER in
+// flashinfer/gemm/svdquant_sm120_routes.py, which is what lets Python offer a
+// candidate this file can actually launch.
+#define FI_SVDQ_LARGE_M_GEOMETRIES(X) \
+  X(192, 16, 512)                     \
+  X(192, 32, 128)                     \
+  X(192, 48, 128)                     \
+  X(224, 48, 128)                     \
+  X(256, 32, 256)                     \
+  X(256, 80, 128)                     \
+  X(288, 80, 128)                     \
+  X(384, 32, 256)
+
+#define FI_SVDQ_SMALL_M_TILINGS(X) \
+  X(256, 16, 4)                    \
+  X(768, 8, 8)                     \
+  X(768, 16, 16)                   \
+  X(768, 32, 16)                   \
+  X(896, 16, 16)                   \
+  X(1024, 8, 4)                    \
+  X(1024, 8, 16)                   \
+  X(1024, 16, 16)
+
 inline cudaError_t nvfp4_smooth_quantize_lora_down_dyn_sm120(
     void const* x, void const* pre_quant_scale, float const* global_scale, void* xq, void* sf,
     void const* l2t_smoothed, void* down, int m, int k, int block_threads, int tile_m, int tile_k,
@@ -2696,14 +2721,7 @@ inline cudaError_t nvfp4_smooth_quantize_lora_down_dyn_sm120(
                : large_m::launch_large_m_dyn_kernel<BT, false, TM, TK, DynAddress::kRecompute>(    \
                      x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, m, k, stream);  \
   }
-  FI_SVDQ_DYN_CASE(192, 16, 512)
-  FI_SVDQ_DYN_CASE(192, 32, 128)
-  FI_SVDQ_DYN_CASE(192, 48, 128)
-  FI_SVDQ_DYN_CASE(224, 48, 128)
-  FI_SVDQ_DYN_CASE(256, 32, 256)
-  FI_SVDQ_DYN_CASE(256, 80, 128)
-  FI_SVDQ_DYN_CASE(288, 80, 128)
-  FI_SVDQ_DYN_CASE(384, 32, 256)
+  FI_SVDQ_LARGE_M_GEOMETRIES(FI_SVDQ_DYN_CASE)
 #undef FI_SVDQ_DYN_CASE
   return cudaErrorInvalidValue;
 }
@@ -2745,14 +2763,7 @@ inline cudaError_t nvfp4_smooth_quantize_lora_down_family_sm120(
     return small_m::launch_small_m_dyn_kernel<BT, DTC, RPQB>(                        \
         x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, m, k, stream); \
   }
-    FI_SVDQ_SMALL_CASE(256, 16, 4)
-    FI_SVDQ_SMALL_CASE(768, 8, 8)
-    FI_SVDQ_SMALL_CASE(768, 16, 16)
-    FI_SVDQ_SMALL_CASE(768, 32, 16)
-    FI_SVDQ_SMALL_CASE(896, 16, 16)
-    FI_SVDQ_SMALL_CASE(1024, 8, 4)
-    FI_SVDQ_SMALL_CASE(1024, 8, 16)
-    FI_SVDQ_SMALL_CASE(1024, 16, 16)
+    FI_SVDQ_SMALL_M_TILINGS(FI_SVDQ_SMALL_CASE)
 #undef FI_SVDQ_SMALL_CASE
     return cudaErrorInvalidValue;
   }
@@ -2765,399 +2776,40 @@ inline cudaError_t nvfp4_smooth_quantize_lora_down_sm120(
     void const* x, void const* pre_quant_scale, float const* global_scale, void* xq, void* sf,
     void const* l2t_smoothed, void* down, int m, int k, cudaStream_t stream,
     bool signal_m537_quant_ready = false, int geometry_variant = 0) {
-  namespace detail = smooth_quantize_lora_down_sm120_detail;
-  if (m == detail::kM && k == detail::kK) {
-    detail::nvfp4_smooth_quantize_lora_down_sm120_kernel<<<
-        detail::kQuantBlocks + detail::kDownBlocks, detail::kBlockThreads, 0, stream>>>(
-        static_cast<detail::quant::Type const*>(x),
-        static_cast<detail::quant::Type const*>(pre_quant_scale), global_scale,
-        static_cast<std::uint64_t*>(xq), static_cast<std::uint8_t*>(sf),
-        static_cast<detail::quant::Type const*>(l2t_smoothed),
-        static_cast<detail::quant::Type*>(down));
-    return cudaGetLastError();
-  }
-
-  namespace m512 = smooth_quantize_lora_down_m512_sm120_detail;
-  if (m == m512::kM) {
-    if (k == 3072) {
-      // The two-fragment N tile was accepted on the shared rows 0/28 producer:
-      // row28 crossed the complete-route Nsys kernel-sum gate, while row0 also
-      // improved and therefore does not require an N-aware routing seam.
-      return m512::launch_m512_kernel<3072, 256, 16>(x, pre_quant_scale, global_scale, xq, sf,
-                                                     l2t_smoothed, down, stream);
-    }
-  }
-
-  namespace small_m = smooth_quantize_lora_down_small_m_sm120_detail;
-  namespace large_m = smooth_quantize_lora_down_large_m_sm120_detail;
-  if (m == 32760 && k == 1536) {
-    return large_m::launch_large_m_variant<32760, 1536, 256, 32, 256>(
-        geometry_variant, x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, stream);
-  }
-
-  if ((m == 7800 || m == 32760 || m == 75600) && k == 5120) {
-    int const padded_m = (m + 127) / 128 * 128;
-    if (m == 7800) {
-      // Two independent cold-L2 Nsys sweeps favored this geometry while
-      // preserving bit-exact quantization and LoRA-down outputs.
-      constexpr int block_threads = 192;
-      constexpr int tile_m = 32;
-      constexpr int tile_k = 128;
-      int const grid_blocks = (padded_m + tile_m - 1) / tile_m;
-      large_m::launch_large_m_dyn_kernel<block_threads, false, tile_m, tile_k,
-                                         large_m::DynAddress::kRecompute>(
-          x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, 7800, 5120, stream);
-    } else if (m == 32760) {
-      constexpr int block_threads = 256;
-      constexpr int tile_m = 32;
-      constexpr int tile_k = 256;
-      int const grid_blocks = (padded_m + tile_m - 1) / tile_m;
-      large_m::launch_large_m_dyn_kernel<block_threads, false, tile_m, tile_k,
-                                         large_m::DynAddress::kRecompute>(
-          x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, 32760, 5120, stream);
-    } else {
-      int const grid_blocks = padded_m / large_m::kTileM;
-      large_m::launch_large_m_dyn_kernel<large_m::kBlockThreads, false, large_m::kTileM, 128,
-                                         large_m::DynAddress::kRecompute>(
-          x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, 75600, 5120, stream);
-    }
-    return cudaGetLastError();
-  }
-
-  if (m == 7800 && k == 8960) {
-    int const padded_m = (m + 127) / 128 * 128;
-    constexpr int tile_m = 80;
-    int const grid_blocks = (padded_m + tile_m - 1) / tile_m;
-    large_m::launch_large_m_dyn_kernel<large_m::kBlockThreads, true, large_m::kTileM, 128,
-                                       large_m::DynAddress::kRecompute>(
-        x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, 7800, 8960, stream);
-    return cudaGetLastError();
-  }
-
-  if (m == 32760 && k == 8960) {
-    int const padded_m = (m + 127) / 128 * 128;
-    constexpr int tile_m = 80;
-    int const grid_blocks = (padded_m + tile_m - 1) / tile_m;
-    large_m::launch_large_m_dyn_kernel<large_m::kBlockThreads, true, large_m::kTileM, 128,
-                                       large_m::DynAddress::kRecompute>(
-        x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, 32760, 8960, stream);
-    return cudaGetLastError();
-  }
-
-  if (m == 7800 && k == 13824) {
-    int const padded_m = (m + 127) / 128 * 128;
-    constexpr int tile_m = 80;
-    int const grid_blocks = (padded_m + tile_m - 1) / tile_m;
-    large_m::launch_large_m_dyn_kernel<288, true, 80, 128, large_m::DynAddress::kRecompute>(
-        x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, 7800, 13824, stream);
-    return cudaGetLastError();
-  }
-
-  if (m == 32760 && k == 13824) {
-    int const padded_m = (m + 127) / 128 * 128;
-    constexpr int tile_m = 80;
-    int const grid_blocks = (padded_m + tile_m - 1) / tile_m;
-    large_m::launch_large_m_dyn_kernel<large_m::kBlockThreads, true, large_m::kTileM, 128,
-                                       large_m::DynAddress::kRecompute>(
-        x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, 32760, 13824, stream);
-    return cudaGetLastError();
-  }
-
-  if (m == 75600 && k == 13824) {
-    int const padded_m = (m + 127) / 128 * 128;
-    constexpr int tile_m = 80;
-    int const grid_blocks = (padded_m + tile_m - 1) / tile_m;
-    large_m::launch_large_m_dyn_kernel<large_m::kBlockThreads, true, large_m::kTileM, 128,
-                                       large_m::DynAddress::kRecompute>(
-        x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, 75600, 13824, stream);
-    return cudaGetLastError();
-  }
-
-  if (m == 27280 && (k == 3072 || k == 14336)) {
-    int const padded_m = (m + 127) / 128 * 128;
-    if (k == 3072) {
-      constexpr int case6_tile_m = 32;
-      constexpr int case6_tile_k = 256;
-      constexpr int case6_block_threads = 256;
-      int const grid_blocks = (padded_m + case6_tile_m - 1) / case6_tile_m;
-      large_m::launch_large_m_dyn_kernel<case6_block_threads, false, case6_tile_m, case6_tile_k,
-                                         large_m::DynAddress::kRecompute>(
-          x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, 27280, 3072, stream);
-    } else {
-      constexpr int case7_tile_m = 32;
-      constexpr int case7_tile_k = 256;
-      constexpr int case7_block_threads = 384;
-      int const grid_blocks = (padded_m + case7_tile_m - 1) / case7_tile_m;
-      large_m::launch_large_m_dyn_kernel<case7_block_threads, true, case7_tile_m, case7_tile_k,
-                                         large_m::DynAddress::kRecompute>(
-          x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, 27280, 14336, stream);
-    }
-    return cudaGetLastError();
-  }
-
-  // Exact (73984, 14336) producer for MiniMax-H3 Omni row 52
-  // (73984 x 5376 x 14336). This is the only MiniMax-H3 shape whose K already
-  // carries an accepted producer geometry, so nothing here is extrapolated to a
-  // new K: the K matches the (27280, 14336) instance above, and the tile family
-  // is the K >= 8192 default that every proven large-M long-K case runs --
-  // (75600, 13824) and (32760, 13824) both at 256 threads with 80-row / 128-K
-  // tiles. Unlike those two, M is not a whole number of 80-row tiles
-  // (73984 % 80 == 64), so the final tile is partial and relies on the kernel's
-  // row guard; the 128-row SF padding is unaffected because 73984 % 128 == 0.
-  if (m == 73984 && k == 14336) {
-    return large_m::launch_large_m_variant<73984, 14336, 256, 80, 128>(
-        geometry_variant, x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, stream);
-  }
-
-  // Exact MiniMax-H3 row-50 producer retained after its direct and full-op
-  // gates. It shares rows 59 and 68's screened 32-row, 256-wide geometry while
-  // keeping admission exact to this M.
-  if (m == 73984 && k == 7168) {
-    return large_m::launch_large_m_variant<73984, 7168, 256, 32, 256>(
-        geometry_variant, x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, stream);
-  }
-
-  // Exact MiniMax-H3 row-61 producer retained after its direct and full-op gates.
-  if (m == 61056 && k == 14336) {
-    return large_m::launch_large_m_variant<61056, 14336, 256, 80, 128>(
-        geometry_variant, x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, stream);
-  }
-
-  // Exact MiniMax-H3 row-59 producer retained after its direct and full-op
-  // gates. It shares row 68's screened 32-row, 256-wide geometry while keeping
-  // admission exact to this M.
-  if (m == 61056 && k == 7168) {
-    return large_m::launch_large_m_variant<61056, 7168, 256, 32, 256>(
-        geometry_variant, x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, stream);
-  }
-
-  // Exact MiniMax-H3 row-70 producer retained after its direct and full-op gates.
-  if (m == 82752 && k == 14336) {
-    return large_m::launch_large_m_variant<82752, 14336, 256, 80, 128>(
-        geometry_variant, x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, stream);
-  }
-
-  // Exact MiniMax-H3 row-68 producer retained after its geometry and full-op
-  // gates. The 32x256 tile beat the short-K default 16x128 candidate.
-  if (m == 82752 && k == 7168) {
-    return large_m::launch_large_m_variant<82752, 7168, 256, 32, 256>(
-        geometry_variant, x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, stream);
-  }
-
-  // Bounded Batch-4 producer candidates. Each route is admitted only for its
-  // exact measured (M, K); full-pipeline tactic selection remains independent.
-  if (m == 537 && k == 5120) {
-    return small_m::launch_m537_mixed_kernel<5120, 1024, 24, 16, 8>(
-        x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, stream);
-  }
-  if (m == 537 && k == 7168) {
-    return small_m::launch_m537_mixed_kernel<7168, 1024, 24, 16, 8>(
-        x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, stream);
-  }
-  if (m == 537 && k == 5376) {
-    return small_m::launch_m537_mixed_kernel<5376, 1024, 24, 16, 8>(
-        x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, stream);
-  }
-  if (m == 1935 && k == 5120) {
-    return small_m::launch_small_m_dyn_kernel<256, 16, /*RowsPerQuantBlock=*/4>(
-        x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, 1935, 5120, stream);
-  }
-  if (m == 1935 && k == 7168) {
-    return small_m::launch_small_m_dyn_kernel<256, 16, /*RowsPerQuantBlock=*/4>(
-        x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, 1935, 7168, stream);
-  }
-  if (m == 1935 && k == 14336) {
-    // Row 57 is the only Batch-4 small-M shape on the large-M producer, and its
-    // 32-row tile leaves the grid at 2048/32 = 64 blocks -- a single partial
-    // wave on a 110-SM SM120 (110 SMs). The 16-row tile that doubles the grid to 128
-    // blocks was measured on SM120 (110 SMs) and refuted: 456.70 us against the 424.22
-    // us default. Each block streams the whole K x 32 LoRA-down matrix, so at
-    // K14336 doubling the grid doubles a 0.92 MB per-block re-read and costs
-    // more than the extra wave recovers. The geometry is retired, not disabled.
-    return large_m::launch_large_m_variant<1935, 14336, 384, 32, 256>(
-        geometry_variant, x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, stream);
-  }
-  if (m == 6913 && k == 5120) {
-    return large_m::launch_large_m_variant<6913, 5120, 192, 32, 128>(
-        geometry_variant, x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, stream);
-  }
-  if (m == 6913 && k == 5376) {
-    return large_m::launch_large_m_variant<6913, 5376, 192, 32, 128>(
-        geometry_variant, x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, stream);
-  }
-  if (m == 73984 && k == 5376) {
-    return large_m::launch_large_m_variant<73984, 5376, 256, 32, 256>(
-        geometry_variant, x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, stream);
-  }
-  if (m == 61056 && k == 5376) {
-    return large_m::launch_large_m_variant<61056, 5376, 256, 32, 256>(
-        geometry_variant, x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, stream);
-  }
-  if (m == 82752 && k == 5376) {
-    return large_m::launch_large_m_variant<82752, 5376, 256, 32, 256>(
-        geometry_variant, x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, stream);
-  }
-  if (m == 6913 && k == 7168) {
-    return large_m::launch_large_m_variant<6913, 7168, 256, 32, 256>(
-        geometry_variant, x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, stream);
-  }
-  if (m == 6913 && k == 14336) {
-    return large_m::launch_large_m_variant<6913, 14336, 384, 32, 256>(
-        geometry_variant, x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, stream);
-  }
-
-  // Exact K12288 producer for baseline rows 33/36/39/42
-  // (4096|6889|9216|16384 x 3072 x 12288). Both geometries are first bounded
-  // candidates copied from the nearest proven long-K neighbours -- 32-row/256-K
-  // tiles with 384 threads as on (27280, 14336), and 80-row/128-K tiles with
-  // 288 threads as on (7800, 13824). All four geometries passed the independent
-  // Nsys kernel-duration-sum gate before their Python production admission.
-  if (k == 12288) {
-    if (m == 4096) {
-      return large_m::launch_large_m_variant<4096, 12288, 384, 32, 256>(
-          geometry_variant, x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, stream);
-    }
-    if (m == 6889) {
-      return large_m::launch_large_m_variant<6889, 12288, 288, 80, 128>(
-          geometry_variant, x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, stream);
-    }
-    if (m == 9216) {
-      return large_m::launch_large_m_variant<9216, 12288, 288, 80, 128>(
-          geometry_variant, x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, stream);
-    }
-    if (m == 16384) {
-      return large_m::launch_large_m_variant<16384, 12288, 288, 80, 128>(
-          geometry_variant, x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, stream);
-    }
-  }
-
-  // Producers for six (M, K) prefixes that previously had none, so their shapes
-  // ran the unfused prefix -- a quantize kernel plus a separate rank-32
-  // torch.mm -- and streamed the activation twice.
+  // This was 399 lines of `if (m == A && k == B)`, each branch launching the
+  // producer that shape had been pinned to -- the last place a shape chose its
+  // own kernel. Choosing is the autotuner's job now: the fused route passes an
+  // explicit (family, tiling, address policy) that came from
+  // sm120_producer_variants(), and reaches the launchers through
+  // nvfp4_smooth_quantize_lora_down_family_sm120.
   //
-  // Neither the geometry nor the membership of this block is a judgement call.
-  // Every geometry the launch-seam static_asserts admit was enumerated offline,
-  // compiled, and timed under the campaign protocol (cold L2 flushed at 2x the
-  // device L2 before each launch, primary statistic = median of the fastest
-  // quintile, three repetitions), and each candidate was required to reproduce
-  // the cross-family reference: xq and sf byte-for-byte, `down` to within 1% of
-  // the output scale. The winner below is the fastest survivor; where the field
-  // ties within 0.5% the tie is broken away from BlockThreads == 160, because
-  // two candidates at that width -- one quantize warp -- pass every
-  // static_assert and still write wrong xq at K = 12288.
+  // What remains here is the entry for a caller with no opinion, and it forms
+  // one by asking rather than by naming shapes: every launcher validates its own
+  // preconditions and returns cudaErrorInvalidValue before it launches anything,
+  // so the first candidate that does not refuse is one this shape can run. The
+  // ladders come from the same lists the dispatch expands, so a candidate
+  // offered here is always a candidate that exists.
   //
-  // The six prefixes are exactly those where the fused producer beat the
-  // unfused prefix it replaces by more than 2%. Six further prefixes were
-  // swept and deliberately left out, because fusing them costs time rather
-  // than saving it: (4096, 3072) -10.6%, (1024, 3072) -15.8%, and the whole
-  // K12288 small-M group -- (64, 12288) -33.3%, (256, 12288) -21.7%,
-  // (512, 12288) -2.9%, (1024, 12288) -5.9%. Those shapes are launch-bound
-  // rather than bandwidth-bound, so collapsing two kernels into one costs more
-  // parallelism than it saves traffic.
-  //
-  //   (M, K)          prefix    fused producer   saved
-  //   (16384, 3072)   221.18       135.17 us    38.9%
-  //   (9216, 3072)    112.64        83.97 us    25.5%
-  //   (7800, 1536)     51.20        36.86 us    28.0%
-  //   (6889, 3072)     76.29        61.44 us    19.5%
-  //   (256, 3072)      15.04        10.27 us    31.7%
-  //   (512, 1536)      11.79        10.24 us    13.2%
-  if (k == 1536) {
-    if (m == 512) {
-      return small_m::launch_small_m_dyn_kernel<768, 32, 16>(
-          x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, 512, 1536, stream);
-    }
-    if (m == 7800) {
-      return large_m::launch_large_m_variant<7800, 1536, 224, 48, 128>(
-          geometry_variant, x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, stream);
-    }
+  // Row-major families only. The M537 family reads L2T prepacked; making it a
+  // default would hand it whatever layout an unopinionated caller happened to
+  // pass, which is silent when it is wrong. A caller that wants it names
+  // family 2.
+  (void)signal_m537_quant_ready;
+  (void)geometry_variant;
+#define FI_SVDQ_TRY(FAMILY, A, B, C)                                                            \
+  {                                                                                             \
+    cudaError_t const status = nvfp4_smooth_quantize_lora_down_family_sm120(                    \
+        x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, m, k, FAMILY, A, B, C, 0, \
+        stream);                                                                                \
+    if (status != cudaErrorInvalidValue) return status;                                         \
   }
-
-  if (k == 3072) {
-    if (m == 256) {
-      return small_m::launch_small_m_dyn_kernel<768, 8, 8>(x, pre_quant_scale, global_scale, xq, sf,
-                                                           l2t_smoothed, down, 256, 3072, stream);
-    }
-    if (m == 6889) {
-      return large_m::launch_large_m_variant<6889, 3072, 224, 48, 128>(
-          geometry_variant, x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, stream);
-    }
-    if (m == 9216) {
-      return large_m::launch_large_m_variant<9216, 3072, 192, 48, 128>(
-          geometry_variant, x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, stream);
-    }
-    if (m == 16384) {
-      return large_m::launch_large_m_variant<16384, 3072, 288, 80, 128>(
-          geometry_variant, x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, stream);
-    }
-    if (m == 1024) {
-      return small_m::launch_small_m_dyn_kernel<1024, 16, 16>(
-          x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, 1024, 3072, stream);
-    }
-    if (m == 4096) {
-      return large_m::launch_large_m_variant<4096, 3072, 384, 32, 256>(
-          geometry_variant, x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, stream);
-    }
-  }
-
-  // Producers for the remaining production prefixes. Unlike the block above,
-  // these are NOT here because fusing measured faster -- on every one of them
-  // it measured slower than the prefix the shape pays today, by 2.9% to 33.3%
-  // against the unfused prefix and by 11.1% to 55.6% against the cuBLASLt one
-  // (artifacts/producer-gap-20260822, full legal-geometry sweep, three
-  // repetitions). They are here so that the fused route exists everywhere and
-  // the choice belongs to the tuner rather than to this file: a shape with no
-  // producer has no fused candidate to measure, and a source-side "this one
-  // would lose" is exactly the kind of unchecked judgement that goes stale.
-  //
-  // Each geometry is the fastest survivor of its shape's full legal field under
-  // the campaign protocol, so what the tuner gets to reject is the best fused
-  // implementation available, not a strawman.
-  //
-  //   (M, K)          pays now   best fused producer
-  //   (4096, 3072)      48.13         51.20 us   unfused
-  //   (1024, 3072)      19.97         22.53 us   unfused
-  //   (1024, 12288)     52.22         55.30 us   unfused
-  //   (512, 12288)      35.84         36.86 us   unfused
-  //   (256, 12288)      23.04         28.67 us   unfused
-  //   (64, 12288)       15.36         20.48 us   unfused
-  //   (512, 5120)       17.94         20.48 us   cuBLASLt prefix
-  //   (537, 14336)      30.72         43.01 us   cuBLASLt prefix
-  //   (1935, 5376)      36.86         57.34 us   cuBLASLt prefix
-  if (k == 12288) {
-    if (m == 64) {
-      return small_m::launch_small_m_dyn_kernel<1024, 8, 4>(
-          x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, 64, 12288, stream);
-    }
-    if (m == 256) {
-      return small_m::launch_small_m_dyn_kernel<1024, 8, 16>(
-          x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, 256, 12288, stream);
-    }
-    if (m == 512) {
-      return small_m::launch_small_m_dyn_kernel<768, 16, 16>(
-          x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, 512, 12288, stream);
-    }
-    if (m == 1024) {
-      return large_m::launch_large_m_variant<1024, 12288, 192, 16, 512>(
-          geometry_variant, x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, stream);
-    }
-  }
-
-  if (m == 512 && k == 5120) {
-    return small_m::launch_small_m_dyn_kernel<1024, 16, 16>(
-        x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, 512, 5120, stream);
-  }
-
-  if (m == 537 && k == 14336) {
-    return small_m::launch_small_m_dyn_kernel<896, 16, 16>(x, pre_quant_scale, global_scale, xq, sf,
-                                                           l2t_smoothed, down, 537, 14336, stream);
-  }
-
-  if (m == 1935 && k == 5376) {
-    return small_m::launch_small_m_dyn_kernel<896, 16, 16>(x, pre_quant_scale, global_scale, xq, sf,
-                                                           l2t_smoothed, down, 1935, 5376, stream);
-  }
-
+#define FI_SVDQ_TRY_LARGE(BT, TM, TK) FI_SVDQ_TRY(0, BT, TM, TK)
+#define FI_SVDQ_TRY_SMALL(BT, DTC, RPQB) FI_SVDQ_TRY(1, BT, DTC, RPQB)
+  FI_SVDQ_LARGE_M_GEOMETRIES(FI_SVDQ_TRY_LARGE)
+  FI_SVDQ_SMALL_M_TILINGS(FI_SVDQ_TRY_SMALL)
+#undef FI_SVDQ_TRY_SMALL
+#undef FI_SVDQ_TRY_LARGE
+#undef FI_SVDQ_TRY
   return cudaErrorInvalidValue;
 }
 

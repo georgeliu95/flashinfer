@@ -220,62 +220,6 @@ def _producer_header() -> str:
     ).read_text()
 
 
-def _ffi_guard_shapes() -> set[tuple[int, int]]:
-    """Every exact (M, K) the fused-prefix FFI entry point will accept.
-
-    A third list, in a third language: ``nvfp4_quantize_smooth_lora_down_sm120_impl``
-    rejects anything outside it before the dispatcher is ever reached, so a
-    producer that exists and is admitted is still unreachable if this check does
-    not name it.
-    """
-    root = Path(__file__).resolve().parents[2]
-    source = (root / "csrc" / "nvfp4_smooth_quantize_sm100.cu").read_text()
-    # Anchored on a whitespace-tolerant pattern rather than a literal slice of
-    # the expression: where this condition wraps is clang-format's decision, not
-    # a contract, and it moved once already when the file was first formatted.
-    # What the test is actually about is which shapes the guard names.
-    head = re.search(r"TVM_FFI_ICHECK\(\s*\(\(m\s*==", source)
-    assert head is not None, "the SM120 K12 shape guard is no longer in the FFI source"
-    start = head.start()
-    end = source.index('<< "x must be one of the measured SM120 K12 shapes";', start)
-    guard = source[start:end]
-    shapes: set[tuple[int, int]] = set()
-    # Clauses are `(m == A [|| m == B ...]) && k == C`, wrapped and line-broken.
-    for clause in re.finditer(
-        r"((?:m\s*==\s*\d+\s*(?:\|\||\s)*)+?)\)?\s*&&\s*k\s*==\s*(\d+)", guard
-    ):
-        k = int(clause.group(2))
-        for m in re.findall(r"m\s*==\s*(\d+)", clause.group(1)):
-            shapes.add((int(m), k))
-    return shapes
-
-
-def test_the_ffi_guard_admits_exactly_the_compiled_producers() -> None:
-    # Given: the fused prefix is gated by three lists in three languages -- this
-    # FFI check, the C++ producer dispatcher, and the Python admission set.
-    # When: the FFI check is compared with the set of compiled producers.
-    # Then: they name the same shapes. Adding a producer and its Python
-    # admission while leaving this check alone produces a route the tuner will
-    # pick and the FFI will refuse, which is how the six swept producers first
-    # failed (artifacts/producer-gap-20260822).
-    guard = _ffi_guard_shapes()
-    unbacked = sorted(shape for shape in guard if not _has_native_producer(*shape))
-    assert unbacked == [], f"{unbacked} pass the FFI check but have no producer"
-    # The other direction. It used to read as "we compiled a producer for a
-    # shape the FFI will not admit", which was a real waste when producers were
-    # per-shape templates. Every legal (M, K) computes a geometry now, so that
-    # difference would be every shape outside the guard and would say nothing.
-    # Scoped to what this backend actually claims to support, the waste it
-    # guarded against is still a thing worth refusing.
-    claimed = set(SM120_FUSED_LINEAR_MK)
-    unreachable = sorted(
-        shape
-        for shape in claimed
-        if _has_native_producer(*shape) and shape not in guard
-    )
-    assert unreachable == [], f"{unreachable} have a producer the FFI check will reject"
-
-
 def test_every_fused_admission_has_a_prefix_that_can_run() -> None:
     # Given: admitting (M, K) to SM120_FUSED_LINEAR_MK offers the fused runner to
     # the tuner, and the fused route reaches its prefix in one of two ways -- a
@@ -288,7 +232,7 @@ def test_every_fused_admission_has_a_prefix_that_can_run() -> None:
     # had the prefix but no native producer. The prefix is a producer family now
     # and is offered exactly where the native families are, so a shape reachable
     # by one is reachable by the other and the ladder term has nothing to add.
-    reachable = {shape for shape in _ffi_guard_shapes() if _has_native_producer(*shape)}
+    reachable = {s for s in SM120_FUSED_LINEAR_MK if _has_native_producer(*s)}
     orphans = sorted(set(SM120_FUSED_LINEAR_MK) - reachable)
     assert orphans == [], (
         f"{orphans} are admitted to the fused route but have no native producer "
@@ -323,7 +267,9 @@ def test_swept_producers_are_admitted_and_route_native(m: int, k: int) -> None:
     # L2T layout, which belongs to the M537 mixed producer alone.
     assert (m, k) in SM120_FUSED_LINEAR_MK
     assert _has_native_producer(m, k)
-    assert (m, k) in _ffi_guard_shapes()
+    # Was `(m, k) in _ffi_guard_shapes()`. The FFI no longer carries a shape
+    # list; being runnable is being able to compute a producer geometry.
+    assert sm120_producer_variants(m, k)
     # "routes native and does not claim the packed L2T layout" used to be two
     # table lookups. The producer is chosen per tactic now, so the same claim is
     # made about the variants themselves: none of these shapes offers the M537
@@ -362,7 +308,9 @@ def test_prefixes_where_fusing_measured_slower_are_offered_anyway(
     # itself. The measured costs live beside each dispatcher entry.
     assert (m, k) in SM120_FUSED_LINEAR_MK
     assert _has_native_producer(m, k)
-    assert (m, k) in _ffi_guard_shapes()
+    # Was `(m, k) in _ffi_guard_shapes()`. The FFI no longer carries a shape
+    # list; being runnable is being able to compute a producer geometry.
+    assert sm120_producer_variants(m, k)
 
 
 def test_every_production_prefix_has_a_fused_producer() -> None:
@@ -379,7 +327,8 @@ def test_every_production_prefix_has_a_fused_producer() -> None:
     missing = sorted(p for p in prefixes if not _has_native_producer(*p))
     assert missing == [], f"{missing} have no fused producer"
     assert prefixes <= set(SM120_FUSED_LINEAR_MK)
-    assert prefixes <= _ffi_guard_shapes()
+    # Same: reachability is computed, not listed.
+    assert all(sm120_producer_variants(m, k) for m, k in prefixes)
 
 
 # --- the producer axis of a packed tactic ------------------------------------
