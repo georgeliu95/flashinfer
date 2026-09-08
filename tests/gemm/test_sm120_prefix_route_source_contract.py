@@ -32,7 +32,8 @@ _QUALIFIED = "flashinfer::gemm::svdquant_sm120_prefix_route::"
 _SF_VEC_SIZE = 16
 _RANK = 32
 _LARGE_M_DOWN_WARPS = _RANK // 8
-_SM120_110SM_SM_COUNT = 110
+# One wave on the SM count both SM120 parts in use here happen to have.
+_ONE_WAVE_SM_COUNT = 110
 
 
 def _large_m_geometry(m: int, k: int, block_threads: int, tile_m: int, tile_k: int):
@@ -66,14 +67,14 @@ def test_row57_producer_underfill_was_real_but_not_the_cause(
     expected_blocks: int,
 ) -> None:
     # Given: the underfill hypothesis for row 57 -- a 32-row tile leaves 64 blocks
-    # on a 110-SM device -- was arithmetically sound and still lost by 7.7%.
+    # on a 110-SM device -- was arithmetically sound and still lost.
     # When: both geometries are re-derived from the producer launch contract.
     # Then: each is legal and only the 16-row tile fills the device, which pins
     # the refutation to the K14336 per-block LoRA-down re-read, not to legality.
     grid_blocks, shared_bytes = _large_m_geometry(1935, 14336, 384, tile_m, 256)
     assert grid_blocks == expected_blocks
     assert shared_bytes <= 48 * 1024
-    assert (grid_blocks >= _SM120_110SM_SM_COUNT) is (tile_m == 16)
+    assert (grid_blocks >= _ONE_WAVE_SM_COUNT) is (tile_m == 16)
 
 
 def test_row57_is_the_only_underfilled_batch4_producer_grid() -> None:
@@ -90,6 +91,7 @@ def test_row57_is_the_only_underfilled_batch4_producer_grid() -> None:
             (6913, 7168, 256, 32, 256),
             (6913, 14336, 384, 32, 256),
         )
-        if _large_m_geometry(m, k, block_threads, tile_m, tile_k)[0] < _SM120_110SM_SM_COUNT
+        if _large_m_geometry(m, k, block_threads, tile_m, tile_k)[0]
+        < _ONE_WAVE_SM_COUNT
     }
     assert underfilled == {(1935, 14336)}
