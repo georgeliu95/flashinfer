@@ -87,7 +87,7 @@ def test_the_two_formerly_pinned_problems_keep_their_fused_admission() -> None:
     # admission separately from SM120_FUSED_LINEAR_MK.
     # When: the pins are deleted.
     # Then: their prefix has to survive in the admission set on its own, or the
-    # tuner sees only Sm120CutlassLinearRunner for both -- measured at 19% on
+    # tuner sees only Sm120CutlassLinearRunner for both -- measured slower on
     # 32760x1536x1536.
     assert (32760, 1536) in SM120_FUSED_LINEAR_MK
 
@@ -128,8 +128,7 @@ def test_no_module_ships_a_shape_keyed_tactic_table() -> None:
     # Given: a tactic is a measurement of one kernel on one device, and the only
     # thing entitled to produce one is the tuner. A cache is fine; a source
     # literal is not, because nothing re-checks it and nothing dates it. One went
-    # stale by 4.02% and was found only by measuring the whole candidate field
-    # (artifacts/selector-metric-20260821).
+    # stale and was found only by measuring the whole candidate field.
     # When: every module of the gemm package is parsed.
     # Then: no module-level mapping is keyed by an exact (M, N, K, rank) problem,
     # which is the shape such a table has to have to be looked up at dispatch.
@@ -261,7 +260,7 @@ def test_every_native_producer_is_admitted() -> None:
 def test_swept_producers_are_admitted_and_route_native(m: int, k: int) -> None:
     # Given: six prefixes gained a producer because a full sweep of the legal
     # launch geometries measured the fused producer beating the unfused prefix
-    # by 13.2% to 38.9% (artifacts/producer-gap-20260822).
+    # by a measured margin.
     # When: each is resolved through the manifest.
     # Then: it is admitted, it routes native, and it does not claim the packed
     # L2T layout, which belongs to the M537 mixed producer alone.
@@ -298,8 +297,8 @@ def test_prefixes_where_fusing_measured_slower_are_offered_anyway(
     m: int, k: int
 ) -> None:
     # Given: the sweep measured these prefixes too, and on every one the fused
-    # producer was SLOWER than the prefix the shape pays today -- 2.9% to 33.3%
-    # against the unfused prefix, 11.1% to 55.6% against the cuBLASLt one.
+    # producer was SLOWER than the prefix the shape pays today, against both
+    # the unfused prefix and the cuBLASLt one.
     # When: the manifest is checked.
     # Then: they are present regardless. Whether a candidate is worth running is
     # a measurement, and the only thing entitled to make it is the tuner; a

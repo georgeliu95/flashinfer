@@ -294,7 +294,7 @@ def test_sm120_budget_prunes_nothing_over_the_frozen_matrix():
     """On a real card the budget is not a de-facto shape table.
 
     Measured over all 71 frozen shapes at rank 32 with the candidate plane
-    unpruned (artifacts/wsprobe, SM120 (156 SMs)), the widest workspace any tactic
+    unpruned, the widest workspace any tactic
     asks for is 8.86 GiB. A quarter of either SM120 card in use clears that, so
     every implementable tactic on every frozen shape reaches the autotuner and
     the tuner -- not this bound -- decides which one runs.
@@ -305,9 +305,9 @@ def test_sm120_budget_prunes_nothing_over_the_frozen_matrix():
     widest_measured = 8.86 * 1024**3
     frac = svdquant_sm120_cutlass._SM120_WORKSPACE_BUDGET_FRACTION
     for card_bytes in (
-        73415 * 1024**2,  # SM120 (110 SMs)
+        73415 * 1024**2,  # the smaller SM120 part
         85651 * 1024**2,
-    ):  # SM120 (156 SMs)
+    ):  # the larger SM120 part
         assert card_bytes * frac > widest_measured
 
 

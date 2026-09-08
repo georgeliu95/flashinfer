@@ -31,7 +31,7 @@ SM120_TACTIC_ABI_VERSION: Final = 3
 # The cost of getting that wrong is recorded in
 # test_sm120_linear_op_name_keeps_v5_for_every_other_shape: an earlier global
 # bump made every unrelated shape miss its record and re-profile, and one such
-# re-tune picked a slower tactic and regressed that shape by 8.47%.
+# re-tune picked a slower tactic and regressed that shape.
 SM120_LINEAR_ROUTE_ABI_VERSION: Final = 5
 
 # A route version changes only when the runner set for that exact (M, K, rank)
@@ -116,8 +116,8 @@ SM120_PRODUCER_GEOMETRY_LADDER: Final[tuple[tuple[int, int, int], ...]] = (
 )
 
 # How the runtime row offset is formed. Both are built; which one is faster is a
-# property of the geometry -- accumulating wins by 13% on (224, 48, 128) and
-# loses 10% on (192, 32, 128) -- so the tuner picks, on the device it is running
+# property of the geometry -- accumulating wins on some and loses on others --
+# so the tuner picks, on the device it is running
 # on.
 SM120_ADDRESS_POLICIES: Final[tuple[int, ...]] = (0, 1)  # 0 recompute, 1 accumulate
 
@@ -325,8 +325,7 @@ PrefixRouteKey: TypeAlias = tuple[int, int]
 # LoRA-down matrix while the cuBLASLt prefix consumes the row-major one; the
 # packed layout below is chosen from the effective route, not from the shape.
 #
-# Every alternate rung this ladder once carried was measured on SM120 (110 SMs) in
-# round 2 and refuted, so each shape now admits only its measured default. The
+# Every alternate rung this ladder once carried was measured and refuted, so each shape now admits only its measured default. The
 # C++ header records the per-rung medians. The table is retained for the
 # gate/layout reconciliation, not as a live A/B instrument.
 
@@ -363,9 +362,8 @@ PrefixRouteKey: TypeAlias = tuple[int, int]
 # ORDER IS ABI -- see the same note on kGeometryLadder in the header.
 
 # Budget, not a judgement: every admitted geometry is another instantiation in a
-# single translation unit and another candidate the tuner profiles. Measured on
-# SM120 (110 SMs), raising this from 1 to 4 took that unit from 6.9 s to 11.9 s to
-# compile and its object from 700 KB to 1058 KB.
+# single translation unit and another candidate the tuner profiles. Raising this
+# from 1 to 4 measurably lengthens that unit's compile and grows its object.
 
 # The geometry each exact large-M shape is pinned to today, which is always
 # variant 0 so an unselected shape runs what it has always run.
@@ -394,8 +392,8 @@ SM120_FUSED_LINEAR_MK: Final[frozenset[tuple[int, int]]] = frozenset(
         # because they carried a pinned tactic, whose prefixes were unioned in
         # separately. Admission is route data, not a measured preference, so it
         # stays behind when the pins go. Without it the tuner sees only
-        # Sm120CutlassLinearRunner for these two, which cost 19% on
-        # 32760x1536x1536 when measured (artifacts/stage0-exposure-20260821).
+        # Sm120CutlassLinearRunner for these two, which measured slower on
+        # 32760x1536x1536.
         (32760, 1536),
         (32760, 5120),
         (32760, 8960),
@@ -428,7 +426,7 @@ SM120_FUSED_LINEAR_MK: Final[frozenset[tuple[int, int]]] = frozenset(
         # Prefixes whose native producer was added after a full sweep of the
         # legal launch geometries showed the fused producer beating the unfused
         # prefix -- a quantize kernel plus a separate rank-32 torch.mm, which
-        # streams the activation twice -- by 13.2% to 38.9%. The six further
+        # streams the activation twice. The six further
         # prefixes swept alongside these are deliberately absent: fusing them
         # measured slower, so admitting them would cost time. The dispatcher
         # entries and the full measured table live in

@@ -75,7 +75,7 @@ def gen_gemm_sm120_module_cutlass_nvfp4_svdquant(
     releases the overlay stage before the epilogue, and folds the rank-32 bf16
     LoRA product into each epilogue subtile's accumulator block inside the
     store loop instead of serially before it. Bit-identical to the serial
-    path; measured to recover 13-29% of the serialized tail on many-wave
+    path; measured to recover part of the serialized tail on many-wave
     shapes (the balance is genuine issue-bound compute) with no regression
     beyond noise anywhere. ``lora_epi_overlap=False`` builds the serial-tail
     fallback variant. The other variant flags keep the serial path (the

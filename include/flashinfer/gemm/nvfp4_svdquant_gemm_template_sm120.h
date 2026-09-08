@@ -487,7 +487,7 @@ using Tactic64x32x256SwapStaticConfig =
     SvdquantGemmConfigSm120<Shape<_64, _32, _256>, true, cutlass::gemm::StaticPersistentScheduler>;
 
 // Row 81: static K3 sibling of the legacy 256x128x128 swap kernel for the
-// 105-tile M537,N5376 grid. It fits the 110-SM SM120 (110 SMs) in one wave, where the
+// 105-tile M537,N5376 grid. It fits a 110-SM part in one wave, where the
 // static scheduler avoids the persistent scheduler-response protocol.
 // Profitability is restricted to the two measured K shapes by Python.
 #if defined(SVDQ_SM120_STATIC_SCHED)

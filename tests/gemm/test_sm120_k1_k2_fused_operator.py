@@ -189,7 +189,7 @@ def test_sm120_jit_module_exports_fused_k1_k2_operator() -> None:
         (32760, 13824),
         (75600, 13824),
         (27280, 14336),
-        # Producers added from the geometry sweep (artifacts/producer-gap-20260822).
+        # Producers added from the geometry sweep.
         # Two of them are the first small_m instantiations at these M, and one is
         # the first large_m instantiation at 48-row tiles, so the equivalence is
         # not implied by any neighbour already listed above.
@@ -288,7 +288,7 @@ def test_sm120_fused_k1_k2_matches_unfused_outputs(m: int, k: int) -> None:
     # (9216x3072 and 16384x3072), while the fused producer sits at 55.5-55.7 dB
     # on every shape. Comparing the two directly therefore reports the
     # reference's accuracy at exactly the shapes where it is worst, which is how
-    # two correct producers first failed here (artifacts/producer-gap-20260822).
+    # two correct producers first failed here.
     # An FP32 GEMM with TF32 off lands 126-140 dB from FP64 on these shapes --
     # 70 dB clear of what is being measured -- so it can stand in for FP64,
     # which would be far too slow at 75600x13824.
@@ -666,7 +666,7 @@ def test_sm120_k12288_large_m_writes_every_output_byte(m: int, k: int) -> None:
         (4096, 12416),
         # (16384, 3072) used to stand here as the "same M, different K" case.
         # It now has its own swept producer, so the same coverage moves to a K
-        # that still has none (artifacts/producer-gap-20260822).
+        # that still has none.
         (16384, 6144),
     ),
 )
@@ -955,7 +955,7 @@ def test_sm120_m32760_k1536_has_exact_production_admission() -> None:
     _assert_launch_geometry_is_computed(retained_launch)
     # (7800, 1536) and (512, 1536) used to be named here as prefixes this
     # admission must not generalize to. They have since earned producers of
-    # their own by measurement (artifacts/producer-gap-20260822), so what is
+    # their own by measurement, so what is
     # asserted now is that each K1536 prefix carries its own launch rather than
     # sharing 32760's.
     # One runtime launcher serves every (M, K) now, so "carries its own launch"
@@ -977,8 +977,8 @@ def test_sm120_m32760_k1536_has_exact_production_admission() -> None:
 
     # This prefix reached the fused runner only through the pinned-prefix union
     # while the pins existed. It is stated in SM120_FUSED_LINEAR_MK now, because
-    # without it the tuner sees only the unfused runner here and loses 19%
-    # (artifacts/stage0-exposure-20260821).
+    # without it the tuner sees only the unfused runner here and measures
+    # slower.
     assert (32760, 1536) in svdquant_sm120_cutlass._SM120_FUSED_LINEAR_MK
     assert svdquant_sm120_cutlass._sm120_fused_linear_supported(32760, 1536, 32)
     # Admission is not the route namespace: this shape still keys on the base
@@ -1515,8 +1515,8 @@ def test_sm120_h3_row52_admission_is_exactly_one_shape() -> None:
     _assert_admission_tracks_the_ladder(82751, _H3_ROW52_K, _H3_ROW52_RANK)
     # Not one K but three. 5376 and 7168 are MiniMax-H3 shapes whose fused
     # producer the geometry sweep measured as a win over the unfused prefix
-    # (artifacts/producer-gap-20260822; the swept-producer tests in
-    # test_svdquant_sm120_routes.py assert the same set and cite the numbers).
+    # (the swept-producer tests in test_svdquant_sm120_routes.py assert the
+    # same set).
     # "Exact" is about the admission being keyed on the (M, K) pair and not
     # generalising -- so the K set is pinned outright, and a K nobody measured
     # stays out.
@@ -1553,8 +1553,8 @@ def test_sm120_h3_row61_admission_is_exactly_one_new_shape() -> None:
     _assert_admission_tracks_the_ladder(82751, _H3_ROW52_K, _H3_ROW52_RANK)
     # Not one K but three. 5376 and 7168 are MiniMax-H3 shapes whose fused
     # producer the geometry sweep measured as a win over the unfused prefix
-    # (artifacts/producer-gap-20260822; the swept-producer tests in
-    # test_svdquant_sm120_routes.py assert the same set and cite the numbers).
+    # (the swept-producer tests in test_svdquant_sm120_routes.py assert the
+    # same set).
     # "Exact" is about the admission being keyed on the (M, K) pair and not
     # generalising -- so the K set is pinned outright, and a K nobody measured
     # stays out.
@@ -1591,8 +1591,8 @@ def test_sm120_h3_row70_admission_is_exactly_one_new_shape() -> None:
         _assert_admission_tracks_the_ladder(m, _H3_ROW52_K, _H3_ROW52_RANK)
     # Not one K but three. 5376 and 7168 are MiniMax-H3 shapes whose fused
     # producer the geometry sweep measured as a win over the unfused prefix
-    # (artifacts/producer-gap-20260822; the swept-producer tests in
-    # test_svdquant_sm120_routes.py assert the same set and cite the numbers).
+    # (the swept-producer tests in test_svdquant_sm120_routes.py assert the
+    # same set).
     # "Exact" is about the admission being keyed on the (M, K) pair and not
     # generalising -- so the K set is pinned outright, and a K nobody measured
     # stays out.
@@ -1627,7 +1627,7 @@ def test_sm120_h3_routes_bump_abi_only_where_the_runner_set_changed() -> None:
     fused runner existed. The bump is scoped to those six routes: a global bump
     stranded the retained v5 winner of every unrelated shape and
     forced a re-tune, one of which selected a slower tactic and regressed its
-    shape 8.47%. The tactic encoding is unchanged because no tactic id moved.
+    shape. The tactic encoding is unchanged because no tactic id moved.
     """
     assert (
         svdquant_sm120_cutlass._sm120_linear_route_abi_version(
@@ -2102,7 +2102,7 @@ def test_sm120_h3_combined_k12_k3_matches_separate_at_a_fixed_k3_tactic(
     # which is ~1.48 GiB per cast and peaks at three such buffers (~4.4 GiB)
     # while the squared difference is allocated. The chunked global scale adds
     # ~0.12 GiB. That is ~10.7 GiB peak, so gate at 14 GiB -- still practical on
-    # a 73 GiB SM120 (110 SMs), with room for allocator fragmentation.
+    # the smaller of the two SM120 parts, with room for allocator fragmentation.
     _skip_unless_free_device_memory(14 * 1024**3)
 
     n, rank = _H3_ROW52_N, _H3_ROW52_RANK
@@ -2256,7 +2256,7 @@ def _cublaslt_producer_args(m: int, k: int):
 
 
 def test_sm120_m537_cublaslt_down_matches_generic_prefix() -> None:
-    """SM120 (110 SMs)-only acceptance for row 44's cuBLASLt LoRA-down path."""
+    """Acceptance for row 44's cuBLASLt LoRA-down path."""
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0):
         pytest.skip("requires SM120")
     if torch.cuda.get_device_properties(0).multi_processor_count < 105:

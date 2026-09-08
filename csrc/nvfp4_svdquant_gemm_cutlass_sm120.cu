@@ -445,7 +445,7 @@ LoraDownCublasLtState& lora_down_cublaslt_state(int device_id, int m, int k) {
         << "failed to query cuBLASLt heuristic for SM120 LoRA-down";
     TVM_FFI_ICHECK_GT(returned_results, 0) << "cuBLASLt returned no heuristic for SM120 LoRA-down";
     // CTK 13.2 returns eight candidates for the admitted M537 and M1935
-    // problems. Cold-L2 sweeps on SM120 (110 SMs) select the candidates below
+    // problems. Cold-L2 sweeps select the candidates below
     // independently for each exact (M, K); keep every other shape on
     // cuBLASLt's first-ranked result.
     int heuristic_index = 0;

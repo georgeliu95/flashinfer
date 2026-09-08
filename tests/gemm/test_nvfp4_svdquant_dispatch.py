@@ -430,8 +430,8 @@ def test_sm120_candidate_set_carries_no_shape_fitted_pruning(monkeypatch):
     tile count for Split-K, `m <= 8192` for raster/swizzle, a one-wave envelope
     for the static-scheduler rows. Every one of those numbers was measured on a
     single SM120 card and then applied to every SM120 card, and the filter's own
-    docstring priced its benefit at -0.33% to +0.44% with mixed signs, inside
-    the measurement floor. It bought scan time, and scan time is not a cost we
+    docstring priced its benefit as mixed in sign and inside the measurement
+    floor. It bought scan time, and scan time is not a cost we
     are paying for.
 
     The bound that replaced it reads the card, not the shape. So on a card that
@@ -615,7 +615,7 @@ def test_sm120_linear_op_name_keeps_v5_for_every_other_shape(m, k, rank):
     """Shapes whose runner set did not change must reach their retained winners.
 
     A global bump made every unrelated shape miss its v5 record and re-profile;
-    one such re-tune picked a slower tactic and regressed the shape 8.47%.
+    one such re-tune picked a slower tactic and regressed the shape.
     """
     assert _sm120_linear_op_name_in_use(m, k, rank).endswith("routes_v5_tactics_v3")
 
@@ -758,8 +758,8 @@ def test_sm120_linear_always_reaches_the_tuner(monkeypatch, m, n, k):
 
     Both of these used to be dispatched straight to nvfp4_svdquant_linear_sm120
     with a tactic read out of a source table, so the tuner never saw them and
-    nothing ever re-checked the value. One such value measured 4.02% off the
-    best candidate in its own field (artifacts/selector-metric-20260821). The
+    nothing ever re-checked the value. One such value measured off the best
+    candidate in its own field. The
     contract now is that every SM120 linear shape is selected, and the only
     thing that may produce a tactic is the tuner.
     """
