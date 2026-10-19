@@ -1138,7 +1138,7 @@ def svdquant_linear(
         backend == "auto"
         and get_compute_capability(x.device) == (12, 0)
         and l2t_smoothed.ndim == 2
-        and l2t_smoothed.shape[1] in (32, 64)
+        and l2t_smoothed.shape[1] in (32, 64, 128)
     ):
         from .svdquant_sm120_auto import linear_auto
 

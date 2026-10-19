@@ -941,10 +941,10 @@ def svdquant_linear(
     m, k = x.shape if x.ndim == 2 else (-1, -1)
     n = weight_fp4.shape[0] if weight_fp4.ndim == 2 else -1
     rank = l2t_smoothed.shape[1] if l2t_smoothed.ndim == 2 else -1
-    if rank not in (32, 64):
+    if rank not in (32, 64, 128):
         raise ValueError(
             "the SM120 CUTLASS SVDQuant linear backend supports LoRA ranks "
-            f"32 and 64, got {rank}"
+            f"32, 64 and 128, got {rank}"
         )
 
     if m == 0:
