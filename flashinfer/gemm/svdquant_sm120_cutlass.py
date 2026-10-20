@@ -213,7 +213,7 @@ def _sm120_fused_linear_supported(m: int, k: int, rank: int) -> bool:
     as a candidate instead of being excluded by a list, and the tuner drops it
     if it loses.
     """
-    if rank not in (32, 64):
+    if rank not in (32, 64, 128):
         return False
     return bool(_sm120_producer_variants(m, k, rank))
 
