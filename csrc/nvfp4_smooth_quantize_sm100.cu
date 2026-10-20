@@ -264,6 +264,39 @@ void nvfp4_quantize_smooth_lora_down_dyn_sm120(TensorView x, TensorView pqs,
                                                  false);
 }
 
+#if defined(SVDQ_SM120_OCC_EXPERIMENT)
+// EXPERIMENT ONLY: occupancy sweep of the rank-128 large-M producer.
+// variant: 0 = 384x80x128 minBlocks 1, 1 = 384x48x128 minBlocks 1,
+//          2 = 384x48x128 minBlocks 2, 3 = 384x48x128 minBlocks 3.
+void nvfp4_quantize_smooth_lora_down_occ_experiment_sm120(TensorView x, TensorView pqs,
+                                                         TensorView global_scale,
+                                                         TensorView l2t_smoothed, TensorView xq,
+                                                         TensorView sf, TensorView down,
+                                                         int variant, int pad_smem) {
+  check_sm120_prefix_inputs(x, pqs, global_scale, l2t_smoothed, xq, sf, down);
+  int const m = static_cast<int>(x.size(0));
+  int const k = static_cast<int>(x.size(1));
+  namespace lm = flashinfer::gemm::smooth_quantize_lora_down_large_m_sm120_detail;
+  cudaStream_t stream = get_stream(x.device());
+  void const* a[] = {x.data_ptr(), pqs.data_ptr(), l2t_smoothed.data_ptr()};
+  auto const* gs = static_cast<float const*>(global_scale.data_ptr());
+  cudaError_t status = cudaErrorInvalidValue;
+  switch (variant) {
+    case 0: status = lm::launch_large_m_occ_experiment<384, 80, 128, kSm120PrefixRank, 1>(
+                a[0], a[1], gs, xq.data_ptr(), sf.data_ptr(), a[2], down.data_ptr(), m, k, pad_smem, stream); break;
+    case 1: status = lm::launch_large_m_occ_experiment<384, 48, 128, kSm120PrefixRank, 1>(
+                a[0], a[1], gs, xq.data_ptr(), sf.data_ptr(), a[2], down.data_ptr(), m, k, pad_smem, stream); break;
+    case 2: status = lm::launch_large_m_occ_experiment<384, 48, 128, kSm120PrefixRank, 2>(
+                a[0], a[1], gs, xq.data_ptr(), sf.data_ptr(), a[2], down.data_ptr(), m, k, pad_smem, stream); break;
+    case 3: status = lm::launch_large_m_occ_experiment<384, 48, 128, kSm120PrefixRank, 3>(
+                a[0], a[1], gs, xq.data_ptr(), sf.data_ptr(), a[2], down.data_ptr(), m, k, pad_smem, stream); break;
+    default: break;
+  }
+  TVM_FFI_ICHECK_EQ(status, cudaSuccess)
+      << "occ experiment launch failed: " << cudaGetErrorString(status);
+}
+#endif
+
 void nvfp4_quantize_smooth_lora_down_overlap_sm120(TensorView x, TensorView pqs,
                                                    TensorView global_scale, TensorView l2t_smoothed,
                                                    TensorView xq, TensorView sf, TensorView down) {
@@ -279,6 +312,10 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(nvfp4_quantize_smooth, torch_ext::nvfp4_quantize_s
 #if defined(FLASHINFER_ENABLE_SVDQ_SM120_K1_K2_FUSION)
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(nvfp4_svdquant_pack_l2t_sm120,
                               torch_ext::nvfp4_svdquant_pack_l2t_sm120);
+#if defined(SVDQ_SM120_OCC_EXPERIMENT)
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(nvfp4_quantize_smooth_lora_down_occ_experiment_sm120,
+                              torch_ext::nvfp4_quantize_smooth_lora_down_occ_experiment_sm120);
+#endif
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(nvfp4_quantize_smooth_lora_down_dyn_sm120,
                               torch_ext::nvfp4_quantize_smooth_lora_down_dyn_sm120);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(nvfp4_quantize_smooth_lora_down_sm120,

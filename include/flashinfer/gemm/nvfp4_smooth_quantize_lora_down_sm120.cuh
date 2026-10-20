@@ -634,9 +634,9 @@ __device__ __forceinline__ void copy_pre_quant_scale_tile_async_dyn(
 }
 
 template <int BlockThreads, bool LongK, int KernelTileM, int KernelTileK = 128,
-          DynAddress Policy = DynAddress::kRecompute, int Rank = 32>
+          DynAddress Policy = DynAddress::kRecompute, int Rank = 32, int MinBlocks = 1>
 __global__
-__launch_bounds__(BlockThreads) void nvfp4_smooth_quantize_lora_down_large_m_dyn_sm120_kernel(
+__launch_bounds__(BlockThreads, MinBlocks) void nvfp4_smooth_quantize_lora_down_large_m_dyn_sm120_kernel(
     quant::Type const* __restrict__ x, quant::Type const* __restrict__ pre_quant_scale,
     float const* __restrict__ global_scale, std::uint64_t* __restrict__ xq,
     std::uint8_t* __restrict__ sf, quant::Type const* __restrict__ l2t_smoothed,
@@ -1038,6 +1038,35 @@ inline cudaError_t launch_large_m_dyn_kernel(void const* x, void const* pre_quan
     return cudaGetLastError();
   }
 }
+
+#if defined(SVDQ_SM120_OCC_EXPERIMENT)
+// EXPERIMENT ONLY (occupancy sweep): same kernel, ptxas minBlocks and an unused
+// dynamic shared-memory pad to cap resident CTAs per SM, carveout forced to max.
+template <int BlockThreads, int TileM, int TileK, int Rank, int MinBlocks>
+inline cudaError_t launch_large_m_occ_experiment(void const* x, void const* pre_quant_scale,
+                                                 float const* global_scale, void* xq, void* sf,
+                                                 void const* l2t_smoothed, void* down, int m,
+                                                 int k, int pad_smem, cudaStream_t stream) {
+  static_assert((TileM * (TileK / quant::SF_VEC_SIZE)) %
+                    (BlockThreads - large_m_down_warps(Rank) * 32) == 0,
+                "quantize work must divide across the quantize threads");
+  if (k >= 8192 || k % TileK != 0) return cudaErrorInvalidValue;
+  auto kernel = nvfp4_smooth_quantize_lora_down_large_m_dyn_sm120_kernel<
+      BlockThreads, false, TileM, TileK, DynAddress::kRecompute, Rank, MinBlocks>;
+  cudaError_t status =
+      cudaFuncSetAttribute(kernel, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+  if (status != cudaSuccess) return status;
+  status = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, pad_smem);
+  if (status != cudaSuccess) return status;
+  int const padded_m = (m + 127) / 128 * 128;
+  int const grid_blocks = (padded_m + TileM - 1) / TileM;
+  kernel<<<grid_blocks, BlockThreads, pad_smem, stream>>>(
+      static_cast<quant::Type const*>(x), static_cast<quant::Type const*>(pre_quant_scale),
+      global_scale, static_cast<std::uint64_t*>(xq), static_cast<std::uint8_t*>(sf),
+      static_cast<quant::Type const*>(l2t_smoothed), static_cast<quant::Type*>(down), m, k);
+  return cudaGetLastError();
+}
+#endif
 
 }  // namespace smooth_quantize_lora_down_large_m_sm120_detail
 

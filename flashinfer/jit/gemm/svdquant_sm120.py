@@ -56,6 +56,9 @@ def gen_gemm_sm120_module_cutlass_nvfp4_svdquant(lora_rank: int = 32) -> JitSpec
         supported_major_versions=[12]
     )
     rank_flags = [f"-DSVDQ_SM120_LORA_RANK={lora_rank}"] if lora_rank != 32 else []
+    # EXPERIMENT ONLY: occupancy sweep entry point (separate cache dir required).
+    if os.environ.get("SVDQ_SM120_OCC_EXPERIMENT"):
+        rank_flags.append("-DSVDQ_SM120_OCC_EXPERIMENT")
     return gen_jit_spec(
         f"nvfp4_svdquant_gemm_cutlass_sm120{variant}",
         source_paths,
