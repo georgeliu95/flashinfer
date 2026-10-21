@@ -33,6 +33,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -811,6 +812,12 @@ void run_tactic_impl(RuntimeTacticSm120 const& rt, void* out, void const* A, voi
   args.epilogue.thread.bias_ptr = static_cast<OutElementType const*>(bias);
 
   apply_runtime_scheduler_args<Config>(rt, args.scheduler);
+#if defined(SVDQ_WS_ABLATIONS)
+  // EXPERIMENT ONLY: cap the persistent grid to SVDQ_GEMM_SM_CAP SMs (SM-partition probe).
+  if (char const* cap = std::getenv("SVDQ_GEMM_SM_CAP")) {
+    args.hw_info.sm_count = std::atoi(cap);
+  }
+#endif
 
   Gemm gemm;
   size_t const gemmWorkspaceBytes = gemm.get_workspace_size(args);

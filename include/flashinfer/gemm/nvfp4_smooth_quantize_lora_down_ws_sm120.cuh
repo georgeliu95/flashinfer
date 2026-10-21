@@ -50,6 +50,8 @@
 
 #include <cstdint>
 
+#include <cstdlib>
+
 #include "flashinfer/gemm/nvfp4_smooth_quantize_sm100.cuh"
 
 namespace flashinfer::gemm {
@@ -683,8 +685,12 @@ inline cudaError_t launch_ws_kernel(void const* x, void const* pre_quant_scale,
     if (grid_mode != 0 && grid_mode != 1 && !(grid_mode == 2 && MinBlocks > 1)) {
       return cudaErrorInvalidValue;
     }
-    int const sms = ws_device_sm_count();
+    int sms = ws_device_sm_count();
     if (sms <= 0) return cudaErrorInvalidValue;
+#if defined(SVDQ_WS_ABLATIONS)
+    // EXPERIMENT ONLY: cap the persistent grid to SVDQ_PREFIX_SM_CAP SMs (SM-partition probe).
+    if (char const* cap = std::getenv("SVDQ_PREFIX_SM_CAP")) sms = std::atoi(cap);
+#endif
     int const padded_m = (m + 127) / 128 * 128;
     int const units = padded_m / 16;
     int grid = grid_mode == 0 ? sms : (padded_m + TileM - 1) / TileM;
