@@ -170,8 +170,11 @@ __device__ __forceinline__ void mma_bf16_16816(float* d, std::uint32_t a0, std::
 // QuantWarps quantize, the last DownWarpsM * DownWarpsN compute LoRA-down
 // (each owning TileM / DownWarpsM rows and Rank / DownWarpsN columns).
 template <int TileM_, int TileK_, int Stages_, int QuantWarps_, int DownWarpsM_, int DownWarpsN_,
-          bool WithDown_>
+          bool WithDown_, bool ReadOnly_ = false>
 struct WsConfig {
+  // EXPERIMENT ONLY (SVDQ_WS_ABLATIONS): quantize warps read the x/pqs stage but
+  // skip quantization and every xq/sf store, giving the x-stream floor.
+  static constexpr bool kReadOnly = ReadOnly_;
   static constexpr int kTileM = TileM_;
   static constexpr int kTileK = TileK_;
   static constexpr int kStages = Stages_;
@@ -307,6 +310,7 @@ __global__ void __launch_bounds__(Cfg::kThreads, 1)
     int const qthread = thread - 32;
     float const scale = global_scale[0];
     int const sf_cols = K / quant::SF_VEC_SIZE;
+    [[maybe_unused]] std::uint32_t read_only_sink = 0;
     int it = 0;
     for (int chunk = row_begin; chunk < row_end; chunk += kTileM) {
       int const chunk_rows = min(kTileM, row_end - chunk);
@@ -318,6 +322,26 @@ __global__ void __launch_bounds__(Cfg::kThreads, 1)
         std::uint8_t const* const stage = stage_base + s * Cfg::kStageBytes;
         quant::Type const* const pqs_tile =
             reinterpret_cast<quant::Type const*>(stage + Cfg::kXBytes + Cfg::kBBytes);
+        if constexpr (Cfg::kReadOnly) {
+          // Same smem reads as the quantize path, no quantization, no stores.
+          for (int item = qthread; item < items; item += kQuantThreads) {
+            int const group = item / chunk_rows;
+            int const r = item - group * chunk_rows;
+            std::uint8_t const* const sub_tile = stage + group * Cfg::kXSubBytes;
+#pragma unroll
+            for (int b = 0; b < kSfPerItem; ++b) {
+              int const col = (group * kSfPerItem + b) * quant::SF_VEC_SIZE;
+              int const chunk16 = (col % 64) / 8;
+              uint4 const v0 = *reinterpret_cast<uint4 const*>(sub_tile + swz128(r, chunk16));
+              uint4 const v1 = *reinterpret_cast<uint4 const*>(sub_tile + swz128(r, chunk16 + 1));
+              uint4 const v2 = *reinterpret_cast<uint4 const*>(pqs_tile + col);
+              read_only_sink ^= v0.x ^ v0.y ^ v0.z ^ v0.w ^ v1.x ^ v1.y ^ v1.z ^ v1.w ^ v2.x ^ v2.w;
+            }
+          }
+          __syncwarp();
+          if (lane == 0) mbar_arrive(&empty_bar[s]);
+          continue;
+        }
         for (int item = qthread; item < items; item += kQuantThreads) {
           // Row-fastest: consecutive threads read consecutive rows of one
           // sub-tile (distinct swizzle phases, conflict-free 16-byte reads).
@@ -366,6 +390,10 @@ __global__ void __launch_bounds__(Cfg::kThreads, 1)
         __syncwarp();
         if (lane == 0) mbar_arrive(&empty_bar[s]);
       }
+    }
+    if constexpr (Cfg::kReadOnly) {
+      // Keep the loads live: a store that the data never actually triggers.
+      if (read_only_sink == 0x9e3779b9u) reinterpret_cast<std::uint32_t*>(sf)[0] = read_only_sink;
     }
   } else if constexpr (Cfg::kWithDown) {
     // ---------------------------------------------------------------- down
@@ -509,12 +537,12 @@ inline int ws_device_sm_count() {
 // grid_mode 0: one CTA per SM (capped by the 16-row units); 1: as many CTAs as
 // TileM chunks, capped by the SM count.
 template <int TileM, int TileK, int Stages, int QuantWarps, int DownWarpsM, int DownWarpsN,
-          bool WithDown>
+          bool WithDown, bool ReadOnly = false>
 inline cudaError_t launch_ws_kernel(void const* x, void const* pre_quant_scale,
                                     float const* global_scale, void* xq, void* sf,
                                     void const* l2t_kmajor, void* down, int m, int k,
                                     int grid_mode, cudaStream_t stream) {
-  using Cfg = WsConfig<TileM, TileK, Stages, QuantWarps, DownWarpsM, DownWarpsN, WithDown>;
+  using Cfg = WsConfig<TileM, TileK, Stages, QuantWarps, DownWarpsM, DownWarpsN, WithDown, ReadOnly>;
   if constexpr (Cfg::kSmemBytes > 99 * 1024) {
     return cudaErrorInvalidValue;
   } else {
@@ -586,12 +614,31 @@ inline cudaError_t nvfp4_smooth_quantize_lora_down_ws_rank128_sm120(
   // grid_mode bit 0x100 (SVDQ_WS_ABLATIONS builds only) runs the quantize-only
   // ablation: no B copies, no down warps, down left unwritten.
   bool const quant_only = (grid_mode & 0x100) != 0;
+  [[maybe_unused]] bool const read_only = (grid_mode & 0x2000) != 0;
   grid_mode &= 0xff;
 #if defined(SVDQ_WS_ABLATIONS)
+  // Ablation-only tilings (quantize-only / read-only; no B tile in the stage, so
+  // wider x stages fit): 96x128x2 and 96x256x1, 6 quantize warps.
+#define FI_SVDQ_WS_ABL_ONLY(TM, TK, ST, QW)                                                     \
+  if (quant_only && tile_m == (TM) && tile_k == (TK) && stages == (ST) && quant_warps == (QW)) { \
+    return read_only ? ws::launch_ws_kernel<TM, TK, ST, QW, 1, 1, false, true>(                 \
+                           x, pre_quant_scale, global_scale, xq, sf, l2t_kmajor, down, m, k,    \
+                           grid_mode, stream)                                                   \
+                     : ws::launch_ws_kernel<TM, TK, ST, QW, 1, 1, false, false>(                \
+                           x, pre_quant_scale, global_scale, xq, sf, l2t_kmajor, down, m, k,    \
+                           grid_mode, stream);                                                  \
+  }
+  FI_SVDQ_WS_ABL_ONLY(96, 128, 2, 6)
+  FI_SVDQ_WS_ABL_ONLY(96, 256, 1, 6)
+#undef FI_SVDQ_WS_ABL_ONLY
 #define FI_SVDQ_WS_QUANT_ONLY(TM, TK, ST, QW, DM, DN)                                           \
   if (quant_only) {                                                                           \
-    return ws::launch_ws_kernel<TM, TK, ST, QW, DM, DN, false>(                               \
-        x, pre_quant_scale, global_scale, xq, sf, l2t_kmajor, down, m, k, grid_mode, stream); \
+    return read_only ? ws::launch_ws_kernel<TM, TK, ST, QW, DM, DN, false, true>(             \
+                           x, pre_quant_scale, global_scale, xq, sf, l2t_kmajor, down, m, k,  \
+                           grid_mode, stream)                                                 \
+                     : ws::launch_ws_kernel<TM, TK, ST, QW, DM, DN, false>(                   \
+                           x, pre_quant_scale, global_scale, xq, sf, l2t_kmajor, down, m, k,  \
+                           grid_mode, stream);                                                \
   }
 #else
   if (quant_only) return cudaErrorInvalidValue;

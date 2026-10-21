@@ -56,6 +56,11 @@ def gen_gemm_sm120_module_cutlass_nvfp4_svdquant(lora_rank: int = 32) -> JitSpec
         supported_major_versions=[12]
     )
     rank_flags = [f"-DSVDQ_SM120_LORA_RANK={lora_rank}"] if lora_rank != 32 else []
+    # EXPERIMENT ONLY: ws prefix ablation kernels. Read at build *and* load time,
+    # so the flag lands in build.ninja and a later load cannot silently rebuild
+    # the module without it. Use a dedicated FLASHINFER_WORKSPACE_BASE.
+    if lora_rank == 128 and os.environ.get("SVDQ_SM120_WS_ABLATIONS"):
+        rank_flags.append("-DSVDQ_WS_ABLATIONS")
     return gen_jit_spec(
         f"nvfp4_svdquant_gemm_cutlass_sm120{variant}",
         source_paths,
