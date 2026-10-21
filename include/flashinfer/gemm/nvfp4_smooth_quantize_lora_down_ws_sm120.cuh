@@ -170,8 +170,10 @@ __device__ __forceinline__ void mma_bf16_16816(float* d, std::uint32_t a0, std::
 // QuantWarps quantize, the last DownWarpsM * DownWarpsN compute LoRA-down
 // (each owning TileM / DownWarpsM rows and Rank / DownWarpsN columns).
 template <int TileM_, int TileK_, int Stages_, int QuantWarps_, int DownWarpsM_, int DownWarpsN_,
-          bool WithDown_, bool ReadOnly_ = false, bool GroupFastest_ = false>
+          bool WithDown_, bool ReadOnly_ = false, bool GroupFastest_ = false, int MinBlocks_ = 1>
 struct WsConfig {
+  // EXPERIMENT ONLY: resident CTAs per SM requested from ptxas (grid mode 2).
+  static constexpr int kMinBlocks = MinBlocks_;
   // EXPERIMENT ONLY: consecutive threads take consecutive SF groups of one row
   // (coalesced xq stores) instead of consecutive rows of one group.
   static constexpr bool kGroupFastest = GroupFastest_;
@@ -219,7 +221,7 @@ struct WsConfig {
 };
 
 template <class Cfg>
-__global__ void __launch_bounds__(Cfg::kThreads, 1)
+__global__ void __launch_bounds__(Cfg::kThreads, Cfg::kMinBlocks)
     nvfp4_smooth_quantize_lora_down_ws_sm120_kernel(
         __grid_constant__ CUtensorMap const x_map, __grid_constant__ CUtensorMap const b_map,
         quant::Type const* __restrict__ pre_quant_scale, float const* __restrict__ global_scale,
@@ -540,13 +542,13 @@ inline int ws_device_sm_count() {
 // grid_mode 0: one CTA per SM (capped by the 16-row units); 1: as many CTAs as
 // TileM chunks, capped by the SM count.
 template <int TileM, int TileK, int Stages, int QuantWarps, int DownWarpsM, int DownWarpsN,
-          bool WithDown, bool ReadOnly = false, bool GroupFastest = false>
+          bool WithDown, bool ReadOnly = false, bool GroupFastest = false, int MinBlocks = 1>
 inline cudaError_t launch_ws_kernel(void const* x, void const* pre_quant_scale,
                                     float const* global_scale, void* xq, void* sf,
                                     void const* l2t_kmajor, void* down, int m, int k,
                                     int grid_mode, cudaStream_t stream) {
   using Cfg = WsConfig<TileM, TileK, Stages, QuantWarps, DownWarpsM, DownWarpsN, WithDown, ReadOnly,
-                       GroupFastest>;
+                       GroupFastest, MinBlocks>;
   if constexpr (Cfg::kSmemBytes > 99 * 1024) {
     return cudaErrorInvalidValue;
   } else {
@@ -554,13 +556,18 @@ inline cudaError_t launch_ws_kernel(void const* x, void const* pre_quant_scale,
     if (m <= 0 || k <= 0 || k % TileK != 0 || k % 64 != 0 || m > (1 << 30)) {
       return cudaErrorInvalidValue;
     }
-    if (grid_mode != 0 && grid_mode != 1) return cudaErrorInvalidValue;
+    // grid mode 2 (EXPERIMENT ONLY): MinBlocks CTAs per SM.
+    if (grid_mode != 0 && grid_mode != 1 && !(grid_mode == 2 && MinBlocks > 1)) {
+      return cudaErrorInvalidValue;
+    }
     int const sms = ws_device_sm_count();
     if (sms <= 0) return cudaErrorInvalidValue;
     int const padded_m = (m + 127) / 128 * 128;
     int const units = padded_m / 16;
     int grid = grid_mode == 0 ? sms : (padded_m + TileM - 1) / TileM;
-    grid = grid < sms ? grid : sms;
+    int const max_grid = grid_mode == 2 ? MinBlocks * sms : sms;
+    if (grid_mode == 2) grid = max_grid;
+    grid = grid < max_grid ? grid : max_grid;
     grid = grid < units ? grid : units;
     CUtensorMap x_map;
     CUtensorMap b_map;
@@ -643,6 +650,21 @@ inline cudaError_t nvfp4_smooth_quantize_lora_down_ws_rank128_sm120(
     return ws::launch_ws_kernel<160, 128, 2, 10, 1, 1, false, false, true>(
         x, pre_quant_scale, global_scale, xq, sf, l2t_kmajor, down, m, k, grid_mode, stream);
   }
+  if (quant_only && grid_mode == 2) {
+#define FI_SVDQ_WS_ABL_2CTA(TM, TK, ST, QW)                                                     \
+  if (tile_m == (TM) && tile_k == (TK) && stages == (ST) && quant_warps == (QW)) {             \
+    return ws::launch_ws_kernel<TM, TK, ST, QW, 1, 1, false, false, false, 2>(                 \
+        x, pre_quant_scale, global_scale, xq, sf, l2t_kmajor, down, m, k, grid_mode, stream);  \
+  }
+    FI_SVDQ_WS_ABL_2CTA(64, 128, 2, 4)
+    FI_SVDQ_WS_ABL_2CTA(64, 128, 2, 8)
+    FI_SVDQ_WS_ABL_2CTA(96, 64, 2, 6)
+#undef FI_SVDQ_WS_ABL_2CTA
+    return cudaErrorInvalidValue;
+  }
+  FI_SVDQ_WS_ABL_ONLY(64, 128, 2, 4)
+  FI_SVDQ_WS_ABL_ONLY(64, 128, 2, 8)
+  FI_SVDQ_WS_ABL_ONLY(96, 64, 2, 6)
   FI_SVDQ_WS_ABL_ONLY(96, 256, 1, 6)
   FI_SVDQ_WS_ABL_ONLY(96, 128, 3, 6)
   FI_SVDQ_WS_ABL_ONLY(64, 128, 4, 4)
