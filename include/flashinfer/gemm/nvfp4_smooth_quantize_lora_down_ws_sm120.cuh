@@ -761,6 +761,22 @@ inline cudaError_t nvfp4_smooth_quantize_lora_down_ws_rank128_sm120(
 #if defined(SVDQ_WS_ABLATIONS)
   // Ablation-only tilings (quantize-only / read-only; no B tile in the stage, so
   // wider x stages fit): 96x128x2 and 96x256x1, 6 quantize warps.
+  if (!quant_only && x_policy != 0) {
+#define FI_SVDQ_WS_ABL_FULL_XPOL(TM, TK, ST, QW, DL, XP)                                        \
+  if (tile_m == (TM) && tile_k == (TK) && stages == (ST) && quant_warps == (QW) &&             \
+      layout == (DL) && x_policy == (XP)) {                                                    \
+    return ws::launch_ws_kernel<TM, TK, ST, QW, (DL) == 2 ? 1 : 2, (DL) == 0 ? 4 : 8, true,     \
+                                false, false, 1, 0, XP>(x, pre_quant_scale, global_scale, xq,  \
+                                                        sf, l2t_kmajor, down, m, k, grid_mode, \
+                                                        stream);                               \
+  }
+    FI_SVDQ_WS_ABL_FULL_XPOL(160, 64, 2, 5, 1, 1)
+    FI_SVDQ_WS_ABL_FULL_XPOL(160, 64, 2, 5, 1, 2)
+    FI_SVDQ_WS_ABL_FULL_XPOL(128, 64, 2, 4, 0, 1)
+    FI_SVDQ_WS_ABL_FULL_XPOL(128, 64, 2, 4, 0, 2)
+#undef FI_SVDQ_WS_ABL_FULL_XPOL
+    return cudaErrorInvalidValue;
+  }
   if (quant_only && x_policy != 0) {
 #define FI_SVDQ_WS_ABL_XPOL(SA, XP)                                                             \
   if (tile_m == 96 && tile_k == 128 && stages == 2 && quant_warps == 6 && store_abl == (SA) &&  \
