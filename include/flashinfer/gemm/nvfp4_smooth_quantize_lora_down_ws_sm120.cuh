@@ -629,6 +629,10 @@ inline cudaError_t nvfp4_smooth_quantize_lora_down_ws_rank128_sm120(
                            grid_mode, stream);                                                  \
   }
   FI_SVDQ_WS_ABL_ONLY(96, 128, 2, 6)
+  FI_SVDQ_WS_ABL_ONLY(96, 128, 2, 12)
+  FI_SVDQ_WS_ABL_ONLY(96, 128, 2, 16)
+  FI_SVDQ_WS_ABL_ONLY(96, 128, 2, 24)
+  FI_SVDQ_WS_ABL_ONLY(96, 128, 2, 31)
   FI_SVDQ_WS_ABL_ONLY(96, 256, 1, 6)
 #undef FI_SVDQ_WS_ABL_ONLY
 #define FI_SVDQ_WS_QUANT_ONLY(TM, TK, ST, QW, DM, DN)                                           \
