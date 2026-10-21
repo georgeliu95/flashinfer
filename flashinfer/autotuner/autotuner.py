@@ -525,6 +525,17 @@ class TuningConfig:
             lane views in the reusable A/B profiling arenas. Their contents are
             staged once per profile even when they are not value-aware. Shared
             read-only tensors may be omitted and retain one pointer.
+        finalist_rounds (int): After the single pass over every tactic, re-time
+            the finalists -- tactics within ``finalist_margin`` of the fastest,
+            at most ``finalist_max`` -- in this many interleaved rounds and pick
+            the lowest median across rounds. ``0`` (default) keeps the single
+            pass. Use it for operations long and heavy enough to hit the power
+            limit: the clock then moves between steady levels over seconds, and
+            a single sequential pass ranks tactics by the clock level each one
+            happened to be timed at rather than by their own speed.
+        finalist_margin (float): Relative slowdown from the first-pass best
+            within which a tactic is a finalist.
+        finalist_max (int): Maximum number of finalists, fastest first.
     """
 
     dynamic_tensor_specs: tuple[DynamicTensorSpec, ...] = ()
@@ -537,6 +548,9 @@ class TuningConfig:
     use_cold_l2_graph_replay: bool = False
     value_aware_input_indices: tuple[int, ...] = ()
     profile_arena_input_indices: tuple[int, ...] = ()
+    finalist_rounds: int = 0
+    finalist_margin: float = 0.05
+    finalist_max: int = 6
     # Optional callback invoked once per profile bucket, after dynamic
     # tensors are synthesized but before the per-tactic profile loop.
     # Receives the full list of tensors and returns a (possibly modified)
@@ -2434,6 +2448,7 @@ class AutoTuner:
                         # Initialize runner and tactic as None in case of no valid tactic or runners are found
                         runner_id, tactic = None, None
                         skipped_count = 0
+                        first_pass: list[tuple[float, int, Any]] = []
                         for r_id, r in enumerate(runners):
                             runner_preparation_oom = False
                             try:
@@ -2554,6 +2569,7 @@ class AutoTuner:
                                     # Set time_measured to inf to notify the failure of the tactic. This can happen when `get_valid_tactics` mistakenly return wrong tactics
                                     # or some runtime error occurs during profiling.
                                     time_measured = float("inf")
+                                first_pass.append((time_measured, r_id, tac))
                                 if time_measured < min_time:
                                     min_time = time_measured
                                     runner_id, tactic = r_id, tac
@@ -2562,6 +2578,20 @@ class AutoTuner:
                             logger.info(
                                 f"[Autotuner]: Skipped {skipped_count} unsupported tactic(s) for {custom_op} "
                                 f"(enable debug logs to see details)"
+                            )
+
+                        if (
+                            runner_id is not None
+                            and tuning_config.finalist_rounds > 0
+                        ):
+                            runner_id, tactic = self._rerank_finalists(
+                                runners,
+                                tensors,
+                                prepared_input_batches,
+                                tuning_config,
+                                first_pass,
+                                (runner_id, tactic),
+                                **kwargs,
                             )
 
                         if runner_id is not None:
@@ -2633,6 +2663,74 @@ class AutoTuner:
             )
 
             return runners[runner_id], tactic
+
+    def _rerank_finalists(
+        self,
+        runners: list[TunableRunner],
+        tensors: list[Any],
+        input_batches: list[list[Any]],
+        tuning_config: TuningConfig,
+        first_pass: list[tuple[float, int, Any]],
+        first_pass_best: tuple[int, Any],
+        **kwargs,
+    ) -> tuple[int, Any]:
+        """Re-time the first-pass finalists in interleaved rounds.
+
+        Every round times each finalist once, in the same order, so a clock
+        level change between rounds moves all of them alike; the winner has the
+        lowest median over rounds. A finalist that fails in a later round drops
+        out; if all do, the first-pass best stands.
+        """
+        measured = sorted(
+            (item for item in first_pass if item[0] < float("inf")),
+            key=lambda item: item[0],
+        )
+        if not measured:
+            return first_pass_best
+        limit = measured[0][0] * (1.0 + tuning_config.finalist_margin)
+        finalists = [
+            (r_id, tac) for t, r_id, tac in measured if t <= limit
+        ][: max(1, tuning_config.finalist_max)]
+        if len(finalists) < 2:
+            return first_pass_best
+        samples: dict[int, list[float] | None] = {i: [] for i in range(len(finalists))}
+        for _ in range(tuning_config.finalist_rounds):
+            for i, (r_id, tac) in enumerate(finalists):
+                times = samples[i]
+                if times is None:
+                    continue
+                try:
+                    times.append(
+                        self._profile_single_kernel(
+                            runners[r_id],
+                            tensors,
+                            tac,
+                            tuning_config,
+                            input_tensor_batches=input_batches,
+                            **kwargs,
+                        )
+                    )
+                except Exception as e:
+                    logger.debug(
+                        f"[Autotuner]: Dropping finalist {runners[r_id]} {tac}: {e}"
+                    )
+                    samples[i] = None
+        scored = [
+            (statistics.median(times), i)
+            for i, times in samples.items()
+            if times
+        ]
+        if not scored:
+            return first_pass_best
+        best = min(scored)[1]
+        logger.debug(
+            "[Autotuner]: finalist medians "
+            + ", ".join(
+                f"{runners[finalists[i][0]]}:{finalists[i][1]}={t:.4f}"
+                for t, i in sorted(scored)
+            )
+        )
+        return finalists[best]
 
     def _discard_profile_cache(
         self, custom_op, runners, input_shapes, tuning_config, inputs
@@ -3456,7 +3554,7 @@ class AutoTuner:
     @staticmethod
     def _profiling_policy(tuning_config: TuningConfig) -> tuple:
         """Return measurement provenance that can change tactic ranking."""
-        return (
+        policy: tuple = (
             "cuda_graph_profile_replays",
             (
                 int(tuning_config.cuda_graph_profile_replays)
@@ -3466,6 +3564,18 @@ class AutoTuner:
             "l2_cache_policy",
             "cold" if tuning_config.use_cold_l2_cache else "hot",
         )
+        # Appended only when enabled, so every single-pass policy (and every
+        # record persisted under one) is unchanged.
+        if tuning_config.finalist_rounds > 0:
+            policy += (
+                "finalists",
+                (
+                    int(tuning_config.finalist_rounds),
+                    float(tuning_config.finalist_margin),
+                    int(tuning_config.finalist_max),
+                ),
+            )
+        return policy
 
     @staticmethod
     def _default_profiling_policy(tuning_config: TuningConfig) -> tuple:

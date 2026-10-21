@@ -5,6 +5,7 @@ CUTLASS/Cake and SM12x CuTe DSL, plus the explicit SM120 CUTLASS backend.
 Host dispatch, JIT, workspace and compiled guard tests live in the companion
 ``test_nvfp4_svdquant_host.py`` module."""
 
+import gc
 import math
 import re
 import unittest
@@ -2136,6 +2137,60 @@ def test_sm120_m537_l2t_pack_handles_inference_tensor_mutation(k: int) -> None:
     assert torch.equal(first, torch.zeros_like(first))
     assert torch.equal(updated, torch.ones_like(updated))
     assert updated is not first
+
+
+def _clear_prepared_l2t() -> None:
+    svdquant_sm120_cutlass._SM120_PREPARED_L2T.clear()
+    svdquant_sm120_cutlass._SM120_KMAJOR_L2T_CACHE.clear()
+    svdquant_sm120_cutlass._SM120_M537_PACKED_L2T_CACHE.clear()
+
+
+def test_sm120_prepared_kmajor_l2t_serves_inference_tensors() -> None:
+    _clear_prepared_l2t()
+    try:
+        with torch.inference_mode():
+            source = torch.arange(3072 * 128, dtype=torch.float32).reshape(3072, 128)
+            svdquant_sm120_cutlass.prepare_sm120_l2t(source)
+            first = svdquant_sm120_cutlass._cached_sm120_kmajor_l2t(source)
+            assert svdquant_sm120_cutlass._cached_sm120_kmajor_l2t(source) is first
+        assert torch.equal(first, svdquant_sm120_cutlass._pack_sm120_kmajor_l2t(source))
+        # Unprepared inference tensors keep repacking on every call.
+        with torch.inference_mode():
+            other = torch.zeros((3072, 128))
+            a = svdquant_sm120_cutlass._cached_sm120_kmajor_l2t(other)
+            assert svdquant_sm120_cutlass._cached_sm120_kmajor_l2t(other) is not a
+    finally:
+        _clear_prepared_l2t()
+
+
+def test_sm120_prepared_l2t_invalidates_on_mutation_and_release() -> None:
+    _clear_prepared_l2t()
+    try:
+        source = torch.zeros((5120, 32), dtype=torch.int32)
+        svdquant_sm120_cutlass.prepare_sm120_l2t(source)
+        prepared = svdquant_sm120_cutlass._cached_sm120_m537_l2t(source)
+        assert prepared is svdquant_sm120_cutlass._SM120_PREPARED_L2T[
+            svdquant_sm120_cutlass._prepared_l2t_key(source)
+        ][2]["m537"]
+        source.add_(1)
+        mutated = svdquant_sm120_cutlass._cached_sm120_m537_l2t(source)
+        assert mutated is not prepared
+        assert torch.equal(mutated, svdquant_sm120_cutlass._pack_sm120_m537_l2t(source))
+        del source, prepared, mutated
+        gc.collect()
+        assert not svdquant_sm120_cutlass._SM120_PREPARED_L2T
+    finally:
+        _clear_prepared_l2t()
+
+
+def test_sm120_prepare_l2t_skips_layouts_no_producer_reads() -> None:
+    _clear_prepared_l2t()
+    try:
+        source = torch.zeros((3072, 64))
+        svdquant_sm120_cutlass.prepare_sm120_l2t(source)
+        assert not svdquant_sm120_cutlass._SM120_PREPARED_L2T
+    finally:
+        _clear_prepared_l2t()
 
 
 def test_sm120_jit_module_exports_fused_k1_k2_operator() -> None:
@@ -5007,11 +5062,13 @@ def _run_prefix(inputs: list[torch.Tensor], *, dynamic: bool) -> None:
         (0, (64 * 3072,), "x must be 2-D"),
         (1, (1,), "pqs must have k elements"),
         (2, (0,), "global_scale must contain at least one element"),
-        (3, (1, 32), r"l2t_smoothed must be \[k, 32\]"),
+        # A wrong leading dimension fails the row check, which names the rank
+        # generically; only a wrong rank names the compiled rank.
+        (3, (1, 32), r"l2t_smoothed must be \[k, rank\]"),
         (3, (3072, 16), r"l2t_smoothed must be \[k, 32\]"),
         (4, (64, 1), r"xq must be \[m, k/2\]"),
         (5, (1,), "sf is smaller than"),
-        (6, (1, 32), r"down must be \[m, 32\]"),
+        (6, (1, 32), r"down must be \[m, rank\]"),
     ),
 )
 def test_prefix_rejects_invalid_shapes_before_launch(
