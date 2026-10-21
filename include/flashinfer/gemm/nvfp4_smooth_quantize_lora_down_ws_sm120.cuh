@@ -112,6 +112,12 @@ __device__ __forceinline__ std::uint64_t make_l2_policy_evict_first() {
   return policy;
 }
 
+__device__ __forceinline__ std::uint64_t make_l2_policy_evict_normal() {
+  std::uint64_t policy;
+  asm volatile("createpolicy.fractional.L2::evict_normal.b64 %0, 1.0;\n" : "=l"(policy));
+  return policy;
+}
+
 __device__ __forceinline__ std::uint64_t make_l2_policy_evict_last() {
   std::uint64_t policy;
   asm volatile("createpolicy.fractional.L2::evict_last.b64 %0, 1.0;\n" : "=l"(policy));
@@ -127,6 +133,35 @@ __device__ __forceinline__ void bulk_copy_g2s(void* dst, void const* src, std::u
       :
       : "r"(smem_u32(dst)), "l"(src), "r"(bytes), "r"(smem_u32(bar)), "l"(policy)
       : "memory");
+}
+
+// Shared -> global 2-D TMA store of one box, tracked by the issuing thread's
+// bulk async-group.
+__device__ __forceinline__ void tma_store_2d(CUtensorMap const* map, void const* src, int c0,
+                                             int c1) {
+  asm volatile(
+      "cp.async.bulk.tensor.2d.global.shared::cta.bulk_group [%0, {%1, %2}], [%3];\n"
+      :
+      : "l"(reinterpret_cast<std::uint64_t>(map)), "r"(c0), "r"(c1), "r"(smem_u32(src))
+      : "memory");
+}
+
+__device__ __forceinline__ void bulk_commit_group() {
+  asm volatile("cp.async.bulk.commit_group;\n" ::: "memory");
+}
+
+// Waits until every committed bulk store of this thread has finished reading
+// shared memory.
+__device__ __forceinline__ void bulk_wait_group_read0() {
+  asm volatile("cp.async.bulk.wait_group.read 0;\n" ::: "memory");
+}
+
+__device__ __forceinline__ void fence_proxy_async_smem() {
+  asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+}
+
+__device__ __forceinline__ void named_bar_sync(int id, int threads) {
+  asm volatile("bar.sync %0, %1;\n" : : "r"(id), "r"(threads) : "memory");
 }
 
 // One 2-D TMA box (inner coordinate c0 in elements, outer c1 in rows).
@@ -170,8 +205,16 @@ __device__ __forceinline__ void mma_bf16_16816(float* d, std::uint32_t a0, std::
 // QuantWarps quantize, the last DownWarpsM * DownWarpsN compute LoRA-down
 // (each owning TileM / DownWarpsM rows and Rank / DownWarpsN columns).
 template <int TileM_, int TileK_, int Stages_, int QuantWarps_, int DownWarpsM_, int DownWarpsN_,
-          bool WithDown_, bool ReadOnly_ = false, bool GroupFastest_ = false, int MinBlocks_ = 1>
+          bool WithDown_, bool ReadOnly_ = false, bool GroupFastest_ = false, int MinBlocks_ = 1,
+          int StoreAbl_ = 0, int XPolicy_ = 0>
 struct WsConfig {
+  // EXPERIMENT ONLY: L2 policy of the x TMA loads, 0 evict_first, 1 evict_normal,
+  // 2 evict_last.
+  static constexpr int kXPolicy = XPolicy_;
+  // EXPERIMENT ONLY: 1 = xq stores go to item-linear (wrong, fully coalesced)
+  // addresses; 2 = no xq stores (sf only); 3 = quantize, store nothing;
+  // 4 = correct output, xq through shared staging + TMA stores.
+  static constexpr int kStoreAbl = StoreAbl_;
   // EXPERIMENT ONLY: resident CTAs per SM requested from ptxas (grid mode 2).
   static constexpr int kMinBlocks = MinBlocks_;
   // EXPERIMENT ONLY: consecutive threads take consecutive SF groups of one row
@@ -203,7 +246,13 @@ struct WsConfig {
   static constexpr int kStageBytes = (kXBytes + kBBytes + kPqsBytes + 1023) / 1024 * 1024;
   static constexpr int kBarrierBytes = 2 * kStages * 8;
   // Slack to round the dynamic shared memory base up to 1024 bytes.
-  static constexpr int kSmemBytes = 1024 + kStages * kStageBytes + kBarrierBytes;
+  // EXPERIMENT ONLY (kStoreAbl 4): xq goes through a double-buffered shared
+  // staging tile (64-byte rows, 64-byte swizzle) and leaves with TMA stores.
+  static constexpr bool kTmaStore = StoreAbl_ == 4;
+  static constexpr int kXqStageBytes = kTileM * kTileK / 2;
+  static constexpr int kXqStagingOffset = (kStages * kStageBytes + kBarrierBytes + 1023) / 1024 * 1024;
+  static constexpr int kSmemBytes =
+      1024 + (kTmaStore ? kXqStagingOffset + 2 * kXqStageBytes : kStages * kStageBytes + kBarrierBytes);
   static constexpr int kSfPerTile = kTileK / quant::SF_VEC_SIZE;
   // A quantize item is one row's group of up to four SF blocks (one 32-bit,
   // or for K32 tiles 16-bit, SF store and a contiguous run of xq).
@@ -224,7 +273,7 @@ template <class Cfg>
 __global__ void __launch_bounds__(Cfg::kThreads, Cfg::kMinBlocks)
     nvfp4_smooth_quantize_lora_down_ws_sm120_kernel(
         __grid_constant__ CUtensorMap const x_map, __grid_constant__ CUtensorMap const b_map,
-        quant::Type const* __restrict__ pre_quant_scale, float const* __restrict__ global_scale,
+        __grid_constant__ CUtensorMap const xq_map, quant::Type const* __restrict__ pre_quant_scale, float const* __restrict__ global_scale,
         std::uint64_t* __restrict__ xq, std::uint8_t* __restrict__ sf,
         quant::Type* __restrict__ down, int M, int K) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1200)
@@ -263,7 +312,9 @@ __global__ void __launch_bounds__(Cfg::kThreads, Cfg::kMinBlocks)
 
   if (warp == 0) {
     // ---------------------------------------------------------------- producer
-    std::uint64_t const x_policy = make_l2_policy_evict_first();
+    std::uint64_t const x_policy = Cfg::kXPolicy == 1   ? make_l2_policy_evict_normal()
+                                   : Cfg::kXPolicy == 2 ? make_l2_policy_evict_last()
+                                                        : make_l2_policy_evict_first();
     std::uint64_t const keep_policy = make_l2_policy_evict_last();
     if (lane == 0) {
       asm volatile("prefetch.tensormap [%0];\n" : : "l"(reinterpret_cast<std::uint64_t>(&x_map)));
@@ -316,6 +367,7 @@ __global__ void __launch_bounds__(Cfg::kThreads, Cfg::kMinBlocks)
     float const scale = global_scale[0];
     int const sf_cols = K / quant::SF_VEC_SIZE;
     [[maybe_unused]] std::uint32_t read_only_sink = 0;
+    [[maybe_unused]] std::uint8_t* const xq_staging = stage_base + Cfg::kXqStagingOffset;
     int it = 0;
     for (int chunk = row_begin; chunk < row_end; chunk += kTileM) {
       int const chunk_rows = min(kTileM, row_end - chunk);
@@ -373,14 +425,48 @@ __global__ void __launch_bounds__(Cfg::kThreads, Cfg::kMinBlocks)
               packed[b] =
                   quant::quantizeSmoothed16(x_lo, x_hi, pqs_lo, pqs_hi, scale, &sf_bytes[b]);
             }
+            // kStoreAbl 1: each 16-byte half goes to an item-linear slot, so one
+            // warp store instruction covers 512 contiguous bytes.
+            std::uint64_t* const xq_lin = xq + static_cast<std::int64_t>(chunk) * sf_cols +
+                                          static_cast<std::int64_t>(kt) * chunk_rows *
+                                              Cfg::kSfPerTile;
             std::uint64_t* const xq_row = xq + static_cast<std::int64_t>(row) * sf_cols + sf_col;
-            {
-              reinterpret_cast<uint4*>(xq_row)[0] = make_uint4(
+            uint4* const xq_dst0 = Cfg::kStoreAbl == 1
+                                       ? reinterpret_cast<uint4*>(xq_lin) + item
+                                       : reinterpret_cast<uint4*>(xq_row);
+            uint4* const xq_dst1 = Cfg::kStoreAbl == 1
+                                       ? reinterpret_cast<uint4*>(xq_lin) + items + item
+                                       : reinterpret_cast<uint4*>(xq_row) + 1;
+            if constexpr (Cfg::kTmaStore) {
+              // 64-byte rows, 16-byte chunk c of row r at (c ^ ((r >> 1) & 3)):
+              // the TMA 64-byte swizzle, conflict-free for row-fastest items.
+              std::uint8_t* const xq_tile = xq_staging + (it & 1) * Cfg::kXqStageBytes + r * 64;
+              int const c0 = group * 2;
+              int const sw = (r >> 1) & 3;
+              *reinterpret_cast<uint4*>(xq_tile + ((c0 ^ sw) * 16)) = make_uint4(
                   static_cast<std::uint32_t>(packed[0]), static_cast<std::uint32_t>(packed[0] >> 32),
                   static_cast<std::uint32_t>(packed[1]), static_cast<std::uint32_t>(packed[1] >> 32));
-              reinterpret_cast<uint4*>(xq_row)[1] = make_uint4(
+              *reinterpret_cast<uint4*>(xq_tile + (((c0 + 1) ^ sw) * 16)) = make_uint4(
                   static_cast<std::uint32_t>(packed[2]), static_cast<std::uint32_t>(packed[2] >> 32),
                   static_cast<std::uint32_t>(packed[3]), static_cast<std::uint32_t>(packed[3] >> 32));
+              *reinterpret_cast<std::uint32_t*>(sf + sf_offset) =
+                  static_cast<std::uint32_t>(sf_bytes[0]) |
+                  (static_cast<std::uint32_t>(sf_bytes[1]) << 8) |
+                  (static_cast<std::uint32_t>(sf_bytes[2]) << 16) |
+                  (static_cast<std::uint32_t>(sf_bytes[3]) << 24);
+            } else if constexpr (Cfg::kStoreAbl == 3) {
+              read_only_sink ^= static_cast<std::uint32_t>(packed[0] ^ packed[1] ^ packed[2] ^
+                                                           packed[3]) ^
+                                sf_bytes[0] ^ sf_bytes[1] ^ sf_bytes[2] ^ sf_bytes[3];
+            } else {
+              if constexpr (Cfg::kStoreAbl != 2) {
+              *xq_dst0 = make_uint4(
+                  static_cast<std::uint32_t>(packed[0]), static_cast<std::uint32_t>(packed[0] >> 32),
+                  static_cast<std::uint32_t>(packed[1]), static_cast<std::uint32_t>(packed[1] >> 32));
+              *xq_dst1 = make_uint4(
+                  static_cast<std::uint32_t>(packed[2]), static_cast<std::uint32_t>(packed[2] >> 32),
+                  static_cast<std::uint32_t>(packed[3]), static_cast<std::uint32_t>(packed[3] >> 32));
+              }
               *reinterpret_cast<std::uint32_t*>(sf + sf_offset) =
                   static_cast<std::uint32_t>(sf_bytes[0]) |
                   (static_cast<std::uint32_t>(sf_bytes[1]) << 8) |
@@ -394,9 +480,27 @@ __global__ void __launch_bounds__(Cfg::kThreads, Cfg::kMinBlocks)
         }
         __syncwarp();
         if (lane == 0) mbar_arrive(&empty_bar[s]);
+        if constexpr (Cfg::kTmaStore) {
+          // Make the staging writes visible to the async proxy; the issuer has
+          // also drained the previous store from the other buffer, so after the
+          // barrier both buffers' states are known to every quantize thread.
+          fence_proxy_async_smem();
+          if (qthread == 0) bulk_wait_group_read0();
+          named_bar_sync(1, kQuantThreads);
+          if (qthread == 0) {
+            std::uint8_t const* const tile = xq_staging + (it & 1) * Cfg::kXqStageBytes;
+            for (int rb = 0; rb * 16 < chunk_rows; ++rb) {
+              tma_store_2d(&xq_map, tile + rb * 1024, kt * (kTileK / 2), chunk + rb * 16);
+            }
+            bulk_commit_group();
+          }
+        }
       }
     }
-    if constexpr (Cfg::kReadOnly) {
+    if constexpr (Cfg::kTmaStore) {
+      if (qthread == 0) asm volatile("cp.async.bulk.wait_group 0;\n" ::: "memory");
+    }
+    if constexpr (Cfg::kReadOnly || Cfg::kStoreAbl == 3) {
       // Keep the loads live: a store that the data never actually triggers.
       if (read_only_sink == 0x9e3779b9u) reinterpret_cast<std::uint32_t*>(sf)[0] = read_only_sink;
     }
@@ -525,6 +629,24 @@ inline bool ws_make_map(CUtensorMap* map, void const* base, int rows, int cols, 
   return result == CUDA_SUCCESS;
 }
 
+// Row-major uint8 [rows, cols] with a 64-byte x box_rows box and the 64-byte
+// swizzle (EXPERIMENT ONLY: xq TMA stores).
+inline bool ws_make_map_u8_sw64(CUtensorMap* map, void const* base, int rows, int cols,
+                                int box_rows) {
+  auto const encode = ws_encode_fn();
+  if (encode == nullptr) return false;
+  if (reinterpret_cast<std::uintptr_t>(base) % 16 != 0 || cols % 16 != 0) return false;
+  cuuint64_t dims[2] = {static_cast<cuuint64_t>(cols), static_cast<cuuint64_t>(rows)};
+  cuuint64_t strides[1] = {static_cast<cuuint64_t>(cols)};
+  cuuint32_t box[2] = {64, static_cast<cuuint32_t>(box_rows)};
+  cuuint32_t elem_strides[2] = {1, 1};
+  CUresult const result =
+      encode(map, CU_TENSOR_MAP_DATA_TYPE_UINT8, 2, const_cast<void*>(base), dims, strides, box,
+             elem_strides, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_64B,
+             CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+  return result == CUDA_SUCCESS;
+}
+
 inline int ws_device_sm_count() {
   static int cached[64] = {};
   int device = 0;
@@ -542,13 +664,14 @@ inline int ws_device_sm_count() {
 // grid_mode 0: one CTA per SM (capped by the 16-row units); 1: as many CTAs as
 // TileM chunks, capped by the SM count.
 template <int TileM, int TileK, int Stages, int QuantWarps, int DownWarpsM, int DownWarpsN,
-          bool WithDown, bool ReadOnly = false, bool GroupFastest = false, int MinBlocks = 1>
+          bool WithDown, bool ReadOnly = false, bool GroupFastest = false, int MinBlocks = 1,
+          int StoreAbl = 0, int XPolicy = 0>
 inline cudaError_t launch_ws_kernel(void const* x, void const* pre_quant_scale,
                                     float const* global_scale, void* xq, void* sf,
                                     void const* l2t_kmajor, void* down, int m, int k,
                                     int grid_mode, cudaStream_t stream) {
   using Cfg = WsConfig<TileM, TileK, Stages, QuantWarps, DownWarpsM, DownWarpsN, WithDown, ReadOnly,
-                       GroupFastest, MinBlocks>;
+                       GroupFastest, MinBlocks, StoreAbl, XPolicy>;
   if constexpr (Cfg::kSmemBytes > 99 * 1024) {
     return cudaErrorInvalidValue;
   } else {
@@ -574,12 +697,17 @@ inline cudaError_t launch_ws_kernel(void const* x, void const* pre_quant_scale,
     if (!ws_make_map(&x_map, x, m, k, Cfg::kBoxRows)) return cudaErrorInvalidValue;
     static_assert(Cfg::kSub < 30, "producer lanes");
     if (!ws_make_map(&b_map, l2t_kmajor, kRank, k, kRank)) return cudaErrorInvalidValue;
+    CUtensorMap xq_map = x_map;
+    if constexpr (Cfg::kTmaStore) {
+      static_assert(TileK == 128, "xq staging rows are one 64-byte swizzle line");
+      if (!ws_make_map_u8_sw64(&xq_map, xq, m, k / 2, 16)) return cudaErrorInvalidValue;
+    }
     auto* const kernel = nvfp4_smooth_quantize_lora_down_ws_sm120_kernel<Cfg>;
     static cudaError_t const attribute_status = cudaFuncSetAttribute(
         kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, Cfg::kSmemBytes);
     if (attribute_status != cudaSuccess) return attribute_status;
     kernel<<<grid, Cfg::kThreads, Cfg::kSmemBytes, stream>>>(
-        x_map, b_map, static_cast<quant::Type const*>(pre_quant_scale), global_scale,
+        x_map, b_map, xq_map, static_cast<quant::Type const*>(pre_quant_scale), global_scale,
         static_cast<std::uint64_t*>(xq), static_cast<std::uint8_t*>(sf),
         static_cast<quant::Type*>(down), m, k);
     return cudaGetLastError();
@@ -627,10 +755,46 @@ inline cudaError_t nvfp4_smooth_quantize_lora_down_ws_rank128_sm120(
   bool const quant_only = (grid_mode & 0x100) != 0;
   [[maybe_unused]] bool const read_only = (grid_mode & 0x2000) != 0;
   [[maybe_unused]] bool const group_fastest = (grid_mode & 0x200) != 0;
+  [[maybe_unused]] int const store_abl = ((grid_mode >> 14) & 3) | ((grid_mode & 0x10000) ? 4 : 0);
+  [[maybe_unused]] int const x_policy = (grid_mode >> 17) & 3;
   grid_mode &= 0xff;
 #if defined(SVDQ_WS_ABLATIONS)
   // Ablation-only tilings (quantize-only / read-only; no B tile in the stage, so
   // wider x stages fit): 96x128x2 and 96x256x1, 6 quantize warps.
+  if (quant_only && x_policy != 0) {
+#define FI_SVDQ_WS_ABL_XPOL(SA, XP)                                                             \
+  if (tile_m == 96 && tile_k == 128 && stages == 2 && quant_warps == 6 && store_abl == (SA) &&  \
+      x_policy == (XP)) {                                                                      \
+    return ws::launch_ws_kernel<96, 128, 2, 6, 1, 1, false, false, false, 1, SA, XP>(          \
+        x, pre_quant_scale, global_scale, xq, sf, l2t_kmajor, down, m, k, grid_mode, stream);  \
+  }
+    FI_SVDQ_WS_ABL_XPOL(0, 1)
+    FI_SVDQ_WS_ABL_XPOL(0, 2)
+    FI_SVDQ_WS_ABL_XPOL(3, 1)
+    FI_SVDQ_WS_ABL_XPOL(4, 1)
+#undef FI_SVDQ_WS_ABL_XPOL
+    return cudaErrorInvalidValue;
+  }
+  if (quant_only && store_abl != 0) {
+#define FI_SVDQ_WS_ABL_STORE(TM, TK, ST, QW, SA)                                                \
+  if (tile_m == (TM) && tile_k == (TK) && stages == (ST) && quant_warps == (QW) &&             \
+      store_abl == (SA)) {                                                                     \
+    return ws::launch_ws_kernel<TM, TK, ST, QW, 1, 1, false, false, false, 1, SA>(             \
+        x, pre_quant_scale, global_scale, xq, sf, l2t_kmajor, down, m, k, grid_mode, stream);  \
+  }
+    FI_SVDQ_WS_ABL_STORE(96, 128, 2, 6, 1)
+    FI_SVDQ_WS_ABL_STORE(96, 128, 2, 6, 2)
+    FI_SVDQ_WS_ABL_STORE(96, 128, 2, 6, 3)
+    FI_SVDQ_WS_ABL_STORE(160, 128, 2, 10, 1)
+    FI_SVDQ_WS_ABL_STORE(160, 128, 2, 10, 2)
+    FI_SVDQ_WS_ABL_STORE(160, 128, 2, 10, 3)
+    FI_SVDQ_WS_ABL_STORE(96, 128, 2, 6, 4)
+    FI_SVDQ_WS_ABL_STORE(96, 128, 3, 6, 4)
+    FI_SVDQ_WS_ABL_STORE(128, 128, 2, 8, 4)
+    FI_SVDQ_WS_ABL_STORE(96, 128, 2, 12, 4)
+#undef FI_SVDQ_WS_ABL_STORE
+    return cudaErrorInvalidValue;
+  }
 #define FI_SVDQ_WS_ABL_ONLY(TM, TK, ST, QW)                                                     \
   if (quant_only && tile_m == (TM) && tile_k == (TK) && stages == (ST) && quant_warps == (QW)) { \
     return read_only ? ws::launch_ws_kernel<TM, TK, ST, QW, 1, 1, false, true>(                 \
@@ -669,6 +833,7 @@ inline cudaError_t nvfp4_smooth_quantize_lora_down_ws_rank128_sm120(
   FI_SVDQ_WS_ABL_ONLY(96, 128, 3, 6)
   FI_SVDQ_WS_ABL_ONLY(64, 128, 4, 4)
   FI_SVDQ_WS_ABL_ONLY(160, 128, 2, 10)
+  FI_SVDQ_WS_ABL_ONLY(128, 128, 2, 8)
   FI_SVDQ_WS_ABL_ONLY(96, 256, 1, 12)
 #undef FI_SVDQ_WS_ABL_ONLY
 #define FI_SVDQ_WS_QUANT_ONLY(TM, TK, ST, QW, DM, DN)                                           \
