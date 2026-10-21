@@ -257,7 +257,10 @@ class DenseGemmKernel:
         load_path: Literal["tma", "cpasync"] = "tma",
         swap_ab: bool = False,
         enable_iket: bool = False,
+        ablate_epilogue: bool = False,
     ):
+        # EXPERIMENT ONLY: drop the per-tile output epilogue (timing bound).
+        self.ablate_epilogue = ablate_epilogue
         self.acc_dtype = cutlass.Float32
         self.sf_vec_size = sf_vec_size
         self.mma_k = mma_k
@@ -1929,317 +1932,326 @@ class DenseGemmKernel:
 
                 if cutlass.const_expr(not self.swap_ab):
                     # EPILOGUE
-                    _is_m_major = self.c_layout.is_m_major_c()
-                    if cutlass.const_expr(self.c_dtype.width == 16):
-                        copy_atom_r2s = cute.make_copy_atom(
-                            cute.nvgpu.warp.StMatrix8x8x16bOp(_is_m_major, 2),
-                            self.c_dtype,
-                        )
+                    if cutlass.const_expr(self.ablate_epilogue):
+                        # EXPERIMENT ONLY: no output; keep the accumulators live through a
+                        # store that the data never triggers (epilogue-free upper bound).
+                        acc_sink = Float32(0.0)
+                        for acc_i in cutlass.range_constexpr(cute.size(accumulators)):
+                            acc_sink += accumulators[acc_i]
+                        if acc_sink == Float32(1.2345e30):
+                            directC_mnl[(Int32(0), Int32(0), Int32(0))] = acc_sink.to(self.c_dtype)
                     else:
-                        copy_atom_r2s = cute.make_copy_atom(
-                            cute.nvgpu.CopyUniversalOp(),
-                            self.c_dtype,
+                        _is_m_major = self.c_layout.is_m_major_c()
+                        if cutlass.const_expr(self.c_dtype.width == 16):
+                            copy_atom_r2s = cute.make_copy_atom(
+                                cute.nvgpu.warp.StMatrix8x8x16bOp(_is_m_major, 2),
+                                self.c_dtype,
+                            )
+                        else:
+                            copy_atom_r2s = cute.make_copy_atom(
+                                cute.nvgpu.CopyUniversalOp(),
+                                self.c_dtype,
+                            )
+
+                        if cutlass.const_expr(self.c_dtype.width == 16):
+                            copy_atom_C = cute.make_copy_atom(
+                                cute.nvgpu.warp.StMatrix8x8x16bOp(
+                                    self.c_layout.is_m_major_c(),
+                                    2,
+                                ),
+                                self.c_dtype,
+                            )
+                        else:
+                            copy_atom_C = cute.make_copy_atom(
+                                cute.nvgpu.CopyUniversalOp(), self.c_dtype
+                            )
+
+                        tiled_copy_C_Atom = cute.make_tiled_copy_C_atom(
+                            copy_atom_C, tiled_mma
                         )
 
-                    if cutlass.const_expr(self.c_dtype.width == 16):
-                        copy_atom_C = cute.make_copy_atom(
-                            cute.nvgpu.warp.StMatrix8x8x16bOp(
-                                self.c_layout.is_m_major_c(),
-                                2,
-                            ),
-                            self.c_dtype,
-                        )
-                    else:
-                        copy_atom_C = cute.make_copy_atom(
-                            cute.nvgpu.CopyUniversalOp(), self.c_dtype
+                        tiled_copy_r2s = cute.make_tiled_copy_S(
+                            copy_atom_r2s,
+                            tiled_copy_C_Atom,
                         )
 
-                    tiled_copy_C_Atom = cute.make_tiled_copy_C_atom(
-                        copy_atom_C, tiled_mma
-                    )
+                        thr_copy_r2s = tiled_copy_r2s.get_slice(tidx)
+                        tRS_sD = thr_copy_r2s.partition_D(sC)
+                        tRS_rAcc = tiled_copy_r2s.retile(accumulators)
+                        if cutlass.const_expr(svdquant_bias is not None):
+                            c_identity = cute.make_identity_tensor(
+                                cute.slice_(self.tile_shape_mnk, (None, None, 0))
+                            )
+                            tRS_cD = tiled_copy_r2s.retile(thr_mma.partition_C(c_identity))
 
-                    tiled_copy_r2s = cute.make_tiled_copy_S(
-                        copy_atom_r2s,
-                        tiled_copy_C_Atom,
-                    )
+                        rD_shape = cute.shape(thr_copy_r2s.partition_S(sC))
+                        tRS_rD_layout = cute.make_layout(rD_shape[:3])
+                        tRS_rD = cute.make_rmem_tensor(tRS_rD_layout.shape, self.acc_dtype)
 
-                    thr_copy_r2s = tiled_copy_r2s.get_slice(tidx)
-                    tRS_sD = thr_copy_r2s.partition_D(sC)
-                    tRS_rAcc = tiled_copy_r2s.retile(accumulators)
-                    if cutlass.const_expr(svdquant_bias is not None):
-                        c_identity = cute.make_identity_tensor(
-                            cute.slice_(self.tile_shape_mnk, (None, None, 0))
+                        sepi_for_tma_partition = cute.group_modes(sC, 0, 2)
+                        tcgc_for_tma_partition = cute.zipped_divide(
+                            gC_mnl_slice, self.epi_tile
                         )
-                        tRS_cD = tiled_copy_r2s.retile(thr_mma.partition_C(c_identity))
 
-                    rD_shape = cute.shape(thr_copy_r2s.partition_S(sC))
-                    tRS_rD_layout = cute.make_layout(rD_shape[:3])
-                    tRS_rD = cute.make_rmem_tensor(tRS_rD_layout.shape, self.acc_dtype)
+                        bSG_sD, bSG_gD = cpasync.tma_partition(
+                            tma_atom_c,
+                            0,
+                            cute.make_layout(1),
+                            sepi_for_tma_partition,
+                            tcgc_for_tma_partition,
+                        )
 
-                    sepi_for_tma_partition = cute.group_modes(sC, 0, 2)
-                    tcgc_for_tma_partition = cute.zipped_divide(
-                        gC_mnl_slice, self.epi_tile
-                    )
+                        epi_rest_m = bSG_gD.shape[1][0]
+                        epi_rest_n = bSG_gD.shape[1][1]
+                        epi_tile_m = self.epi_tile[0]
+                        epi_tile_n = self.epi_tile[1]
+                        mma_tile_m = self.tile_shape_mnk[0] // cute.size(tRS_rAcc, mode=[1])
+                        mma_tile_n = self.tile_shape_mnk[1] // cute.size(tRS_rAcc, mode=[2])
 
-                    bSG_sD, bSG_gD = cpasync.tma_partition(
-                        tma_atom_c,
-                        0,
-                        cute.make_layout(1),
-                        sepi_for_tma_partition,
-                        tcgc_for_tma_partition,
-                    )
-
-                    epi_rest_m = bSG_gD.shape[1][0]
-                    epi_rest_n = bSG_gD.shape[1][1]
-                    epi_tile_m = self.epi_tile[0]
-                    epi_tile_n = self.epi_tile[1]
-                    mma_tile_m = self.tile_shape_mnk[0] // cute.size(tRS_rAcc, mode=[1])
-                    mma_tile_n = self.tile_shape_mnk[1] // cute.size(tRS_rAcc, mode=[2])
-
-                    for epi_m in cutlass.range_constexpr(epi_rest_m):
-                        for epi_n in cutlass.range_constexpr(epi_rest_n):
-                            MmaMPerEpiM = epi_tile_m // mma_tile_m
-                            MmaNPerEpiN = epi_tile_n // mma_tile_n
-                            for mma_n_in_epi in cutlass.range_constexpr(MmaNPerEpiN):
-                                for mma_m_in_epi in cutlass.range_constexpr(
-                                    MmaMPerEpiM
-                                ):
-                                    mma_n = (epi_n * MmaNPerEpiN) + mma_n_in_epi
-                                    mma_m = (epi_m * MmaMPerEpiM) + mma_m_in_epi
-                                    tRS_rD_slice = tRS_rD[
-                                        (None, mma_m_in_epi, mma_n_in_epi)
-                                    ]
-                                    tRS_rAcc_slice = tRS_rAcc[(None, mma_m, mma_n)]
-                                    if cutlass.const_expr(svdquant_bias is not None):
-                                        tRS_cD_slice = tRS_cD[(None, mma_m, mma_n)]
-                                    for elem_idx in cutlass.range_constexpr(
-                                        cute.size(tRS_rD_slice)
+                        for epi_m in cutlass.range_constexpr(epi_rest_m):
+                            for epi_n in cutlass.range_constexpr(epi_rest_n):
+                                MmaMPerEpiM = epi_tile_m // mma_tile_m
+                                MmaNPerEpiN = epi_tile_n // mma_tile_n
+                                for mma_n_in_epi in cutlass.range_constexpr(MmaNPerEpiN):
+                                    for mma_m_in_epi in cutlass.range_constexpr(
+                                        MmaMPerEpiM
                                     ):
-                                        acc_value = tRS_rAcc_slice[elem_idx]
-                                        if cutlass.const_expr(
-                                            svdquant_bias is not None
+                                        mma_n = (epi_n * MmaNPerEpiN) + mma_n_in_epi
+                                        mma_m = (epi_m * MmaMPerEpiM) + mma_m_in_epi
+                                        tRS_rD_slice = tRS_rD[
+                                            (None, mma_m_in_epi, mma_n_in_epi)
+                                        ]
+                                        tRS_rAcc_slice = tRS_rAcc[(None, mma_m, mma_n)]
+                                        if cutlass.const_expr(svdquant_bias is not None):
+                                            tRS_cD_slice = tRS_cD[(None, mma_m, mma_n)]
+                                        for elem_idx in cutlass.range_constexpr(
+                                            cute.size(tRS_rD_slice)
                                         ):
-                                            coord = tRS_cD_slice[elem_idx]
-                                            n_coord = (
-                                                tile_coord_mnl[1]
-                                                * Int32(self.tile_shape_mnk[1])
-                                                + coord[1]
-                                            )
-                                            if n_coord < Int32(directC_mnl.shape[1]):
-                                                acc_value = (
-                                                    alpha_value * acc_value
-                                                    + svdquant_bias[(n_coord,)].to(
-                                                        Float32
-                                                    )
-                                                )
-                                        tRS_rD_slice[elem_idx] = acc_value
-
-                            gmem_coord = (epi_m, epi_n)
-                            if cutlass.const_expr(self.split_k_slices > 1):
-                                acc_mn = _reshape_acc_to_mn(accumulators)
-                                c_identity = cute.make_identity_tensor(
-                                    cute.slice_(self.tile_shape_mnk, (None, None, 0))
-                                )
-                                coord_mn = _reshape_acc_to_mn(
-                                    thr_mma.partition_C(c_identity)
-                                )
-                                if cutlass.const_expr(self.split_k_atomic_bf16):
-                                    for acc_m in cutlass.range_constexpr(
-                                        cute.size(acc_mn.shape[0])
-                                    ):
-                                        for acc_n_pair in cutlass.range_constexpr(
-                                            cute.size(acc_mn.shape[1]) // 2
-                                        ):
-                                            acc_n0 = acc_n_pair * 2
-                                            acc_n1 = acc_n0 + 1
-                                            coord0 = coord_mn[acc_m, acc_n0]
-                                            coord1 = coord_mn[acc_m, acc_n1]
-                                            m_coord0 = (
-                                                tile_coord_mnl[0]
-                                                * Int32(self.tile_shape_mnk[0])
-                                                + coord0[0]
-                                            )
-                                            n_coord0 = (
-                                                tile_coord_mnl[1]
-                                                * Int32(self.tile_shape_mnk[1])
-                                                + coord0[1]
-                                            )
-                                            m_coord1 = (
-                                                tile_coord_mnl[0]
-                                                * Int32(self.tile_shape_mnk[0])
-                                                + coord1[0]
-                                            )
-                                            n_coord1 = (
-                                                tile_coord_mnl[1]
-                                                * Int32(self.tile_shape_mnk[1])
-                                                + coord1[1]
-                                            )
-                                            if (
-                                                m_coord0 < Int32(directC_mnl.shape[0])
-                                                and m_coord1
-                                                < Int32(directC_mnl.shape[0])
-                                                and n_coord0
-                                                < Int32(directC_mnl.shape[1])
-                                                and n_coord1
-                                                < Int32(directC_mnl.shape[1])
+                                            acc_value = tRS_rAcc_slice[elem_idx]
+                                            if cutlass.const_expr(
+                                                svdquant_bias is not None
                                             ):
-                                                c_offset = cute.crd2idx(
-                                                    (
-                                                        m_coord0,
-                                                        n_coord0,
-                                                        Int32(0),
-                                                    ),
-                                                    directC_mnl.layout,
+                                                coord = tRS_cD_slice[elem_idx]
+                                                n_coord = (
+                                                    tile_coord_mnl[1]
+                                                    * Int32(self.tile_shape_mnk[1])
+                                                    + coord[1]
                                                 )
-                                                scatter_add_bf16x2(
-                                                    get_ptr_as_int64(
-                                                        directC_mnl,
-                                                        c_offset,
-                                                    ),
-                                                    alpha_value * acc_mn[acc_m, acc_n0],
-                                                    alpha_value * acc_mn[acc_m, acc_n1],
-                                                )
-                                        if cutlass.const_expr(
-                                            cute.size(acc_mn.shape[1]) % 2 == 1
+                                                if n_coord < Int32(directC_mnl.shape[1]):
+                                                    acc_value = (
+                                                        alpha_value * acc_value
+                                                        + svdquant_bias[(n_coord,)].to(
+                                                            Float32
+                                                        )
+                                                    )
+                                            tRS_rD_slice[elem_idx] = acc_value
+
+                                gmem_coord = (epi_m, epi_n)
+                                if cutlass.const_expr(self.split_k_slices > 1):
+                                    acc_mn = _reshape_acc_to_mn(accumulators)
+                                    c_identity = cute.make_identity_tensor(
+                                        cute.slice_(self.tile_shape_mnk, (None, None, 0))
+                                    )
+                                    coord_mn = _reshape_acc_to_mn(
+                                        thr_mma.partition_C(c_identity)
+                                    )
+                                    if cutlass.const_expr(self.split_k_atomic_bf16):
+                                        for acc_m in cutlass.range_constexpr(
+                                            cute.size(acc_mn.shape[0])
                                         ):
-                                            acc_n = cute.size(acc_mn.shape[1]) - 1
-                                            coord = coord_mn[acc_m, acc_n]
-                                            m_coord = (
-                                                tile_coord_mnl[0]
-                                                * Int32(self.tile_shape_mnk[0])
-                                                + coord[0]
-                                            )
-                                            n_coord = (
-                                                tile_coord_mnl[1]
-                                                * Int32(self.tile_shape_mnk[1])
-                                                + coord[1]
-                                            )
-                                            if m_coord < Int32(
-                                                directC_mnl.shape[0]
-                                            ) and n_coord < Int32(directC_mnl.shape[1]):
-                                                c_offset = cute.crd2idx(
-                                                    (
-                                                        m_coord,
-                                                        n_coord,
-                                                        Int32(0),
-                                                    ),
-                                                    directC_mnl.layout,
+                                            for acc_n_pair in cutlass.range_constexpr(
+                                                cute.size(acc_mn.shape[1]) // 2
+                                            ):
+                                                acc_n0 = acc_n_pair * 2
+                                                acc_n1 = acc_n0 + 1
+                                                coord0 = coord_mn[acc_m, acc_n0]
+                                                coord1 = coord_mn[acc_m, acc_n1]
+                                                m_coord0 = (
+                                                    tile_coord_mnl[0]
+                                                    * Int32(self.tile_shape_mnk[0])
+                                                    + coord0[0]
                                                 )
-                                                scatter_add_bf16(
-                                                    get_ptr_as_int64(
-                                                        directC_mnl,
-                                                        c_offset,
-                                                    ),
-                                                    alpha_value * acc_mn[acc_m, acc_n],
+                                                n_coord0 = (
+                                                    tile_coord_mnl[1]
+                                                    * Int32(self.tile_shape_mnk[1])
+                                                    + coord0[1]
                                                 )
+                                                m_coord1 = (
+                                                    tile_coord_mnl[0]
+                                                    * Int32(self.tile_shape_mnk[0])
+                                                    + coord1[0]
+                                                )
+                                                n_coord1 = (
+                                                    tile_coord_mnl[1]
+                                                    * Int32(self.tile_shape_mnk[1])
+                                                    + coord1[1]
+                                                )
+                                                if (
+                                                    m_coord0 < Int32(directC_mnl.shape[0])
+                                                    and m_coord1
+                                                    < Int32(directC_mnl.shape[0])
+                                                    and n_coord0
+                                                    < Int32(directC_mnl.shape[1])
+                                                    and n_coord1
+                                                    < Int32(directC_mnl.shape[1])
+                                                ):
+                                                    c_offset = cute.crd2idx(
+                                                        (
+                                                            m_coord0,
+                                                            n_coord0,
+                                                            Int32(0),
+                                                        ),
+                                                        directC_mnl.layout,
+                                                    )
+                                                    scatter_add_bf16x2(
+                                                        get_ptr_as_int64(
+                                                            directC_mnl,
+                                                            c_offset,
+                                                        ),
+                                                        alpha_value * acc_mn[acc_m, acc_n0],
+                                                        alpha_value * acc_mn[acc_m, acc_n1],
+                                                    )
+                                            if cutlass.const_expr(
+                                                cute.size(acc_mn.shape[1]) % 2 == 1
+                                            ):
+                                                acc_n = cute.size(acc_mn.shape[1]) - 1
+                                                coord = coord_mn[acc_m, acc_n]
+                                                m_coord = (
+                                                    tile_coord_mnl[0]
+                                                    * Int32(self.tile_shape_mnk[0])
+                                                    + coord[0]
+                                                )
+                                                n_coord = (
+                                                    tile_coord_mnl[1]
+                                                    * Int32(self.tile_shape_mnk[1])
+                                                    + coord[1]
+                                                )
+                                                if m_coord < Int32(
+                                                    directC_mnl.shape[0]
+                                                ) and n_coord < Int32(directC_mnl.shape[1]):
+                                                    c_offset = cute.crd2idx(
+                                                        (
+                                                            m_coord,
+                                                            n_coord,
+                                                            Int32(0),
+                                                        ),
+                                                        directC_mnl.layout,
+                                                    )
+                                                    scatter_add_bf16(
+                                                        get_ptr_as_int64(
+                                                            directC_mnl,
+                                                            c_offset,
+                                                        ),
+                                                        alpha_value * acc_mn[acc_m, acc_n],
+                                                    )
+                                    else:
+                                        split_idx = Int32(block_idx[1])
+                                        for acc_m in cutlass.range_constexpr(
+                                            cute.size(acc_mn.shape[0])
+                                        ):
+                                            for acc_n in cutlass.range_constexpr(
+                                                cute.size(acc_mn.shape[1])
+                                            ):
+                                                coord = coord_mn[acc_m, acc_n]
+                                                m_coord = (
+                                                    tile_coord_mnl[0]
+                                                    * Int32(self.tile_shape_mnk[0])
+                                                    + coord[0]
+                                                )
+                                                n_coord = (
+                                                    tile_coord_mnl[1]
+                                                    * Int32(self.tile_shape_mnk[1])
+                                                    + coord[1]
+                                                )
+                                                if m_coord < Int32(
+                                                    directC_mnl.shape[0]
+                                                ) and n_coord < Int32(directC_mnl.shape[1]):
+                                                    directC_mnl[
+                                                        (m_coord, n_coord, split_idx)
+                                                    ] = alpha_value * acc_mn[acc_m, acc_n]
                                 else:
-                                    split_idx = Int32(block_idx[1])
-                                    for acc_m in cutlass.range_constexpr(
-                                        cute.size(acc_mn.shape[0])
-                                    ):
-                                        for acc_n in cutlass.range_constexpr(
-                                            cute.size(acc_mn.shape[1])
+                                    # Type conversion with alpha scaling
+                                    tRS_rD_out = cute.make_rmem_tensor(
+                                        tRS_rD_layout.shape, self.c_dtype
+                                    )
+                                    acc_vec = tRS_rD.load()
+                                    # Multiply alpha in FP32 before converting to c_dtype
+                                    # to avoid overflow when c_dtype is FP16
+                                    if cutlass.const_expr(svdquant_bias is not None):
+                                        acc_vec = epilogue_op(acc_vec.to(self.c_dtype))
+                                    else:
+                                        acc_vec = epilogue_op(
+                                            (alpha_value * acc_vec).to(self.c_dtype)
+                                        )
+                                    tRS_rD_out.store(acc_vec)
+
+                                    # Register to shared memory
+                                    epi_buffer = (epi_m * epi_rest_n + epi_n) % cute.size(
+                                        tRS_sD, mode=[3]
+                                    )
+                                    # The TMA store issued from this sC buffer,
+                                    # possibly by the previous work tile, may
+                                    # still be reading it.
+                                    if warp_idx == 0:
+                                        tma_store_pipeline.producer_acquire()
+                                    self.epilog_sync_barrier.arrive_and_wait()
+                                    cute.copy(
+                                        tiled_copy_r2s,
+                                        tRS_rD_out,
+                                        tRS_sD[(None, None, None, epi_buffer)],
+                                    )
+                                    cute.arch.fence_proxy(
+                                        "async.shared",
+                                        space="cta",
+                                    )
+                                    self.epilog_sync_barrier.arrive_and_wait()
+
+                                    # Copy from shared memory to global memory
+                                    if cutlass.const_expr(self.use_m1_non_tma_c):
+                                        for n_iter in cutlass.range_constexpr(
+                                            (
+                                                self.epi_tile[1]
+                                                + self.num_mma_warps
+                                                * self.num_threads_per_warp
+                                                - 1
+                                            )
+                                            // (
+                                                self.num_mma_warps
+                                                * self.num_threads_per_warp
+                                            )
                                         ):
-                                            coord = coord_mn[acc_m, acc_n]
-                                            m_coord = (
-                                                tile_coord_mnl[0]
-                                                * Int32(self.tile_shape_mnk[0])
-                                                + coord[0]
+                                            n_local = Int32(tidx) + Int32(
+                                                n_iter
+                                                * self.num_mma_warps
+                                                * self.num_threads_per_warp
                                             )
                                             n_coord = (
                                                 tile_coord_mnl[1]
                                                 * Int32(self.tile_shape_mnk[1])
-                                                + coord[1]
+                                                + Int32(epi_n * self.epi_tile[1])
+                                                + n_local
                                             )
-                                            if m_coord < Int32(
-                                                directC_mnl.shape[0]
+                                            if n_local < Int32(
+                                                self.epi_tile[1]
                                             ) and n_coord < Int32(directC_mnl.shape[1]):
                                                 directC_mnl[
-                                                    (m_coord, n_coord, split_idx)
-                                                ] = alpha_value * acc_mn[acc_m, acc_n]
-                            else:
-                                # Type conversion with alpha scaling
-                                tRS_rD_out = cute.make_rmem_tensor(
-                                    tRS_rD_layout.shape, self.c_dtype
-                                )
-                                acc_vec = tRS_rD.load()
-                                # Multiply alpha in FP32 before converting to c_dtype
-                                # to avoid overflow when c_dtype is FP16
-                                if cutlass.const_expr(svdquant_bias is not None):
-                                    acc_vec = epilogue_op(acc_vec.to(self.c_dtype))
-                                else:
-                                    acc_vec = epilogue_op(
-                                        (alpha_value * acc_vec).to(self.c_dtype)
-                                    )
-                                tRS_rD_out.store(acc_vec)
-
-                                # Register to shared memory
-                                epi_buffer = (epi_m * epi_rest_n + epi_n) % cute.size(
-                                    tRS_sD, mode=[3]
-                                )
-                                # The TMA store issued from this sC buffer,
-                                # possibly by the previous work tile, may
-                                # still be reading it.
-                                if warp_idx == 0:
-                                    tma_store_pipeline.producer_acquire()
-                                self.epilog_sync_barrier.arrive_and_wait()
-                                cute.copy(
-                                    tiled_copy_r2s,
-                                    tRS_rD_out,
-                                    tRS_sD[(None, None, None, epi_buffer)],
-                                )
-                                cute.arch.fence_proxy(
-                                    "async.shared",
-                                    space="cta",
-                                )
-                                self.epilog_sync_barrier.arrive_and_wait()
-
-                                # Copy from shared memory to global memory
-                                if cutlass.const_expr(self.use_m1_non_tma_c):
-                                    for n_iter in cutlass.range_constexpr(
-                                        (
-                                            self.epi_tile[1]
-                                            + self.num_mma_warps
-                                            * self.num_threads_per_warp
-                                            - 1
-                                        )
-                                        // (
-                                            self.num_mma_warps
-                                            * self.num_threads_per_warp
-                                        )
-                                    ):
-                                        n_local = Int32(tidx) + Int32(
-                                            n_iter
-                                            * self.num_mma_warps
-                                            * self.num_threads_per_warp
-                                        )
-                                        n_coord = (
-                                            tile_coord_mnl[1]
-                                            * Int32(self.tile_shape_mnk[1])
-                                            + Int32(epi_n * self.epi_tile[1])
-                                            + n_local
-                                        )
-                                        if n_local < Int32(
-                                            self.epi_tile[1]
-                                        ) and n_coord < Int32(directC_mnl.shape[1]):
-                                            directC_mnl[
-                                                (
-                                                    Int32(0),
-                                                    n_coord,
-                                                    tile_coord_mnl[2],
-                                                )
-                                            ] = sC[(Int32(0), n_local, epi_buffer)]
-                                else:
-                                    if warp_idx == 0:
-                                        cute.copy(
-                                            tma_atom_c,
-                                            bSG_sD[(None, epi_buffer)],
-                                            bSG_gD[(None, gmem_coord)],
-                                        )
-                                        # The matching wait sits just before
-                                        # the next sC write, so it overlaps
-                                        # the next work tile's mainloop.
-                                        tma_store_pipeline.producer_commit()
+                                                    (
+                                                        Int32(0),
+                                                        n_coord,
+                                                        tile_coord_mnl[2],
+                                                    )
+                                                ] = sC[(Int32(0), n_local, epi_buffer)]
+                                    else:
+                                        if warp_idx == 0:
+                                            cute.copy(
+                                                tma_atom_c,
+                                                bSG_sD[(None, epi_buffer)],
+                                                bSG_gD[(None, gmem_coord)],
+                                            )
+                                            # The matching wait sits just before
+                                            # the next sC write, so it overlaps
+                                            # the next work tile's mainloop.
+                                            tma_store_pipeline.producer_commit()
 
                     if cutlass.const_expr(self.enable_iket):
                         iket.range_pop()
