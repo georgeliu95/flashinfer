@@ -36,6 +36,16 @@
 //     L2T often enough to lose more than they gain (32x128: 158us).
 //   - reading B fragments straight from global/L2 (no B stage) to free shared
 //     memory for wider x stages: 152-275us, slower in every configuration.
+//   - sharing B across a 2-CTA cluster (each CTA stages half, or one multicast
+//     copy) is not viable on this part. Cluster launch and DSMEM are correct,
+//     but every .multicast::cluster bulk/TMA copy compiles to a CALL into a
+//     driver routine (0.5M-60M cycles per copy), remote ld.shared::cluster
+//     reads run at ~1.9 B/clk per CTA (local: 64), and a remote mbarrier round
+//     trip costs ~1040 cycles. Even with free remote reads (the
+//     SVDQ_WS_HALFB_ABLATION build: half of B staged, freed shared memory spent
+//     on a third K64 stage or K128 stages) the prefix only drops 151.5 -> 147.5us
+//     at 16384x3072x3072, 47.1 -> 45.6 at 4096x3072x3072 and 542.7 -> 526.3 at
+//     16384x3072x12288 (SM120 (110 SMs), cold L2).
 //
 // Outputs are bit-identical to nvfp4_quantize_smooth for xq/sf (the same
 // quantizeSmoothed16 per 16-element block, SF zero-filled for rows in
@@ -59,6 +69,15 @@ namespace smooth_quantize_lora_down_ws_sm120_detail {
 namespace quant = smooth_quantize_detail;
 
 constexpr int kRank = 128;
+#if defined(SVDQ_WS_HALFB_ABLATION)
+// Upper-bound ablation for a 2-CTA cluster that splits B across the pair: each
+// CTA stages only kRank / 2 rows of the K-major L2T tile and the down warps read
+// the missing half from the local copy as if remote shared memory were free.
+// down is wrong by construction; xq/sf are unchanged.
+constexpr int kBRowsStaged = kRank / 2;
+#else
+constexpr int kBRowsStaged = kRank;
+#endif
 
 __device__ __forceinline__ std::uint32_t smem_u32(void const* ptr) {
   return static_cast<std::uint32_t>(__cvta_generic_to_shared(ptr));
@@ -188,9 +207,9 @@ struct WsConfig {
   static constexpr int kBoxRows = 16;
   static constexpr int kSub = kTileK / 64;
   static constexpr int kXSubBytes = kTileM * 64 * 2;
-  static constexpr int kBSubBytes = kRank * 64 * 2;
+  static constexpr int kBSubBytes = kBRowsStaged * 64 * 2;
   static constexpr int kXBytes = kTileM * kTileK * 2;
-  static constexpr int kBBytes = WithDown_ ? kRank * kTileK * 2 : 0;
+  static constexpr int kBBytes = WithDown_ ? kBRowsStaged * kTileK * 2 : 0;
   static constexpr int kPqsBytes = kTileK * 2;
   static constexpr int kStageBytes = (kXBytes + kBBytes + kPqsBytes + 1023) / 1024 * 1024;
   static constexpr int kBarrierBytes = 2 * kStages * 8;
@@ -410,8 +429,13 @@ __global__ void __launch_bounds__(Cfg::kThreads, 1)
 #pragma unroll
           for (int f = 0; f < kFrags; f += 2) {
             ldmatrix_x4(b[f][0], b[f][1], b[f + 1][0], b[f + 1][1],
+#if defined(SVDQ_WS_HALFB_ABLATION)
+                        b_tile + swz128((warp_n * Cfg::kWarpCols + f * 8 + b_row) % kBRowsStaged,
+                                        ks * 2 + b_col / 8));
+#else
                         b_tile + swz128(warp_n * Cfg::kWarpCols + f * 8 + b_row,
                                         ks * 2 + b_col / 8));
+#endif
           }
 #pragma unroll
           for (int mb = 0; mb < kMBlocks; ++mb) {
@@ -534,7 +558,7 @@ inline cudaError_t launch_ws_kernel(void const* x, void const* pre_quant_scale,
     CUtensorMap b_map;
     if (!ws_make_map(&x_map, x, m, k, Cfg::kBoxRows)) return cudaErrorInvalidValue;
     static_assert(Cfg::kSub < 30, "producer lanes");
-    if (!ws_make_map(&b_map, l2t_kmajor, kRank, k, kRank)) return cudaErrorInvalidValue;
+    if (!ws_make_map(&b_map, l2t_kmajor, kRank, k, kBRowsStaged)) return cudaErrorInvalidValue;
     auto* const kernel = nvfp4_smooth_quantize_lora_down_ws_sm120_kernel<Cfg>;
     static cudaError_t const attribute_status = cudaFuncSetAttribute(
         kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, Cfg::kSmemBytes);
@@ -567,7 +591,23 @@ inline cudaError_t launch_ws_kernel(void const* x, void const* pre_quant_scale,
   X(64, 64, 3, 4, 1)                  \
   X(48, 64, 4, 3, 2)                  \
   X(32, 64, 4, 2, 0)                  \
-  X(32, 64, 4, 4, 0)
+  X(32, 64, 4, 4, 0)                  \
+  FI_SVDQ_RANK128_WS_ABLATION_TILINGS(X)
+
+#if defined(SVDQ_WS_HALFB_ABLATION)
+// Tilings that only fit once B is halved (K128 x stages, or a third K64 stage).
+#define FI_SVDQ_RANK128_WS_ABLATION_TILINGS(X) \
+  X(160, 64, 3, 5, 1)                          \
+  X(144, 64, 3, 9, 2)                          \
+  X(128, 64, 3, 4, 0)                          \
+  X(112, 128, 2, 7, 2)                         \
+  X(96, 128, 2, 6, 0)                          \
+  X(80, 128, 2, 5, 2)                          \
+  X(64, 128, 2, 4, 0)                          \
+  X(64, 64, 4, 4, 0)
+#else
+#define FI_SVDQ_RANK128_WS_ABLATION_TILINGS(X)
+#endif
 
 // A template so that only the rank-128 module, whose dispatch names it inside
 // `if constexpr (Rank == 128)`, instantiates these kernels.
