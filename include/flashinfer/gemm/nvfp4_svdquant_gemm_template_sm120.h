@@ -283,7 +283,13 @@ struct SvdquantGemmConfigSm120 {
                 "inline-down codegen selection must not change shared storage sizing");
 };
 
+#if defined(SVDQ_GEMM_STATIC_PERSISTENT)
+// EXPERIMENT ONLY: compile every "persistent" kernel on the static (SM90-style,
+// grid = #SMs) scheduler instead of the CLC scheduler, to A/B the scheduler alone.
+using PersistentTag = cutlass::gemm::StaticPersistentScheduler;
+#else
 using PersistentTag = cutlass::gemm::PersistentScheduler;
+#endif
 using StreamKTag = cutlass::gemm::StreamKScheduler;
 
 // 16 legacy kernels: shape-major, then swap_ab, then scheduler. IDs are stable.

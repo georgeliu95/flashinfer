@@ -61,6 +61,9 @@ def gen_gemm_sm120_module_cutlass_nvfp4_svdquant(lora_rank: int = 32) -> JitSpec
     # the module without it. Use a dedicated FLASHINFER_WORKSPACE_BASE.
     if lora_rank == 128 and os.environ.get("SVDQ_SM120_WS_ABLATIONS"):
         rank_flags.append("-DSVDQ_WS_ABLATIONS")
+    # EXPERIMENT ONLY: CLC -> static persistent scheduler A/B (all ranks).
+    if os.environ.get("SVDQ_GEMM_STATIC_PERSISTENT"):
+        rank_flags.append("-DSVDQ_GEMM_STATIC_PERSISTENT")
     return gen_jit_spec(
         f"nvfp4_svdquant_gemm_cutlass_sm120{variant}",
         source_paths,
