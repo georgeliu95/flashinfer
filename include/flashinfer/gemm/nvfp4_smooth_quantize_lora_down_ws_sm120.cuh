@@ -170,8 +170,11 @@ __device__ __forceinline__ void mma_bf16_16816(float* d, std::uint32_t a0, std::
 // QuantWarps quantize, the last DownWarpsM * DownWarpsN compute LoRA-down
 // (each owning TileM / DownWarpsM rows and Rank / DownWarpsN columns).
 template <int TileM_, int TileK_, int Stages_, int QuantWarps_, int DownWarpsM_, int DownWarpsN_,
-          bool WithDown_, bool ReadOnly_ = false>
+          bool WithDown_, bool ReadOnly_ = false, bool GroupFastest_ = false>
 struct WsConfig {
+  // EXPERIMENT ONLY: consecutive threads take consecutive SF groups of one row
+  // (coalesced xq stores) instead of consecutive rows of one group.
+  static constexpr bool kGroupFastest = GroupFastest_;
   // EXPERIMENT ONLY (SVDQ_WS_ABLATIONS): quantize warps read the x/pqs stage but
   // skip quantization and every xq/sf store, giving the x-stream floor.
   static constexpr bool kReadOnly = ReadOnly_;
@@ -345,8 +348,8 @@ __global__ void __launch_bounds__(Cfg::kThreads, 1)
         for (int item = qthread; item < items; item += kQuantThreads) {
           // Row-fastest: consecutive threads read consecutive rows of one
           // sub-tile (distinct swizzle phases, conflict-free 16-byte reads).
-          int const group = item / chunk_rows;
-          int const r = item - group * chunk_rows;
+          int const group = Cfg::kGroupFastest ? item % Cfg::kItemsPerRow : item / chunk_rows;
+          int const r = Cfg::kGroupFastest ? item / Cfg::kItemsPerRow : item - group * chunk_rows;
           std::uint8_t const* const sub_tile = stage + group * Cfg::kXSubBytes;
           int const row = chunk + r;
           int const sf_col = kt * Cfg::kSfPerTile + group * kSfPerItem;
@@ -537,12 +540,13 @@ inline int ws_device_sm_count() {
 // grid_mode 0: one CTA per SM (capped by the 16-row units); 1: as many CTAs as
 // TileM chunks, capped by the SM count.
 template <int TileM, int TileK, int Stages, int QuantWarps, int DownWarpsM, int DownWarpsN,
-          bool WithDown, bool ReadOnly = false>
+          bool WithDown, bool ReadOnly = false, bool GroupFastest = false>
 inline cudaError_t launch_ws_kernel(void const* x, void const* pre_quant_scale,
                                     float const* global_scale, void* xq, void* sf,
                                     void const* l2t_kmajor, void* down, int m, int k,
                                     int grid_mode, cudaStream_t stream) {
-  using Cfg = WsConfig<TileM, TileK, Stages, QuantWarps, DownWarpsM, DownWarpsN, WithDown, ReadOnly>;
+  using Cfg = WsConfig<TileM, TileK, Stages, QuantWarps, DownWarpsM, DownWarpsN, WithDown, ReadOnly,
+                       GroupFastest>;
   if constexpr (Cfg::kSmemBytes > 99 * 1024) {
     return cudaErrorInvalidValue;
   } else {
@@ -615,6 +619,7 @@ inline cudaError_t nvfp4_smooth_quantize_lora_down_ws_rank128_sm120(
   // ablation: no B copies, no down warps, down left unwritten.
   bool const quant_only = (grid_mode & 0x100) != 0;
   [[maybe_unused]] bool const read_only = (grid_mode & 0x2000) != 0;
+  [[maybe_unused]] bool const group_fastest = (grid_mode & 0x200) != 0;
   grid_mode &= 0xff;
 #if defined(SVDQ_WS_ABLATIONS)
   // Ablation-only tilings (quantize-only / read-only; no B tile in the stage, so
@@ -633,6 +638,11 @@ inline cudaError_t nvfp4_smooth_quantize_lora_down_ws_rank128_sm120(
   FI_SVDQ_WS_ABL_ONLY(96, 128, 2, 16)
   FI_SVDQ_WS_ABL_ONLY(96, 128, 2, 24)
   FI_SVDQ_WS_ABL_ONLY(96, 128, 2, 31)
+  if (quant_only && group_fastest && tile_m == 160 && tile_k == 128 && stages == 2 &&
+      quant_warps == 10) {
+    return ws::launch_ws_kernel<160, 128, 2, 10, 1, 1, false, false, true>(
+        x, pre_quant_scale, global_scale, xq, sf, l2t_kmajor, down, m, k, grid_mode, stream);
+  }
   FI_SVDQ_WS_ABL_ONLY(96, 256, 1, 6)
   FI_SVDQ_WS_ABL_ONLY(96, 128, 3, 6)
   FI_SVDQ_WS_ABL_ONLY(64, 128, 4, 4)
