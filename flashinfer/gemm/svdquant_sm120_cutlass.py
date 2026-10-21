@@ -787,6 +787,12 @@ _SVDQUANT_CONSTRAINT_SPECS = (
 _NVFP4_SVDQUANT_GEMM_TUNING_CONFIG_EXACT = TuningConfig(
     use_cuda_graph=True,
     use_cold_l2_cache=True,
+    # Large SM120 GEMMs run at the board power limit, where the SM clock steps
+    # between levels for seconds at a time (16384x12288x3072: one tactic reads
+    # 1650 or 1810 us depending on the level). A single sequential pass then
+    # picked a tactic 8% slower than the best; interleaved finalist rounds
+    # time every close candidate under the same clock levels.
+    finalist_rounds=5,
     dynamic_tensor_specs=(
         DynamicTensorSpec(
             (0,),  # a_tensor_index
