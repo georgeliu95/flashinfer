@@ -474,6 +474,66 @@ def test_choose_one_tuning_selects_best_tactic_and_populates_cache(monkeypatch):
     assert tuner.stats.tuned_op_successful_configs["dummy_tune"] >= 1
 
 
+def _clock_level_profile(first_pass_times, steady_times):
+    """Fake profiler: the first call per tactic returns first_pass_times (each
+    tactic timed at whatever clock level it happened to hit), later calls the
+    steady_times every interleaved round sees alike."""
+    calls: dict = {}
+
+    def profile(self, runner_obj, prof_inputs, tactic, tuning_config=None, **kwargs):
+        calls[tactic] = calls.get(tactic, 0) + 1
+        return (first_pass_times if calls[tactic] == 1 else steady_times)[tactic]
+
+    return profile, calls
+
+
+def test_choose_one_finalists_rerank_against_clock_level_drift(monkeypatch):
+    """Tactic 0 won the single pass only by being timed at a higher clock level;
+    interleaved finalist rounds must pick tactic 1, and leave tactic 2 (outside
+    the margin) and tactic 3 (past finalist_max) untimed after the first pass."""
+    tuner = reset_autotuner()
+    runner = DummyRunner(valid_tactics=(0, 1, 2, 3))
+    inputs = [torch.empty((16, 32), dtype=torch.float32)]
+    config = TuningConfig(finalist_rounds=3, finalist_margin=0.05, finalist_max=2)
+    profile, calls = _clock_level_profile(
+        {0: 1.00, 1: 1.02, 2: 1.20, 3: 1.04}, {0: 1.10, 1: 1.00, 2: 0.90, 3: 0.95}
+    )
+    monkeypatch.setattr(AutoTuner, "_profile_single_kernel", profile)
+    with autotune(tune_mode=True):
+        _, tactic = tuner.choose_one("dummy_finalists", [runner], config, inputs)
+
+    assert tactic == 1
+    assert calls == {0: 4, 1: 4, 2: 1, 3: 1}
+    (key,) = tuner.profiling_cache
+    assert tuner._profiling_cache_policies[(None, key)] == tuner._profiling_policy(
+        config
+    )
+
+
+def test_finalists_off_keeps_single_pass_and_policy(monkeypatch):
+    """finalist_rounds=0 (the default) keeps the single pass and the exact
+    policy tuple records were persisted under before the option existed."""
+    tuner = reset_autotuner()
+    runner = DummyRunner(valid_tactics=(0, 1))
+    inputs = [torch.empty((16, 32), dtype=torch.float32)]
+    profile, calls = _clock_level_profile({0: 1.00, 1: 1.02}, {0: 1.10, 1: 1.00})
+    monkeypatch.setattr(AutoTuner, "_profile_single_kernel", profile)
+    with autotune(tune_mode=True):
+        _, tactic = tuner.choose_one("dummy_single", [runner], TuningConfig(), inputs)
+
+    assert tactic == 0
+    assert calls == {0: 1, 1: 1}
+    assert AutoTuner._profiling_policy(TuningConfig()) == (
+        "cuda_graph_profile_replays",
+        None,
+        "l2_cache_policy",
+        "hot",
+    )
+    assert AutoTuner._profiling_policy(
+        TuningConfig(finalist_rounds=3)
+    ) != AutoTuner._profiling_policy(TuningConfig())
+
+
 @pytest.mark.parametrize("phase", ("forward", "precompile"))
 def test_choose_one_recovers_from_memory_error_during_preparation(monkeypatch, phase):
     class PreparationMemoryErrorRunner(DummyRunner):
