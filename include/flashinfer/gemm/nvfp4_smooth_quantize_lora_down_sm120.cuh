@@ -306,9 +306,21 @@ __launch_bounds__(BlockThreads) void nvfp4_smooth_quantize_lora_down_small_m_dyn
   constexpr int kDownElements = 16 * DownTileCols;
 
   int const block = static_cast<int>(blockIdx.x);
+#ifdef SVDQ_SM120_SMALL_M_ABLATE
+  // Experiment-only timing ablation (outputs are wrong): 1 skips the down CTAs,
+  // 2 skips the quantize CTAs, 3 skips the L2T prefetch.
+  if constexpr (Rank > 64) {
+    if (SVDQ_SM120_SMALL_M_ABLATE == 1 && block >= kQuantBlocks) return;
+    if (SVDQ_SM120_SMALL_M_ABLATE == 2 && block < kQuantBlocks) return;
+  }
+  constexpr bool kSkipPrefetch = Rank > 64 && SVDQ_SM120_SMALL_M_ABLATE == 3;
+#else
+  constexpr bool kSkipPrefetch = false;
+#endif
   if (block < kQuantBlocks) {
     for (std::int64_t line = static_cast<std::int64_t>(block) * BlockThreads + threadIdx.x;
-         line < kL2PrefetchLines; line += static_cast<std::int64_t>(kQuantBlocks) * BlockThreads) {
+         !kSkipPrefetch && line < kL2PrefetchLines;
+         line += static_cast<std::int64_t>(kQuantBlocks) * BlockThreads) {
       std::uint8_t const* prefetch_address =
           reinterpret_cast<std::uint8_t const*>(l2t_smoothed) + line * kL2PrefetchBytes;
       asm volatile("prefetch.global.L2 [%0];" : : "l"(prefetch_address));
