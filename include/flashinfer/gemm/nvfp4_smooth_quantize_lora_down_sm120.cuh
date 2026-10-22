@@ -308,8 +308,9 @@ __launch_bounds__(BlockThreads) void nvfp4_smooth_quantize_lora_down_small_m_dyn
   int const block = static_cast<int>(blockIdx.x);
 #ifdef SVDQ_SM120_SMALL_M_ABLATE
   // Experiment-only timing ablation (outputs are wrong): 1 skips the down CTAs,
-  // 2 skips the quantize CTAs, 3 skips the L2T prefetch.
+  // 2 skips the quantize CTAs, 3 skips the L2T prefetch, 4 skips both halves.
   if constexpr (Rank > 64) {
+    if (SVDQ_SM120_SMALL_M_ABLATE == 4) return;
     if (SVDQ_SM120_SMALL_M_ABLATE == 1 && block >= kQuantBlocks) return;
     if (SVDQ_SM120_SMALL_M_ABLATE == 2 && block < kQuantBlocks) return;
   }
