@@ -251,6 +251,11 @@ SM120_FAMILY_SMALL_M_PACKED: Final = 4
 # mbarrier stage ring). Tiling = (tile M, tile K, stages * 100 + quantize
 # warps); the address-policy slot carries the grid mode.
 SM120_FAMILY_WS_RANK128: Final = 5
+# Rank-128 small-M producer whose down tiles are reduced by a cluster of CTAs
+# over K (split-K through distributed shared memory) and whose quantize CTAs
+# split the flat item range. Tiling = (block threads, down tile cols,
+# splits * 1000 + quantize CTAs).
+SM120_FAMILY_SPLIT_K_RANK128: Final = 6
 
 # M537 and packed small-M producers share the lane-packed L2T layout. Other
 # families read row-major L2T, so the selected family determines preprocessing.
@@ -305,6 +310,38 @@ def sm120_ws_tiling_is_valid(m: int, k: int, tile_m: int, tile_k: int, packed: i
     if tile_k % 64 or m <= 0 or k <= 0 or k % tile_k or m > (1 << 30) or stages <= 0:
         return False
     return _ws_shared_bytes(tile_m, tile_k, stages) <= _STAGED_B_SHARED_LIMIT
+
+
+# Mirrors FI_SVDQ_SPLIT_K_TILINGS: (block threads, down tile cols, splits).
+SM120_SPLIT_K_TILING_LADDER: Final[tuple[tuple[int, int, int], ...]] = (
+    (256, 8, 2),
+    (256, 8, 4),
+    (256, 8, 8),
+    (256, 16, 4),
+    (512, 8, 2),
+    (512, 8, 4),
+    (512, 16, 2),
+    (512, 16, 4),
+)
+# Quantize CTA counts; each is a multiple of every split in the ladder.
+SM120_SPLIT_K_QUANT_BLOCKS: Final[tuple[int, ...]] = (32, 64, 96)
+# Above this M the down tiles alone fill the GPU and the other families win.
+SM120_SPLIT_K_MAX_M: Final = 1024
+
+
+def sm120_split_k_tiling_is_valid(
+    m: int, k: int, block_threads: int, down_tile_cols: int, splits_and_quant: int
+) -> bool:
+    """Python counterpart of launch_split_k_kernel's guards."""
+    splits, quant_blocks = divmod(splits_and_quant, 1000)
+    if not 0 < m <= SM120_SPLIT_K_MAX_M or k <= 0:
+        return False
+    if splits < 1 or quant_blocks <= 0 or quant_blocks % splits:
+        return False
+    warps = block_threads // 32
+    if k % (splits * warps) or (k // (splits * warps)) % 32:
+        return False
+    return not k % (4 * _GEOMETRY_SF_VEC)
 
 
 def sm120_small_m_tiling_is_valid(
@@ -381,7 +418,13 @@ def sm120_producer_variants(
             if sm120_ws_tiling_is_valid(m, k, *tiling)
             for grid_mode in SM120_WS_GRID_MODES
         )
-        return large + ws + small
+        split_k = tuple(
+            (SM120_FAMILY_SPLIT_K_RANK128, (threads, cols, splits * 1000 + quant), 0)
+            for threads, cols, splits in SM120_SPLIT_K_TILING_LADDER
+            for quant in SM120_SPLIT_K_QUANT_BLOCKS
+            if sm120_split_k_tiling_is_valid(m, k, threads, cols, splits * 1000 + quant)
+        )
+        return large + ws + small + split_k
     m537 = (
         ((SM120_FAMILY_M537, SM120_M537_TILING, 0),)
         if sm120_m537_is_valid(m, k)
@@ -418,7 +461,12 @@ def sm120_variant_reads_kmajor_l2t(m: int, k: int, variant: int, rank: int = 32)
     family, _, _ = sm120_decode_producer_variant(m, k, variant, rank)
     return (
         family
-        in (SM120_FAMILY_LARGE_M, SM120_FAMILY_WS_RANK128, SM120_FAMILY_SMALL_M)
+        in (
+            SM120_FAMILY_LARGE_M,
+            SM120_FAMILY_WS_RANK128,
+            SM120_FAMILY_SMALL_M,
+            SM120_FAMILY_SPLIT_K_RANK128,
+        )
         and rank > 64
     )
 

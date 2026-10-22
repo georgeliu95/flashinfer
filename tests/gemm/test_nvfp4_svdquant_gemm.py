@@ -4949,7 +4949,8 @@ def _small_m_variants(m: int, k: int, rank: int) -> list[int]:
         for variant, (family, _, _) in enumerate(
             routes.sm120_producer_variants(m, k, rank)
         )
-        if family == routes.SM120_FAMILY_SMALL_M
+        if family
+        in (routes.SM120_FAMILY_SMALL_M, routes.SM120_FAMILY_SPLIT_K_RANK128)
     ]
 
 

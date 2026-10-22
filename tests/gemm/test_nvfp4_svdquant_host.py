@@ -1856,18 +1856,23 @@ def test_rank64_fusion_invalidates_unfused_route_cache() -> None:
 def test_rank128_offers_small_m_after_existing_producers(m: int, k: int) -> None:
     variants = routes.sm120_producer_variants(m, k, 128)
     families = [family for family, _, _ in variants]
-    small = families.index(routes.SM120_FAMILY_SMALL_M)
-    # Appended last, so the large-M and warp-specialized indices keep their meaning.
-    assert set(families[:small]) == {
+    # New families are appended, so earlier indices keep their meaning.
+    order = [
         routes.SM120_FAMILY_LARGE_M,
         routes.SM120_FAMILY_WS_RANK128,
-    }
-    assert set(families[small:]) == {routes.SM120_FAMILY_SMALL_M}
-    for variant in range(small, len(variants)):
-        assert routes.sm120_decode_producer_variant(m, k, variant, 128) == variants[
-            variant
-        ]
-        # Every rank-128 producer, small-M included, reads K-major L2T.
+        routes.SM120_FAMILY_SMALL_M,
+        routes.SM120_FAMILY_SPLIT_K_RANK128,
+    ]
+    ranks = [order.index(family) for family in families]
+    assert ranks == sorted(ranks)
+    assert routes.SM120_FAMILY_SMALL_M in families
+    # Split-K is offered at small M only.
+    assert (routes.SM120_FAMILY_SPLIT_K_RANK128 in families) == (
+        m <= routes.SM120_SPLIT_K_MAX_M
+    )
+    for variant, entry in enumerate(variants):
+        assert routes.sm120_decode_producer_variant(m, k, variant, 128) == entry
+        # Every rank-128 producer reads K-major L2T.
         assert routes.sm120_variant_reads_kmajor_l2t(m, k, variant, 128)
         assert not routes.sm120_variant_packs_l2t(m, k, variant, 128)
     assert routes.sm120_linear_route_abi_version(m, k, 128) == 14
