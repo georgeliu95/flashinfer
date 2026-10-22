@@ -385,7 +385,11 @@ __launch_bounds__(BlockThreads) void nvfp4_smooth_quantize_lora_down_small_m_dyn
     // load instructions of per-step 32-bit loads and whole 32-byte sectors per
     // quad, and every chunk of a kDownPrefetch group is loaded before its MMAs.
     // The launcher requires K / warps to be a multiple of 32.
+#ifdef SVDQ_SM120_SMALL_M_PREFETCH
+    constexpr int kDownPrefetch = SVDQ_SM120_SMALL_M_PREFETCH;  // experiment-only override
+#else
     constexpr int kDownPrefetch = 2;
+#endif
     bool const has_low = a_row < M;
     bool const has_high = a_row + 8 < M;
     int const quad_k = (lane % 4) * 8;
