@@ -596,6 +596,12 @@ __global__ __launch_bounds__(256 * KSub) void nvfp4_smooth_quantize_lora_down_sp
   int const block = static_cast<int>(blockIdx.x);
   int const sf_cols = K / quant::SF_VEC_SIZE;
   constexpr int BlockThreads = kThreads;
+#ifdef SVDQ_SM120_SMALL_M_ABLATE
+  // Experiment-only timing ablation (outputs are wrong): 1 skips the down CTAs,
+  // 2 skips the quantize CTAs.
+  if (SVDQ_SM120_SMALL_M_ABLATE == 1 && block >= quant_blocks) return;
+  if (SVDQ_SM120_SMALL_M_ABLATE == 2 && block < quant_blocks) return;
+#endif
 
   if (block < quant_blocks) {
     // Flat (row, scale column) items over every quantize CTA, padding rows of
