@@ -251,10 +251,10 @@ SM120_FAMILY_SMALL_M_PACKED: Final = 4
 # mbarrier stage ring). Tiling = (tile M, tile K, stages * 100 + quantize
 # warps); the address-policy slot carries the grid mode.
 SM120_FAMILY_WS_RANK128: Final = 5
-# Rank-128 small-M producer whose down tiles are reduced by a cluster of CTAs
-# over K (split-K through distributed shared memory) and whose quantize CTAs
-# split the flat item range. Tiling = (block threads, down tile cols,
-# splits * 1000 + quantize CTAs).
+# Rank-128 small-M producer: down CTAs own a 16-row tile x all rank columns x
+# one K slice (split-K through the caller's workspace, the last CTA per row tile
+# reduces), quantize CTAs split the flat item range. Tiling = (splits, quantize
+# CTAs, 0). Needs a workspace, so only the linear route and the _ws entry run it.
 SM120_FAMILY_SPLIT_K_RANK128: Final = 6
 
 # M537 and packed small-M producers share the lane-packed L2T layout. Other
@@ -312,36 +312,29 @@ def sm120_ws_tiling_is_valid(m: int, k: int, tile_m: int, tile_k: int, packed: i
     return _ws_shared_bytes(tile_m, tile_k, stages) <= _STAGED_B_SHARED_LIMIT
 
 
-# Mirrors FI_SVDQ_SPLIT_K_TILINGS: (block threads, down tile cols, splits).
-SM120_SPLIT_K_TILING_LADDER: Final[tuple[tuple[int, int, int], ...]] = (
-    (256, 8, 2),
-    (256, 8, 4),
-    (256, 8, 8),
-    (256, 16, 4),
-    (512, 8, 2),
-    (512, 8, 4),
-    (512, 16, 2),
-    (512, 16, 4),
-)
-# Quantize CTA counts; each is a multiple of every split in the ladder.
+# Mirrors FI_SVDQ_SPLIT_K_SPLITS: K splits per 16-row tile.
+SM120_SPLIT_K_SPLITS: Final[tuple[int, ...]] = (4, 8, 16, 32)
+# Quantize CTA counts the split-K producer is offered with.
 SM120_SPLIT_K_QUANT_BLOCKS: Final[tuple[int, ...]] = (32, 64, 96)
 # Above this M the down tiles alone fill the GPU and the other families win.
 SM120_SPLIT_K_MAX_M: Final = 1024
+# The fp32 partials live in the linear route's GEMM workspace, which is never
+# smaller than this.
+SM120_SPLIT_K_SCRATCH_LIMIT: Final = 32 * 1024 * 1024
 
 
-def sm120_split_k_tiling_is_valid(
-    m: int, k: int, block_threads: int, down_tile_cols: int, splits_and_quant: int
-) -> bool:
+def sm120_split_k_scratch_bytes(m: int, splits: int, rank: int = 128) -> int:
+    """Mirrors split_k_scratch_bytes() in nvfp4_smooth_quantize_lora_down_sm120.cuh."""
+    return (m + 15) // 16 * splits * 16 * rank * 4
+
+
+def sm120_split_k_tiling_is_valid(m: int, k: int, splits: int, quant_blocks: int) -> bool:
     """Python counterpart of launch_split_k_kernel's guards."""
-    splits, quant_blocks = divmod(splits_and_quant, 1000)
-    if not 0 < m <= SM120_SPLIT_K_MAX_M or k <= 0:
+    if not 0 < m <= SM120_SPLIT_K_MAX_M or k <= 0 or splits < 1 or quant_blocks <= 0:
         return False
-    if splits < 1 or quant_blocks <= 0 or quant_blocks % splits:
+    if k % splits or (k // splits) % 32 or k % (4 * _GEOMETRY_SF_VEC):
         return False
-    warps = block_threads // 32
-    if k % (splits * warps) or (k // (splits * warps)) % 32:
-        return False
-    return not k % (4 * _GEOMETRY_SF_VEC)
+    return sm120_split_k_scratch_bytes(m, splits) <= SM120_SPLIT_K_SCRATCH_LIMIT
 
 
 def sm120_small_m_tiling_is_valid(
@@ -419,10 +412,10 @@ def sm120_producer_variants(
             for grid_mode in SM120_WS_GRID_MODES
         )
         split_k = tuple(
-            (SM120_FAMILY_SPLIT_K_RANK128, (threads, cols, splits * 1000 + quant), 0)
-            for threads, cols, splits in SM120_SPLIT_K_TILING_LADDER
+            (SM120_FAMILY_SPLIT_K_RANK128, (splits, quant, 0), 0)
+            for splits in SM120_SPLIT_K_SPLITS
             for quant in SM120_SPLIT_K_QUANT_BLOCKS
-            if sm120_split_k_tiling_is_valid(m, k, threads, cols, splits * 1000 + quant)
+            if sm120_split_k_tiling_is_valid(m, k, splits, quant)
         )
         return large + ws + small + split_k
     m537 = (

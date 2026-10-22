@@ -9,8 +9,10 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
+#include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <mutex>
 
 #include "flashinfer/gemm/nvfp4_smooth_quantize_lora_down_ws_sm120.cuh"
 #include "flashinfer/gemm/nvfp4_smooth_quantize_sm100.cuh"
@@ -558,51 +560,38 @@ inline cudaError_t launch_small_m_dyn_kernel(void const* x, void const* pre_quan
   }
 }
 
-// Rank-128 small-M producer with cluster split-K (family 6). The row-major
-// small-M kernel ties both halves to M: M / RowsPerQuantBlock quantize CTAs, and
-// one down CTA per 16 x DownTileCols tile that reduces all of K. At M = 64 that
-// is a few dozen CTAs whose time grows with K. Here the quantize CTAs split the
-// flat (row, scale column) item range, so their count is a tiling field; and
-// each down tile is reduced by a cluster of Splits CTAs, each over K / Splits,
-// whose shared-memory partials cluster rank 0 sums through distributed shared
-// memory. Reads K-major L2T, like every rank-128 producer.
-__device__ __forceinline__ std::uint32_t cluster_ctarank() {
-  std::uint32_t rank;
-  asm volatile("mov.u32 %0, %%cluster_ctarank;" : "=r"(rank));
-  return rank;
-}
-
-__device__ __forceinline__ void cluster_barrier() {
-  asm volatile("barrier.cluster.arrive.release.aligned;\nbarrier.cluster.wait.acquire.aligned;\n" ::
-                   : "memory");
-}
-
-__device__ __forceinline__ float load_cluster_f32(float const* local, std::uint32_t peer) {
-  std::uint32_t const address = static_cast<std::uint32_t>(__cvta_generic_to_shared(local));
-  std::uint32_t remote;
-  asm volatile("mapa.shared::cluster.u32 %0, %1, %2;" : "=r"(remote) : "r"(address), "r"(peer));
-  float value;
-  asm volatile("ld.shared::cluster.f32 %0, [%1];" : "=f"(value) : "r"(remote) : "memory");
-  return value;
-}
-
-template <int BlockThreads, int DownTileCols, int Splits, int Rank>
-__global__ __launch_bounds__(BlockThreads) void nvfp4_smooth_quantize_lora_down_split_k_sm120_kernel(
+// Rank-128 small-M producer with split-K over the grid (family 6). The row-major
+// small-M kernel ties both halves to M (M / RowsPerQuantBlock quantize CTAs; one
+// down CTA per 16 x DownTileCols tile reducing all of K), and with 8-column tiles
+// it re-reads every x row once per column tile: about 40 MB from L2 for 4.7 MB
+// of operands at M = 64, K = 12288 (ncu), which is what bounds it.
+//
+// Here a down CTA owns a 16-row tile x all Rank columns x one K slice: each of
+// its eight warps owns 16 columns, so x leaves L2 once per row tile and is then
+// shared through L1, and L2T leaves L2 once per row tile. Splits CTAs per row
+// tile cover K; each writes its fp32 partial to the caller's scratch workspace,
+// and the last to finish (a per-row-tile arrival counter that the last arrival
+// resets, so the counters stay zero between calls and across graph replays) sums
+// the partials into bf16 down. Quantize CTAs split the flat (row, scale column)
+// item range, so their count is a tiling field. Reads K-major L2T.
+template <int Splits, int Rank>
+__global__ __launch_bounds__(256) void nvfp4_smooth_quantize_lora_down_split_k_sm120_kernel(
     quant::Type const* __restrict__ x, quant::Type const* __restrict__ pre_quant_scale,
     float const* __restrict__ global_scale, std::uint64_t* __restrict__ xq,
     std::uint8_t* __restrict__ sf, quant::Type const* __restrict__ l2t_kmajor,
-    quant::Type* __restrict__ down, int M, int K, int quant_blocks) {
+    quant::Type* __restrict__ down, float* __restrict__ partials,
+    unsigned int* __restrict__ arrivals, int M, int K, int quant_blocks) {
   static_assert(Rank == 128, "the split-K small-M producer reads K-major L2T");
-  static_assert(BlockThreads % 32 == 0 && DownTileCols % kMmaN == 0 && Rank % DownTileCols == 0);
-  constexpr int kWarps = BlockThreads / 32;
-  constexpr int kNFragments = DownTileCols / kMmaN;
-  constexpr int kDownNTiles = Rank / DownTileCols;
-  constexpr int kDownElements = 16 * DownTileCols;
-  static_assert(BlockThreads >= kDownElements);
+  constexpr int kThreads = 256;
+  constexpr int kWarps = kThreads / 32;
+  constexpr int kWarpCols = Rank / kWarps;  // 16: two n8 fragments per warp
+  constexpr int kNFragments = kWarpCols / kMmaN;
+  constexpr int kTileElements = 16 * Rank;
+  static_assert(kWarpCols % kMmaN == 0);
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1200)
-  __shared__ __align__(16) float partial[kWarps][kDownElements];
   int const block = static_cast<int>(blockIdx.x);
   int const sf_cols = K / quant::SF_VEC_SIZE;
+  constexpr int BlockThreads = kThreads;
 
   if (block < quant_blocks) {
     // Flat (row, scale column) items over every quantize CTA, padding rows of
@@ -626,30 +615,26 @@ __global__ __launch_bounds__(BlockThreads) void nvfp4_smooth_quantize_lora_down_
         sf[sf_offset] = 0u;
       }
     }
-    // Every CTA of a cluster must reach the cluster barrier, quantize CTAs too.
-    cluster_barrier();
     return;
   }
 
   int const down_block = block - quant_blocks;
   int const split = down_block % Splits;
-  int const tile = down_block / Splits;
-  int const tile_m = tile / kDownNTiles;
-  int const tile_n = tile % kDownNTiles;
+  int const tile_m = down_block / Splits;
   int const warp = static_cast<int>(threadIdx.x) / 32;
   int const lane = static_cast<int>(threadIdx.x) % 32;
   int const group = lane / 4;
   int const quad_k = (lane % 4) * 8;
-  int const k_per_warp = K / (Splits * kWarps);
-  int const k_begin = (split * kWarps + warp) * k_per_warp;
-  int const k_end = k_begin + k_per_warp;
+  int const k_slice = K / Splits;
+  int const k_begin = split * k_slice;
+  int const k_end = k_begin + k_slice;
   int const a_row = tile_m * 16 + group;
   bool const has_low = a_row < M;
   bool const has_high = a_row + 8 < M;
   quant::Type const* const a_low = x + static_cast<std::int64_t>(a_row) * K + quad_k;
   quant::Type const* const a_high = a_low + static_cast<std::int64_t>(8) * K;
   quant::Type const* const b_lane =
-      l2t_kmajor + static_cast<std::int64_t>(tile_n * DownTileCols + group) * K + quad_k;
+      l2t_kmajor + static_cast<std::int64_t>(warp * kWarpCols + group) * K + quad_k;
 
   float d[kNFragments][4];
 #pragma unroll
@@ -658,8 +643,9 @@ __global__ __launch_bounds__(BlockThreads) void nvfp4_smooth_quantize_lora_down_
   }
   // Same 32-k chunk scheme as the row-major kernel's rank-128 loop: each lane
   // loads 8 contiguous k per operand row with one 16-byte load and feeds two k16
-  // steps from it, and both chunks of a pair are loaded before their MMAs.
-  constexpr int kPrefetch = 2;
+  // steps from it. Every warp of the CTA reads the same x rows (L1 hits after
+  // the first) and its own 16 L2T columns.
+  constexpr int kPrefetch = 4;
 #pragma unroll 1
   for (int group_base = k_begin; group_base < k_end; group_base += kPrefetch * 32) {
     uint4 a_lo[kPrefetch], a_hi[kPrefetch], b[kPrefetch][kNFragments];
@@ -691,40 +677,50 @@ __global__ __launch_bounds__(BlockThreads) void nvfp4_smooth_quantize_lora_down_
     }
   }
 
+  // Publish this CTA's 16 x Rank fp32 partial (each warp its own 16 columns,
+  // in the m16n8 accumulator order: thread (group, pair) holds rows group and
+  // group + 8, columns pair_col and pair_col + 1 of each fragment).
   int const pair_col = (lane % 4) * 2;
+  float* const slot = partials + (static_cast<std::int64_t>(tile_m) * Splits + split) * kTileElements;
 #pragma unroll
   for (int fragment = 0; fragment < kNFragments; ++fragment) {
-    int const output0 = group * DownTileCols + fragment * kMmaN + pair_col;
-    int const output1 = output0 + 8 * DownTileCols;
-    *reinterpret_cast<float2*>(&partial[warp][output0]) = make_float2(d[fragment][0], d[fragment][1]);
-    *reinterpret_cast<float2*>(&partial[warp][output1]) = make_float2(d[fragment][2], d[fragment][3]);
+    int const col = warp * kWarpCols + fragment * kMmaN + pair_col;
+    *reinterpret_cast<float2*>(slot + group * Rank + col) = make_float2(d[fragment][0], d[fragment][1]);
+    *reinterpret_cast<float2*>(slot + (group + 8) * Rank + col) =
+        make_float2(d[fragment][2], d[fragment][3]);
   }
+  // Last arrival per row tile sums the partials. Writers fence before arriving;
+  // the last arrival fences after observing the count, before reading.
+  __shared__ unsigned int arrival;
+  __threadfence();
   __syncthreads();
-  // Fold this CTA's warps into partial[0], then publish it to the cluster.
-  int const element = static_cast<int>(threadIdx.x);
-  if (element < kDownElements) {
-    float accum = partial[0][element];
+  if (threadIdx.x == 0) arrival = atomicAdd(&arrivals[tile_m], 1u);
+  __syncthreads();
+  if (arrival != Splits - 1) return;
+  __threadfence();
+  float const* const tile_partials = partials + static_cast<std::int64_t>(tile_m) * Splits * kTileElements;
+  for (int element = static_cast<int>(threadIdx.x) * 4; element < kTileElements;
+       element += kThreads * 4) {
+    float4 accum = __ldcg(reinterpret_cast<float4 const*>(tile_partials + element));
 #pragma unroll
-    for (int source_warp = 1; source_warp < kWarps; ++source_warp) {
-      accum += partial[source_warp][element];
+    for (int s = 1; s < Splits; ++s) {
+      float4 const part =
+          __ldcg(reinterpret_cast<float4 const*>(tile_partials + s * kTileElements + element));
+      accum.x += part.x;
+      accum.y += part.y;
+      accum.z += part.z;
+      accum.w += part.w;
     }
-    partial[0][element] = accum;
-  }
-  cluster_barrier();
-  if (cluster_ctarank() == 0 && element < kDownElements) {
-    float accum = partial[0][element];
-#pragma unroll
-    for (std::uint32_t peer = 1; peer < Splits; ++peer) {
-      accum += load_cluster_f32(&partial[0][element], peer);
-    }
-    int const row = tile_m * 16 + element / DownTileCols;
-    int const col = tile_n * DownTileCols + element % DownTileCols;
+    int const row = tile_m * 16 + element / Rank;
     if (row < M) {
-      down[static_cast<std::int64_t>(row) * Rank + col] = __float2bfloat16_rn(accum);
+      __nv_bfloat162* out = reinterpret_cast<__nv_bfloat162*>(
+          down + static_cast<std::int64_t>(row) * Rank + element % Rank);
+      out[0] = __floats2bfloat162_rn(accum.x, accum.y);
+      out[1] = __floats2bfloat162_rn(accum.z, accum.w);
     }
   }
-  // Peers keep their shared memory alive until rank 0 has read it.
-  cluster_barrier();
+  // Leave the counter at zero for the next call (and the next graph replay).
+  if (threadIdx.x == 0) arrivals[tile_m] = 0u;
 #else
   if (threadIdx.x == 0 && blockIdx.x == 0) {
     __trap();
@@ -732,41 +728,70 @@ __global__ __launch_bounds__(BlockThreads) void nvfp4_smooth_quantize_lora_down_
 #endif
 }
 
-template <int BlockThreads, int DownTileCols, int Splits, int Rank>
+// Per-row-tile arrival counters for the split-K producer: one zeroed allocation
+// per device, created on the first (eager) call. Every call leaves them at zero,
+// so they need no reset between calls or across graph replays.
+constexpr int kSplitKMaxRowTiles = 4096;
+inline cudaError_t split_k_arrivals(int device, cudaStream_t stream, unsigned int** out) {
+  static std::mutex mutex;
+  static unsigned int* counters[64] = {};
+  if (device < 0 || device >= 64) return cudaErrorInvalidDevice;
+  std::lock_guard<std::mutex> lock(mutex);
+  if (counters[device] == nullptr) {
+    cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+    cudaError_t status = cudaStreamIsCapturing(stream, &capture);
+    if (status != cudaSuccess) return status;
+    // Allocation is not capturable; the tuner runs every tactic eagerly first.
+    if (capture != cudaStreamCaptureStatusNone) return cudaErrorStreamCaptureUnsupported;
+    unsigned int* buffer = nullptr;
+    status = cudaMalloc(&buffer, kSplitKMaxRowTiles * sizeof(unsigned int));
+    if (status != cudaSuccess) return status;
+    status = cudaMemset(buffer, 0, kSplitKMaxRowTiles * sizeof(unsigned int));
+    if (status != cudaSuccess) return status;
+    counters[device] = buffer;
+  }
+  *out = counters[device];
+  return cudaSuccess;
+}
+
+// Scratch bytes the split-K producer needs in the caller's workspace.
+inline std::size_t split_k_scratch_bytes(int m, int splits, int rank) {
+  return static_cast<std::size_t>((m + 15) / 16) * splits * 16 * rank * sizeof(float);
+}
+
+template <int Splits, int Rank>
 inline cudaError_t launch_split_k_kernel(void const* x, void const* pre_quant_scale,
                                          float const* global_scale, void* xq, void* sf,
                                          void const* l2t_kmajor, void* down, int m, int k,
-                                         int quant_blocks, cudaStream_t stream) {
-  constexpr int kWarps = BlockThreads / 32;
-  if constexpr (Rank != 128 || BlockThreads % 32 || DownTileCols % kMmaN ||
-                Rank % DownTileCols || Splits < 1 || Splits > 8) {
+                                         int quant_blocks, void* workspace,
+                                         std::size_t workspace_bytes, cudaStream_t stream) {
+  if constexpr (Rank != 128 || Splits < 1) {
     return cudaErrorInvalidValue;
   } else {
-    if (m <= 0 || m > std::numeric_limits<int>::max() - 127 || k <= 0 || quant_blocks <= 0 ||
-        quant_blocks % Splits) {
+    if (m <= 0 || m > std::numeric_limits<int>::max() - 127 || k <= 0 || quant_blocks <= 0) {
       return cudaErrorInvalidValue;
     }
-    if (k % (Splits * kWarps) || (k / (Splits * kWarps)) % 32) return cudaErrorInvalidValue;
+    int const row_tiles = (m + 15) / 16;
+    if (row_tiles > kSplitKMaxRowTiles) return cudaErrorInvalidValue;
+    if (k % Splits || (k / Splits) % 32) return cudaErrorInvalidValue;
     if (k % (4 * quant::SF_VEC_SIZE)) return cudaErrorInvalidValue;
-    int const grid_blocks = quant_blocks + ((m + 15) / 16) * (Rank / DownTileCols) * Splits;
-    cudaLaunchConfig_t config = {};
-    config.gridDim = dim3(grid_blocks);
-    config.blockDim = dim3(BlockThreads);
-    config.dynamicSmemBytes = 0;
-    config.stream = stream;
-    cudaLaunchAttribute attributes[1];
-    attributes[0].id = cudaLaunchAttributeClusterDimension;
-    attributes[0].val.clusterDim.x = Splits;
-    attributes[0].val.clusterDim.y = 1;
-    attributes[0].val.clusterDim.z = 1;
-    config.attrs = attributes;
-    config.numAttrs = 1;
-    return cudaLaunchKernelEx(
-        &config, nvfp4_smooth_quantize_lora_down_split_k_sm120_kernel<BlockThreads, DownTileCols, Splits, Rank>,
+    if (workspace == nullptr || reinterpret_cast<std::uintptr_t>(workspace) % 16 ||
+        workspace_bytes < split_k_scratch_bytes(m, Splits, Rank)) {
+      return cudaErrorInvalidValue;
+    }
+    int device = 0;
+    cudaError_t status = cudaGetDevice(&device);
+    if (status != cudaSuccess) return status;
+    unsigned int* arrivals = nullptr;
+    status = split_k_arrivals(device, stream, &arrivals);
+    if (status != cudaSuccess) return status;
+    int const grid_blocks = quant_blocks + row_tiles * Splits;
+    nvfp4_smooth_quantize_lora_down_split_k_sm120_kernel<Splits, Rank><<<grid_blocks, 256, 0, stream>>>(
         static_cast<quant::Type const*>(x), static_cast<quant::Type const*>(pre_quant_scale),
         global_scale, static_cast<std::uint64_t*>(xq), static_cast<std::uint8_t*>(sf),
-        static_cast<quant::Type const*>(l2t_kmajor), static_cast<quant::Type*>(down), m, k,
-        quant_blocks);
+        static_cast<quant::Type const*>(l2t_kmajor), static_cast<quant::Type*>(down),
+        static_cast<float*>(workspace), arrivals, m, k, quant_blocks);
+    return cudaGetLastError();
   }
 }
 
@@ -1681,20 +1706,16 @@ inline cudaError_t launch_large_m_dyn_kernel(void const* x, void const* pre_quan
   X(1024, 8, 16)                   \
   X(1024, 16, 16)
 
+// Rank-128 split-K small-M splits per row tile; the quantize CTA count is a
+// runtime field.
+#define FI_SVDQ_SPLIT_K_SPLITS(X) \
+  X(4)                            \
+  X(8)                            \
+  X(16)                           \
+  X(32)
+
 // Rank 64 reserves eight warps for LoRA-down; the remaining warps quantize.
 // Rank 128 reuses the same eight down warps, each owning two n8 fragments.
-// Rank-128 cluster split-K small-M tilings (block threads, down tile cols,
-// cluster splits); the quantize CTA count is a runtime field.
-#define FI_SVDQ_SPLIT_K_TILINGS(X) \
-  X(256, 8, 2)                     \
-  X(256, 8, 4)                     \
-  X(256, 8, 8)                     \
-  X(256, 16, 4)                    \
-  X(512, 8, 2)                     \
-  X(512, 8, 4)                     \
-  X(512, 16, 2)                    \
-  X(512, 16, 4)
-
 #define FI_SVDQ_RANK64_LARGE_M_GEOMETRIES(X) \
   X(320, 16, 128)                            \
   X(320, 32, 128)                            \
@@ -1770,7 +1791,8 @@ template <int Rank = 32>
 inline cudaError_t nvfp4_smooth_quantize_lora_down_family_sm120(
     void const* x, void const* pre_quant_scale, float const* global_scale, void* xq, void* sf,
     void const* l2t_smoothed, void* down, int m, int k, int family, int a, int b, int c,
-    int address_policy, cudaStream_t stream, bool signal_launch = false) {
+    int address_policy, cudaStream_t stream, bool signal_launch = false,
+    void* workspace = nullptr, std::size_t workspace_bytes = 0) {
   namespace large_m = smooth_quantize_lora_down_large_m_sm120_detail;
   namespace small_m = smooth_quantize_lora_down_small_m_sm120_detail;
   using large_m::DynAddress;
@@ -1786,14 +1808,14 @@ inline cudaError_t nvfp4_smooth_quantize_lora_down_family_sm120(
           address_policy, stream);
     }
     if (family == 6) {
-      // c = splits * 1000 + quantize CTAs.
-#define FI_SVDQ_SPLIT_K_CASE(BT, DTC, S)                                                      \
-  if (a == (BT) && b == (DTC) && c / 1000 == (S)) {                                           \
-    return small_m::launch_split_k_kernel<BT, DTC, S, Rank>(x, pre_quant_scale, global_scale, \
-                                                            xq, sf, l2t_smoothed, down, m, k, \
-                                                            c % 1000, stream);                \
+      // a = splits, b = quantize CTAs; needs the caller's scratch workspace.
+#define FI_SVDQ_SPLIT_K_CASE(S)                                                          \
+  if (a == (S)) {                                                                        \
+    return small_m::launch_split_k_kernel<S, Rank>(x, pre_quant_scale, global_scale, xq, \
+                                                   sf, l2t_smoothed, down, m, k, b,      \
+                                                   workspace, workspace_bytes, stream);  \
   }
-      FI_SVDQ_SPLIT_K_TILINGS(FI_SVDQ_SPLIT_K_CASE)
+      FI_SVDQ_SPLIT_K_SPLITS(FI_SVDQ_SPLIT_K_CASE)
 #undef FI_SVDQ_SPLIT_K_CASE
       return cudaErrorInvalidValue;
     }

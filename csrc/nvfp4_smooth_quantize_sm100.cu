@@ -238,7 +238,9 @@ void nvfp4_quantize_smooth_lora_down_dyn_sm120_impl(TensorView x, TensorView pqs
                                                     TensorView l2t_smoothed, TensorView xq,
                                                     TensorView sf, TensorView down, int family,
                                                     int tiling0, int tiling1, int tiling2,
-                                                    int address_policy, bool signal_launch) {
+                                                    int address_policy, bool signal_launch,
+                                                    void* workspace = nullptr,
+                                                    std::size_t workspace_bytes = 0) {
   check_sm120_prefix_inputs(x, pqs, global_scale, l2t_smoothed, xq, sf, down);
   int const m = static_cast<int>(x.size(0));
   int const k = static_cast<int>(x.size(1));
@@ -248,7 +250,8 @@ void nvfp4_quantize_smooth_lora_down_dyn_sm120_impl(TensorView x, TensorView pqs
       flashinfer::gemm::nvfp4_smooth_quantize_lora_down_family_sm120<kSm120PrefixRank>(
           x.data_ptr(), pqs.data_ptr(), static_cast<float const*>(global_scale.data_ptr()),
           xq.data_ptr(), sf.data_ptr(), l2t_smoothed.data_ptr(), down.data_ptr(), m, k, family,
-          tiling0, tiling1, tiling2, address_policy, stream, signal_launch);
+          tiling0, tiling1, tiling2, address_policy, stream, signal_launch, workspace,
+          workspace_bytes);
   TVM_FFI_ICHECK_EQ(status, cudaSuccess)
       << "nvfp4_quantize_smooth_lora_down_dyn_sm120 failed: " << cudaGetErrorString(status);
 }
@@ -262,6 +265,20 @@ void nvfp4_quantize_smooth_lora_down_dyn_sm120(TensorView x, TensorView pqs,
   nvfp4_quantize_smooth_lora_down_dyn_sm120_impl(x, pqs, global_scale, l2t_smoothed, xq, sf, down,
                                                  family, tiling0, tiling1, tiling2, address_policy,
                                                  false);
+}
+
+// Same, with a scratch workspace for producers that need one (split-K family 6).
+void nvfp4_quantize_smooth_lora_down_dyn_ws_sm120(TensorView x, TensorView pqs,
+                                                  TensorView global_scale, TensorView l2t_smoothed,
+                                                  TensorView xq, TensorView sf, TensorView down,
+                                                  int family, int tiling0, int tiling1, int tiling2,
+                                                  int address_policy, TensorView workspace) {
+  CHECK_INPUT_AND_TYPE(workspace, dl_uint8);
+  CHECK_DEVICE(workspace, x);
+  nvfp4_quantize_smooth_lora_down_dyn_sm120_impl(
+      x, pqs, global_scale, l2t_smoothed, xq, sf, down, family, tiling0, tiling1, tiling2,
+      address_policy, false, workspace.data_ptr(),
+      static_cast<std::size_t>(workspace.numel()));
 }
 
 void nvfp4_quantize_smooth_lora_down_overlap_sm120(TensorView x, TensorView pqs,
@@ -281,6 +298,8 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(nvfp4_svdquant_pack_l2t_sm120,
                               torch_ext::nvfp4_svdquant_pack_l2t_sm120);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(nvfp4_quantize_smooth_lora_down_dyn_sm120,
                               torch_ext::nvfp4_quantize_smooth_lora_down_dyn_sm120);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(nvfp4_quantize_smooth_lora_down_dyn_ws_sm120,
+                              torch_ext::nvfp4_quantize_smooth_lora_down_dyn_ws_sm120);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(nvfp4_quantize_smooth_lora_down_sm120,
                               torch_ext::nvfp4_quantize_smooth_lora_down_sm120);
 

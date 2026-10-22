@@ -4995,10 +4995,22 @@ def test_fused_prefix_observes_graph_weight_updates(
     # The layout the producer reads; a K-major copy is refreshed from l2t below.
     l2t_read = backend._pack_sm120_kmajor_l2t(l2t) if kmajor else l2t
 
+    # The split-K producer reduces through a scratch workspace; fill it with
+    # garbage so a stale partial would show up as a wrong result.
+    workspace = torch.full(
+        (routes.sm120_split_k_scratch_bytes(m, 32, rank),), 0xFF, dtype=torch.uint8, device="cuda"
+    )
+
     def prefix() -> None:
-        module.nvfp4_quantize_smooth_lora_down_dyn_sm120(
-            x, pqs, global_scale, l2t_read, xq, sf, down, family, *tiling, address_policy
-        )
+        if family == routes.SM120_FAMILY_SPLIT_K_RANK128:
+            module.nvfp4_quantize_smooth_lora_down_dyn_ws_sm120(
+                x, pqs, global_scale, l2t_read, xq, sf, down, family, *tiling,
+                address_policy, workspace,
+            )
+        else:
+            module.nvfp4_quantize_smooth_lora_down_dyn_sm120(
+                x, pqs, global_scale, l2t_read, xq, sf, down, family, *tiling, address_policy
+            )
 
     def check() -> None:
         module.nvfp4_quantize_smooth(

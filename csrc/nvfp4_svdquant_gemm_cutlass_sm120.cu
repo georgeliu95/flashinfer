@@ -542,7 +542,8 @@ void nvfp4_quantize_smooth_lora_down_dyn_sm120_impl(TensorView x, TensorView pqs
                                                     TensorView l2t_smoothed, TensorView xq,
                                                     TensorView sf, TensorView down, int family,
                                                     int tiling0, int tiling1, int tiling2,
-                                                    int address_policy, bool signal_launch);
+                                                    int address_policy, bool signal_launch,
+                                                    void* workspace, std::size_t workspace_bytes);
 
 void nvfp4_quantize_smooth_lora_down_overlap_sm120(TensorView x, TensorView pqs,
                                                    TensorView global_scale, TensorView l2t_smoothed,
@@ -728,7 +729,8 @@ void dispatch_svdquant_producer_sm120(TensorView x, TensorView pqs, TensorView g
   if (producer_family >= 0) {
     nvfp4_quantize_smooth_lora_down_dyn_sm120_impl(
         x, pqs, global_scale, l2t_smoothed, xq, a_sf, down, producer_family, tiling0, tiling1,
-        tiling2, address_policy, producer_family == 4 && enable_pdl);
+        tiling2, address_policy, producer_family == 4 && enable_pdl, workspace_buffer.data_ptr(),
+        static_cast<std::size_t>(workspace_buffer.numel()) * get_element_size(workspace_buffer));
     return;
   }
   nvfp4_quantize_smooth_lora_down_geometry_sm120(x, pqs, global_scale, l2t_smoothed, xq, a_sf, down,
