@@ -600,7 +600,7 @@ __global__ __launch_bounds__(256 * KSub) void nvfp4_smooth_quantize_lora_down_sp
   // Experiment-only timing ablation (outputs are wrong): 1 skips the down CTAs,
   // 2 skips the quantize CTAs.
   if (SVDQ_SM120_SMALL_M_ABLATE == 1 && block >= quant_blocks) return;
-  if (SVDQ_SM120_SMALL_M_ABLATE == 2 && block < quant_blocks) return;
+  if (SVDQ_SM120_SMALL_M_ABLATE >= 2 && block < quant_blocks) return;
 #endif
 
   if (block < quant_blocks) {
@@ -689,6 +689,13 @@ __global__ __launch_bounds__(256 * KSub) void nvfp4_smooth_quantize_lora_down_sp
     }
   }
 
+#ifdef SVDQ_SM120_SMALL_M_ABLATE
+  // 5: down loads + MMAs only (accumulators kept live by a store that never runs).
+  if (SVDQ_SM120_SMALL_M_ABLATE == 5) {
+    if (M < 0) partials[threadIdx.x] = d[0][0] + d[kNFragments - 1][3];
+    return;
+  }
+#endif
   // Publish this CTA's 16 x Rank fp32 partial. In m16n8 accumulator order,
   // thread (group, pair) holds rows group and group + 8, columns pair_col and
   // pair_col + 1 of each fragment. With KSub > 1 the K sub-slices of a column
@@ -729,6 +736,10 @@ __global__ __launch_bounds__(256 * KSub) void nvfp4_smooth_quantize_lora_down_sp
       *reinterpret_cast<float4*>(slot + element) = accum;
     }
   }
+#ifdef SVDQ_SM120_SMALL_M_ABLATE
+  // 6: also publish the partial, but no arrival or final reduction.
+  if (SVDQ_SM120_SMALL_M_ABLATE == 6) return;
+#endif
   // Last arrival per row tile sums the partials. Writers fence before arriving;
   // the last arrival fences after observing the count, before reading.
   __shared__ unsigned int arrival;
