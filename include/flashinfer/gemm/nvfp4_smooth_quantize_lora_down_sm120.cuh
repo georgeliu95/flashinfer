@@ -574,20 +574,24 @@ inline cudaError_t launch_small_m_dyn_kernel(void const* x, void const* pre_quan
 // resets, so the counters stay zero between calls and across graph replays) sums
 // the partials into bf16 down. Quantize CTAs split the flat (row, scale column)
 // item range, so their count is a tiling field. Reads K-major L2T.
-template <int Splits, int Rank>
-__global__ __launch_bounds__(256) void nvfp4_smooth_quantize_lora_down_split_k_sm120_kernel(
+// KSub sets the CTA's memory-level parallelism: its warps are eight column
+// groups x KSub K sub-slices, reduced in shared memory before the partial is
+// published. ncu with KSub = 1 showed 16-27% warps active and long_scoreboard
+// stalls at a quarter of the L2 traffic, i.e. too few loads in flight per SM.
+template <int Splits, int KSub, int Rank>
+__global__ __launch_bounds__(256 * KSub) void nvfp4_smooth_quantize_lora_down_split_k_sm120_kernel(
     quant::Type const* __restrict__ x, quant::Type const* __restrict__ pre_quant_scale,
     float const* __restrict__ global_scale, std::uint64_t* __restrict__ xq,
     std::uint8_t* __restrict__ sf, quant::Type const* __restrict__ l2t_kmajor,
     quant::Type* __restrict__ down, float* __restrict__ partials,
     unsigned int* __restrict__ arrivals, int M, int K, int quant_blocks) {
   static_assert(Rank == 128, "the split-K small-M producer reads K-major L2T");
-  constexpr int kThreads = 256;
-  constexpr int kWarps = kThreads / 32;
-  constexpr int kWarpCols = Rank / kWarps;  // 16: two n8 fragments per warp
+  constexpr int kColGroups = 8;
+  constexpr int kThreads = 32 * kColGroups * KSub;
+  constexpr int kWarpCols = Rank / kColGroups;  // 16: two n8 fragments per warp
   constexpr int kNFragments = kWarpCols / kMmaN;
   constexpr int kTileElements = 16 * Rank;
-  static_assert(kWarpCols % kMmaN == 0);
+  static_assert(kWarpCols % kMmaN == 0 && KSub >= 1);
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1200)
   int const block = static_cast<int>(blockIdx.x);
   int const sf_cols = K / quant::SF_VEC_SIZE;
@@ -622,11 +626,13 @@ __global__ __launch_bounds__(256) void nvfp4_smooth_quantize_lora_down_split_k_s
   int const split = down_block % Splits;
   int const tile_m = down_block / Splits;
   int const warp = static_cast<int>(threadIdx.x) / 32;
+  int const col_group = warp % kColGroups;
+  int const k_sub = warp / kColGroups;
   int const lane = static_cast<int>(threadIdx.x) % 32;
   int const group = lane / 4;
   int const quad_k = (lane % 4) * 8;
-  int const k_slice = K / Splits;
-  int const k_begin = split * k_slice;
+  int const k_slice = K / (Splits * KSub);
+  int const k_begin = (split * KSub + k_sub) * k_slice;
   int const k_end = k_begin + k_slice;
   int const a_row = tile_m * 16 + group;
   bool const has_low = a_row < M;
@@ -634,7 +640,7 @@ __global__ __launch_bounds__(256) void nvfp4_smooth_quantize_lora_down_split_k_s
   quant::Type const* const a_low = x + static_cast<std::int64_t>(a_row) * K + quad_k;
   quant::Type const* const a_high = a_low + static_cast<std::int64_t>(8) * K;
   quant::Type const* const b_lane =
-      l2t_kmajor + static_cast<std::int64_t>(warp * kWarpCols + group) * K + quad_k;
+      l2t_kmajor + static_cast<std::int64_t>(col_group * kWarpCols + group) * K + quad_k;
 
   float d[kNFragments][4];
 #pragma unroll
@@ -677,17 +683,45 @@ __global__ __launch_bounds__(256) void nvfp4_smooth_quantize_lora_down_split_k_s
     }
   }
 
-  // Publish this CTA's 16 x Rank fp32 partial (each warp its own 16 columns,
-  // in the m16n8 accumulator order: thread (group, pair) holds rows group and
-  // group + 8, columns pair_col and pair_col + 1 of each fragment).
+  // Publish this CTA's 16 x Rank fp32 partial. In m16n8 accumulator order,
+  // thread (group, pair) holds rows group and group + 8, columns pair_col and
+  // pair_col + 1 of each fragment. With KSub > 1 the K sub-slices of a column
+  // group are summed in shared memory first.
   int const pair_col = (lane % 4) * 2;
   float* const slot = partials + (static_cast<std::int64_t>(tile_m) * Splits + split) * kTileElements;
+  if constexpr (KSub == 1) {
 #pragma unroll
-  for (int fragment = 0; fragment < kNFragments; ++fragment) {
-    int const col = warp * kWarpCols + fragment * kMmaN + pair_col;
-    *reinterpret_cast<float2*>(slot + group * Rank + col) = make_float2(d[fragment][0], d[fragment][1]);
-    *reinterpret_cast<float2*>(slot + (group + 8) * Rank + col) =
-        make_float2(d[fragment][2], d[fragment][3]);
+    for (int fragment = 0; fragment < kNFragments; ++fragment) {
+      int const col = col_group * kWarpCols + fragment * kMmaN + pair_col;
+      *reinterpret_cast<float2*>(slot + group * Rank + col) =
+          make_float2(d[fragment][0], d[fragment][1]);
+      *reinterpret_cast<float2*>(slot + (group + 8) * Rank + col) =
+          make_float2(d[fragment][2], d[fragment][3]);
+    }
+  } else {
+    __shared__ __align__(16) float sub_partials[KSub][kTileElements];
+#pragma unroll
+    for (int fragment = 0; fragment < kNFragments; ++fragment) {
+      int const col = col_group * kWarpCols + fragment * kMmaN + pair_col;
+      *reinterpret_cast<float2*>(&sub_partials[k_sub][group * Rank + col]) =
+          make_float2(d[fragment][0], d[fragment][1]);
+      *reinterpret_cast<float2*>(&sub_partials[k_sub][(group + 8) * Rank + col]) =
+          make_float2(d[fragment][2], d[fragment][3]);
+    }
+    __syncthreads();
+    for (int element = static_cast<int>(threadIdx.x) * 4; element < kTileElements;
+         element += kThreads * 4) {
+      float4 accum = *reinterpret_cast<float4 const*>(&sub_partials[0][element]);
+#pragma unroll
+      for (int s = 1; s < KSub; ++s) {
+        float4 const part = *reinterpret_cast<float4 const*>(&sub_partials[s][element]);
+        accum.x += part.x;
+        accum.y += part.y;
+        accum.z += part.z;
+        accum.w += part.w;
+      }
+      *reinterpret_cast<float4*>(slot + element) = accum;
+    }
   }
   // Last arrival per row tile sums the partials. Writers fence before arriving;
   // the last arrival fences after observing the count, before reading.
@@ -759,13 +793,13 @@ inline std::size_t split_k_scratch_bytes(int m, int splits, int rank) {
   return static_cast<std::size_t>((m + 15) / 16) * splits * 16 * rank * sizeof(float);
 }
 
-template <int Splits, int Rank>
+template <int Splits, int KSub, int Rank>
 inline cudaError_t launch_split_k_kernel(void const* x, void const* pre_quant_scale,
                                          float const* global_scale, void* xq, void* sf,
                                          void const* l2t_kmajor, void* down, int m, int k,
                                          int quant_blocks, void* workspace,
                                          std::size_t workspace_bytes, cudaStream_t stream) {
-  if constexpr (Rank != 128 || Splits < 1) {
+  if constexpr (Rank != 128 || Splits < 1 || KSub < 1) {
     return cudaErrorInvalidValue;
   } else {
     if (m <= 0 || m > std::numeric_limits<int>::max() - 127 || k <= 0 || quant_blocks <= 0) {
@@ -773,7 +807,7 @@ inline cudaError_t launch_split_k_kernel(void const* x, void const* pre_quant_sc
     }
     int const row_tiles = (m + 15) / 16;
     if (row_tiles > kSplitKMaxRowTiles) return cudaErrorInvalidValue;
-    if (k % Splits || (k / Splits) % 32) return cudaErrorInvalidValue;
+    if (k % (Splits * KSub) || (k / (Splits * KSub)) % 32) return cudaErrorInvalidValue;
     if (k % (4 * quant::SF_VEC_SIZE)) return cudaErrorInvalidValue;
     if (workspace == nullptr || reinterpret_cast<std::uintptr_t>(workspace) % 16 ||
         workspace_bytes < split_k_scratch_bytes(m, Splits, Rank)) {
@@ -786,7 +820,8 @@ inline cudaError_t launch_split_k_kernel(void const* x, void const* pre_quant_sc
     status = split_k_arrivals(device, stream, &arrivals);
     if (status != cudaSuccess) return status;
     int const grid_blocks = quant_blocks + row_tiles * Splits;
-    nvfp4_smooth_quantize_lora_down_split_k_sm120_kernel<Splits, Rank><<<grid_blocks, 256, 0, stream>>>(
+    nvfp4_smooth_quantize_lora_down_split_k_sm120_kernel<Splits, KSub, Rank>
+        <<<grid_blocks, 256 * KSub, 0, stream>>>(
         static_cast<quant::Type const*>(x), static_cast<quant::Type const*>(pre_quant_scale),
         global_scale, static_cast<std::uint64_t*>(xq), static_cast<std::uint8_t*>(sf),
         static_cast<quant::Type const*>(l2t_kmajor), static_cast<quant::Type*>(down),
@@ -1706,13 +1741,16 @@ inline cudaError_t launch_large_m_dyn_kernel(void const* x, void const* pre_quan
   X(1024, 8, 16)                   \
   X(1024, 16, 16)
 
-// Rank-128 split-K small-M splits per row tile; the quantize CTA count is a
-// runtime field.
-#define FI_SVDQ_SPLIT_K_SPLITS(X) \
-  X(4)                            \
-  X(8)                            \
-  X(16)                           \
-  X(32)
+// Rank-128 split-K small-M (K splits per row tile, K sub-slices per CTA); the
+// quantize CTA count is a runtime field.
+#define FI_SVDQ_SPLIT_K_TILINGS(X) \
+  X(4, 4)                          \
+  X(8, 2)                          \
+  X(8, 4)                          \
+  X(16, 2)                         \
+  X(16, 4)                         \
+  X(32, 1)                         \
+  X(32, 2)
 
 // Rank 64 reserves eight warps for LoRA-down; the remaining warps quantize.
 // Rank 128 reuses the same eight down warps, each owning two n8 fragments.
@@ -1808,14 +1846,15 @@ inline cudaError_t nvfp4_smooth_quantize_lora_down_family_sm120(
           address_policy, stream);
     }
     if (family == 6) {
-      // a = splits, b = quantize CTAs; needs the caller's scratch workspace.
-#define FI_SVDQ_SPLIT_K_CASE(S)                                                          \
-  if (a == (S)) {                                                                        \
-    return small_m::launch_split_k_kernel<S, Rank>(x, pre_quant_scale, global_scale, xq, \
-                                                   sf, l2t_smoothed, down, m, k, b,      \
-                                                   workspace, workspace_bytes, stream);  \
+      // a = splits, b = quantize CTAs, c = K sub-slices per CTA; needs the
+      // caller's scratch workspace.
+#define FI_SVDQ_SPLIT_K_CASE(S, KS)                                                         \
+  if (a == (S) && c == (KS)) {                                                              \
+    return small_m::launch_split_k_kernel<S, KS, Rank>(x, pre_quant_scale, global_scale, xq, \
+                                                       sf, l2t_smoothed, down, m, k, b,      \
+                                                       workspace, workspace_bytes, stream);  \
   }
-      FI_SVDQ_SPLIT_K_SPLITS(FI_SVDQ_SPLIT_K_CASE)
+      FI_SVDQ_SPLIT_K_TILINGS(FI_SVDQ_SPLIT_K_CASE)
 #undef FI_SVDQ_SPLIT_K_CASE
       return cudaErrorInvalidValue;
     }

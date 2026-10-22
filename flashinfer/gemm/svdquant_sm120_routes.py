@@ -254,7 +254,8 @@ SM120_FAMILY_WS_RANK128: Final = 5
 # Rank-128 small-M producer: down CTAs own a 16-row tile x all rank columns x
 # one K slice (split-K through the caller's workspace, the last CTA per row tile
 # reduces), quantize CTAs split the flat item range. Tiling = (splits, quantize
-# CTAs, 0). Needs a workspace, so only the linear route and the _ws entry run it.
+# CTAs, K sub-slices per CTA). Needs a workspace, so only the linear route and
+# the _ws entry run it.
 SM120_FAMILY_SPLIT_K_RANK128: Final = 6
 
 # M537 and packed small-M producers share the lane-packed L2T layout. Other
@@ -312,8 +313,16 @@ def sm120_ws_tiling_is_valid(m: int, k: int, tile_m: int, tile_k: int, packed: i
     return _ws_shared_bytes(tile_m, tile_k, stages) <= _STAGED_B_SHARED_LIMIT
 
 
-# Mirrors FI_SVDQ_SPLIT_K_SPLITS: K splits per 16-row tile.
-SM120_SPLIT_K_SPLITS: Final[tuple[int, ...]] = (4, 8, 16, 32)
+# Mirrors FI_SVDQ_SPLIT_K_TILINGS: (K splits per 16-row tile, K sub-slices per CTA).
+SM120_SPLIT_K_TILINGS: Final[tuple[tuple[int, int], ...]] = (
+    (4, 4),
+    (8, 2),
+    (8, 4),
+    (16, 2),
+    (16, 4),
+    (32, 1),
+    (32, 2),
+)
 # Quantize CTA counts the split-K producer is offered with.
 SM120_SPLIT_K_QUANT_BLOCKS: Final[tuple[int, ...]] = (32, 64, 96)
 # Above this M the down tiles alone fill the GPU and the other families win.
@@ -328,11 +337,15 @@ def sm120_split_k_scratch_bytes(m: int, splits: int, rank: int = 128) -> int:
     return (m + 15) // 16 * splits * 16 * rank * 4
 
 
-def sm120_split_k_tiling_is_valid(m: int, k: int, splits: int, quant_blocks: int) -> bool:
+def sm120_split_k_tiling_is_valid(
+    m: int, k: int, splits: int, quant_blocks: int, k_sub: int
+) -> bool:
     """Python counterpart of launch_split_k_kernel's guards."""
     if not 0 < m <= SM120_SPLIT_K_MAX_M or k <= 0 or splits < 1 or quant_blocks <= 0:
         return False
-    if k % splits or (k // splits) % 32 or k % (4 * _GEOMETRY_SF_VEC):
+    if k_sub < 1 or k % (splits * k_sub) or (k // (splits * k_sub)) % 32:
+        return False
+    if k % (4 * _GEOMETRY_SF_VEC):
         return False
     return sm120_split_k_scratch_bytes(m, splits) <= SM120_SPLIT_K_SCRATCH_LIMIT
 
@@ -412,10 +425,10 @@ def sm120_producer_variants(
             for grid_mode in SM120_WS_GRID_MODES
         )
         split_k = tuple(
-            (SM120_FAMILY_SPLIT_K_RANK128, (splits, quant, 0), 0)
-            for splits in SM120_SPLIT_K_SPLITS
+            (SM120_FAMILY_SPLIT_K_RANK128, (splits, quant, k_sub), 0)
+            for splits, k_sub in SM120_SPLIT_K_TILINGS
             for quant in SM120_SPLIT_K_QUANT_BLOCKS
-            if sm120_split_k_tiling_is_valid(m, k, splits, quant)
+            if sm120_split_k_tiling_is_valid(m, k, splits, quant, k_sub)
         )
         return large + ws + small + split_k
     m537 = (
