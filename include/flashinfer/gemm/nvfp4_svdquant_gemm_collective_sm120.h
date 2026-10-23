@@ -2278,6 +2278,14 @@ class GemmUniversalLoRaSm120 {
 
     int thread_idx = int(threadIdx.x);
     int lane_idx = cutlass::canonical_lane_idx();
+#ifdef SVDQ_SM120_TIMELINE
+    // Experiment only: per-phase clock64 stamps for the first and last CTA, printed at exit.
+    long long const tl_entry = clock64();
+    uint64_t tl_entry_ns;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(tl_entry_ns));
+    int const tl_cta = int(blockIdx.x) + int(gridDim.x) * (int(blockIdx.y) + int(gridDim.y) * int(blockIdx.z));
+    bool const tl_block = tl_cta == 0 || tl_cta == int(gridDim.x * gridDim.y * gridDim.z) - 1;
+#endif
     int warp_idx = cutlass::canonical_warp_idx_sync();
     int warp_idx_in_warp_group = warp_idx % cutlass::NumWarpsPerWarpGroup;
     int warp_group_thread_idx = thread_idx % cutlass::NumThreadsPerWarpGroup;
@@ -2536,6 +2544,11 @@ class GemmUniversalLoRaSm120 {
         }
         bool do_load_order_arrive = true;
         bool requires_clc_query = true;
+#ifdef SVDQ_SM120_TIMELINE
+        long long tlp[2] = {0, 0};
+        int tlp_tile = 0;
+        long long const tlp_start = clock64() - tl_entry;
+#endif
         while (work_tile_info.is_valid()) {
           if (!TileScheduler::valid_warpgroup_in_work_tile(work_tile_info)) {
             auto [next_work_tile_info, increment_pipe] = scheduler.fetch_next_work(work_tile_info);
@@ -2585,6 +2598,10 @@ class GemmUniversalLoRaSm120 {
                                                  (do_lora ? CollectiveMainloop::LoRaChunks : 0));
           }
 
+#ifdef SVDQ_SM120_TIMELINE
+          if (tlp_tile < 2) tlp[tlp_tile] = clock64() - tl_entry;
+          ++tlp_tile;
+#endif
           if (do_load_order_arrive) {
             load_order_barrier.arrive();
             do_load_order_arrive = false;
@@ -2601,6 +2618,12 @@ class GemmUniversalLoRaSm120 {
             }
           }
         }  // Scheduler work fetch loop
+#ifdef SVDQ_SM120_TIMELINE
+        if (tl_block && lane_idx == 0) {
+          printf("SVDQTL P cta %d start %lld issued %lld %lld (tiles %d)\n", tl_cta, tlp_start,
+                 tlp[0], tlp[1], tlp_tile);
+        }
+#endif
 
         if constexpr (UseLoRaPipeline) {
           collective_mainloop.load_tail(mainloop_pipeline, mainloop_pipe_producer_state,
@@ -2657,7 +2680,18 @@ class GemmUniversalLoRaSm120 {
                                                    shared_storage.tensors.epilogue);
 
       bool do_store_tail = false;
+#ifdef SVDQ_SM120_TIMELINE
+      long long tl[2][7] = {};
+      int tl_k[2] = {0, 0}, tl_lora[2] = {0, 0};
+      int tl_tile = 0;
+      bool const tl_on = tl_block && mma_thread_idx == 0;
+#define SVDQ_TL(i) \
+  if (tl_on && tl_tile < 2) tl[tl_tile][i] = clock64() - tl_entry
+#else
+#define SVDQ_TL(i)
+#endif
       while (work_tile_info.is_valid()) {
+        SVDQ_TL(0);
         auto m_coord = idx2crd(work_tile_info.M_idx, shape<2>(gA_mkl));
         auto n_coord = idx2crd(work_tile_info.N_idx, shape<2>(gB_nkl));
         auto l_coord = idx2crd(work_tile_info.L_idx, shape<4>(gB_nkl));
@@ -2675,6 +2709,15 @@ class GemmUniversalLoRaSm120 {
 #endif
         bool const lora_first =
             valid_work && CollectiveMainloop::lora_first_for(params.mainloop, do_lora);
+#ifdef SVDQ_SM120_TIMELINE
+        if (tl_on && tl_tile < 2 && valid_work) {
+          // Re-waiting the same phase is a no-op for the real consumer below.
+          mainloop_pipeline.consumer_wait(mainloop_pipe_consumer_state);
+          tl_k[tl_tile] = work_k_tile_count;
+          tl_lora[tl_tile] = do_lora + 2 * lora_first;
+        }
+#endif
+        SVDQ_TL(1);
         if (valid_work) {
           if (lora_first) {
             clear(accumulators);
@@ -2683,6 +2726,7 @@ class GemmUniversalLoRaSm120 {
                                          shared_storage.tensors.mainloop);
             mainloop_pipe_consumer_state.advance(CollectiveMainloop::LoRaChunks);
           }
+          SVDQ_TL(2);
           collective_mainloop.mma(mainloop_pipeline, mainloop_pipe_consumer_state, accumulators,
                                   work_k_tile_count, mma_thread_idx,
                                   shared_storage.tensors.mainloop, params.mainloop, blk_coord,
@@ -2693,12 +2737,14 @@ class GemmUniversalLoRaSm120 {
 
           mainloop_pipe_consumer_state.advance(work_k_tile_count);
         }
+        SVDQ_TL(3);
 
         int consumer_warp_group_idx = cutlass::canonical_warp_group_idx() - NumLoadWarpGroups;
 
         // Perform reduction across splits, if needed
         TileScheduler::fixup(params.scheduler, work_tile_info, accumulators, NumMmaWarpGroups,
                              consumer_warp_group_idx);
+        SVDQ_TL(4);
 
         // On hook-enabled configs, consume the LoRA
         // stage inside the epilogue store loop so the rank-32 tail folds under the store
@@ -2732,6 +2778,7 @@ class GemmUniversalLoRaSm120 {
             mainloop_pipe_consumer_state.advance(CollectiveMainloop::LoRaChunks);
           }
         }
+        SVDQ_TL(5);
 
         if (do_epilogue) {
           auto run_plain_store = [&]() CUTLASS_LAMBDA_FUNC_INLINE {
@@ -2785,6 +2832,10 @@ class GemmUniversalLoRaSm120 {
           }
         }
 
+        SVDQ_TL(6);
+#ifdef SVDQ_SM120_TIMELINE
+        if (tl_on) ++tl_tile;
+#endif
         auto [next_work_tile_info, increment_pipe] = scheduler.fetch_next_work(
             work_tile_info, scheduler_pipeline, scheduler_pipe_consumer_state);
         work_tile_info = next_work_tile_info;
@@ -2799,6 +2850,21 @@ class GemmUniversalLoRaSm120 {
         local_collective_epilogue.store_tail(epi_load_pipeline, epi_load_pipe_consumer_state,
                                              epi_store_pipeline, epi_store_pipe_producer_state);
       }
+#ifdef SVDQ_SM120_TIMELINE
+      if (tl_on) {
+        long long const tl_end = clock64() - tl_entry;
+        uint64_t tl_end_ns;
+        asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(tl_end_ns));
+        for (int t = 0; t < (tl_tile < 2 ? tl_tile : 2); ++t) {
+          printf("SVDQTL C cta %d tile %d k %d lora %d | first %lld lf %lld kloop %lld fixup %lld lora %lld epi %lld (begin %lld)\n",
+                 tl_cta, t, tl_k[t], tl_lora[t], tl[t][1], tl[t][2], tl[t][3], tl[t][4], tl[t][5],
+                 tl[t][6], tl[t][0]);
+        }
+        printf("SVDQTL E cta %d tiles %d end %lld cyc %llu ns\n", tl_cta, tl_tile, tl_end,
+               (unsigned long long)(tl_end_ns - tl_entry_ns));
+      }
+#endif
+#undef SVDQ_TL
     }  // Consumer Warp Groups End
 #endif
   }
