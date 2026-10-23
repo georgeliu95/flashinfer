@@ -322,6 +322,12 @@ __launch_bounds__(BlockThreads) void nvfp4_smooth_quantize_lora_down_small_m_dyn
   constexpr int kDownElements = 16 * DownTileCols;
 
   int const block = static_cast<int>(blockIdx.x);
+#ifdef SVDQ_SM120_SMALL_M_ABLATE
+  // Experiment-only (outputs are wrong): 1 skips the rank-128 down CTAs.
+  if constexpr (Rank > 64) {
+    if (SVDQ_SM120_SMALL_M_ABLATE == 1 && block >= kQuantBlocks) return;
+  }
+#endif
   if (block < kQuantBlocks) {
     for (std::int64_t line = static_cast<std::int64_t>(block) * BlockThreads + threadIdx.x;
          line < kL2PrefetchLines; line += static_cast<std::int64_t>(kQuantBlocks) * BlockThreads) {
