@@ -647,11 +647,9 @@ inline cudaError_t launch_small_m_dyn_kernel(void const* x, void const* pre_quan
     if (kRank <= 64 && quant_blocks * RowsPerQuantBlock > padded_m) return cudaErrorInvalidValue;
     int const grid_blocks =
         (quant_blocks + KSplit - 1) / KSplit * KSplit + ((m + 15) / 16) * kDownNTiles * KSplit;
-    auto* kernel =
-        &nvfp4_smooth_quantize_lora_down_small_m_dyn_sm120_kernel<BlockThreads, DownTileCols,
-                                                                  RowsPerQuantBlock, PackedL2T,
-                                                                  SignalLaunch, Rank,
-                                                                  GateLaunchOnQuant, KSplit>;
+    auto* kernel = &nvfp4_smooth_quantize_lora_down_small_m_dyn_sm120_kernel<
+        BlockThreads, DownTileCols, RowsPerQuantBlock, PackedL2T, SignalLaunch, Rank,
+        GateLaunchOnQuant, KSplit>;
     if constexpr (KSplit > 1) {
       // Keep the primary's ordinary stream dependency, including the preceding GEMM.
       cudaLaunchConfig_t config = {};
@@ -1601,15 +1599,14 @@ inline cudaError_t launch_large_m_dyn_kernel(void const* x, void const* pre_quan
 // Rank-128 split-K small-M tilings: (block threads, down tile columns, K splits).
 // Mirrors SM120_SMALL_M_SPLIT_TILING_LADDER in svdquant_sm120_routes.py.
 #define FI_SVDQ_SMALL_M_SPLIT_TILINGS(X) \
-  X(128, 16, 4)                          \
-  X(128, 16, 8)                          \
-  X(256, 16, 2)                          \
   X(256, 16, 4)                          \
-  X(256, 16, 8)                          \
-  X(256, 32, 2)                          \
-  X(256, 32, 4)                          \
   X(512, 16, 2)                          \
-  X(512, 16, 4)
+  X(512, 16, 4)                          \
+  X(512, 16, 8)                          \
+  X(768, 16, 2)                          \
+  X(768, 16, 4)                          \
+  X(1024, 16, 2)                         \
+  X(1024, 16, 4)
 
 // Rank 64 reserves eight warps for LoRA-down; the remaining warps quantize.
 // Rank 128 reuses the same eight down warps, each owning two n8 fragments.
@@ -1706,18 +1703,18 @@ inline cudaError_t nvfp4_smooth_quantize_lora_down_family_sm120(
     if (family == 6) {
       // The small-M kernel with LoRA-down split over K across a KSplit-CTA cluster;
       // same launch signaling and address policies as family 1.
-#define FI_SVDQ_SPLIT_CASE(BT, DTC, KS)                                                         \
-  if (a == (BT) && b == (DTC) && c == (KS)) {                                                   \
-    if (signal_launch && address_policy == 1) {                                                 \
-      return small_m::launch_small_m_dyn_kernel<BT, DTC, 4, false, true, Rank, true, KS>(       \
-          x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, m, k, stream);          \
-    }                                                                                           \
-    if (signal_launch) {                                                                        \
-      return small_m::launch_small_m_dyn_kernel<BT, DTC, 4, false, true, Rank, false, KS>(      \
-          x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, m, k, stream);          \
-    }                                                                                           \
-    return small_m::launch_small_m_dyn_kernel<BT, DTC, 4, false, false, Rank, false, KS>(       \
-        x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, m, k, stream);            \
+#define FI_SVDQ_SPLIT_CASE(BT, DTC, KS)                                                    \
+  if (a == (BT) && b == (DTC) && c == (KS)) {                                              \
+    if (signal_launch && address_policy == 1) {                                            \
+      return small_m::launch_small_m_dyn_kernel<BT, DTC, 4, false, true, Rank, true, KS>(  \
+          x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, m, k, stream);     \
+    }                                                                                      \
+    if (signal_launch) {                                                                   \
+      return small_m::launch_small_m_dyn_kernel<BT, DTC, 4, false, true, Rank, false, KS>( \
+          x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, m, k, stream);     \
+    }                                                                                      \
+    return small_m::launch_small_m_dyn_kernel<BT, DTC, 4, false, false, Rank, false, KS>(  \
+        x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, m, k, stream);       \
   }
       FI_SVDQ_SMALL_M_SPLIT_TILINGS(FI_SVDQ_SPLIT_CASE)
 #undef FI_SVDQ_SPLIT_CASE
