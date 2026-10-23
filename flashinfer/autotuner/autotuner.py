@@ -2765,10 +2765,7 @@ class AutoTuner:
                                 f"(enable debug logs to see details)"
                             )
 
-                        if (
-                            runner_id is not None
-                            and tuning_config.finalist_rounds > 0
-                        ):
+                        if runner_id is not None and tuning_config.finalist_rounds > 0:
                             runner_id, tactic = self._rerank_finalists(
                                 runners,
                                 tensors,
@@ -2859,9 +2856,9 @@ class AutoTuner:
         if not measured:
             return first_pass_best
         limit = measured[0][0] * (1.0 + tuning_config.finalist_margin)
-        finalists = [
-            (r_id, tac) for t, r_id, tac in measured if t <= limit
-        ][: max(1, tuning_config.finalist_max)]
+        finalists = [(r_id, tac) for t, r_id, tac in measured if t <= limit][
+            : max(1, tuning_config.finalist_max)
+        ]
         if len(finalists) < 2:
             return first_pass_best
         samples: dict[int, list[float] | None] = {i: [] for i in range(len(finalists))}
@@ -2887,9 +2884,7 @@ class AutoTuner:
                     )
                     samples[i] = None
         scored = [
-            (statistics.median(times), i)
-            for i, times in samples.items()
-            if times
+            (statistics.median(times), i) for i, times in samples.items() if times
         ]
         if not scored:
             return first_pass_best
