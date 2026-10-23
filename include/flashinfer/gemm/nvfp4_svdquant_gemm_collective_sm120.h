@@ -1305,10 +1305,11 @@ struct CollectiveMmaLoRaSm120 {
           ++smem_pipe_write;
         }
       };
-      bool const lora_first = lora_first_for(params, do_lora);
-      if (lora_first) {
+      int const lora_at = lora_at_for(params, do_lora, k_tile_count);
+      if (lora_at == 0) {
         issue_lora_chunks();
       }
+      int issued = 0;
 
       // Residual mainloop: each step arms LoRaTmaBytes by default and adds the residual
       // remainder BEFORE issuing its TMAs.
@@ -1332,12 +1333,15 @@ struct CollectiveMmaLoRaSm120 {
 
         ++k_tile_iter;
         ++smem_pipe_write;
+        if (++issued == lora_at) {
+          issue_lora_chunks();
+        }
       }
 
       // One extra producer step: D + L1 into the next freed stage (epilogue owner only).
       // SFA/SFB are dummy-reloaded (k-tile 0) so the arrived bytes exactly match the
       // armed A+B+SF budget; the D/L1 boxes are byte-exact stage overlays.
-      if (do_lora && !lora_first) {
+      if (do_lora && lora_at < 0) {
         if constexpr (CompileInlineDown) {
           wait_for_inline_lora_down(params, m_coord, n_coord);
         }
@@ -1358,23 +1362,33 @@ struct CollectiveMmaLoRaSm120 {
     __syncwarp();
   }
 
-  /// Experiment (SVDQ_SM120_LORA_FIRST): the epilogue owner stages and folds LoRA-up
-  /// before its residual K loop instead of after Stream-K fixup, so the D/L1 loads and
-  /// the bf16 MMAs fill the pipeline warm-up rather than lengthen the tail. Only on the
-  /// byte-exact policy, and never when the GEMM must wait for LoRA-down (deferred).
-  CUTLASS_DEVICE static bool lora_first_for(Params const& params, bool do_lora) {
-#ifdef SVDQ_SM120_LORA_FIRST
+  /// Experiment (SVDQ_SM120_LORA_FIRST / SVDQ_SM120_LORA_MID=p): the epilogue owner stages
+  /// and folds LoRA-up after `lora_at` of its residual K tiles instead of after Stream-K
+  /// fixup (LORA_FIRST: 0; LORA_MID: p >= 0 -> min(p, k), p < 0 -> max(0, k + p)), so the
+  /// D/L1 stages ride the K stream rather than lengthen the tail. -1 keeps the post-fixup
+  /// fold. Byte-exact policy only, and never when the GEMM must wait for LoRA-down.
+  CUTLASS_DEVICE static int lora_at_for(Params const& params, bool do_lora, int k_tile_count) {
+#if defined(SVDQ_SM120_LORA_FIRST) || defined(SVDQ_SM120_LORA_MID)
     if constexpr (!UseDedicatedLoRaTma) {
       bool inline_down = false;
       if constexpr (CompileInlineDown) {
         inline_down = params.ptr_inline_down_counters != nullptr;
       }
-      return do_lora && !params.defer_lora_down_wait && !inline_down;
+      if (do_lora && !params.defer_lora_down_wait && !inline_down) {
+#if defined(SVDQ_SM120_LORA_MID)
+        int const at = SVDQ_SM120_LORA_MID;
+        return at >= 0 ? (at < k_tile_count ? at : k_tile_count)
+                       : (k_tile_count + at > 0 ? k_tile_count + at : 0);
+#else
+        return 0;
+#endif
+      }
     }
 #endif
     (void)params;
     (void)do_lora;
-    return false;
+    (void)k_tile_count;
+    return -1;
   }
 
   /// Producer perspective for the dedicated LoRA policy. The
@@ -2707,35 +2721,53 @@ class GemmUniversalLoRaSm120 {
 #ifdef SVDQ_SM120_ABLATE_LORA
         do_lora = false;
 #endif
-        bool const lora_first =
-            valid_work && CollectiveMainloop::lora_first_for(params.mainloop, do_lora);
+        int const lora_at =
+            valid_work ? CollectiveMainloop::lora_at_for(params.mainloop, do_lora, work_k_tile_count)
+                       : -1;
+        bool const lora_first = lora_at >= 0;
 #ifdef SVDQ_SM120_TIMELINE
         if (tl_on && tl_tile < 2 && valid_work) {
           // Re-waiting the same phase is a no-op for the real consumer below.
           mainloop_pipeline.consumer_wait(mainloop_pipe_consumer_state);
           tl_k[tl_tile] = work_k_tile_count;
-          tl_lora[tl_tile] = do_lora + 2 * lora_first;
+          tl_lora[tl_tile] = do_lora + 2 * (lora_at + 1);
         }
 #endif
         SVDQ_TL(1);
         if (valid_work) {
           if (lora_first) {
             clear(accumulators);
+            if (lora_at > 0) {
+              collective_mainloop.mma(mainloop_pipeline, mainloop_pipe_consumer_state,
+                                      accumulators, lora_at, mma_thread_idx,
+                                      shared_storage.tensors.mainloop, params.mainloop, blk_coord,
+                                      false);
+              mainloop_pipe_consumer_state.advance(lora_at);
+            }
             collective_mainloop.mma_lora(mainloop_pipeline, mainloop_pipe_consumer_state,
                                          accumulators, mma_thread_idx,
                                          shared_storage.tensors.mainloop);
             mainloop_pipe_consumer_state.advance(CollectiveMainloop::LoRaChunks);
+            SVDQ_TL(2);
+            int const rest = work_k_tile_count - lora_at;
+            if (rest > 0) {
+              collective_mainloop.mma(mainloop_pipeline, mainloop_pipe_consumer_state,
+                                      accumulators, rest, mma_thread_idx,
+                                      shared_storage.tensors.mainloop, params.mainloop, blk_coord,
+                                      false);
+              mainloop_pipe_consumer_state.advance(rest);
+            }
+          } else {
+            SVDQ_TL(2);
+            collective_mainloop.mma(mainloop_pipeline, mainloop_pipe_consumer_state, accumulators,
+                                    work_k_tile_count, mma_thread_idx,
+                                    shared_storage.tensors.mainloop, params.mainloop, blk_coord);
+
+            collective_mainloop.mma_tail(mainloop_pipeline, mainloop_pipe_consumer_state,
+                                         work_k_tile_count);
+
+            mainloop_pipe_consumer_state.advance(work_k_tile_count);
           }
-          SVDQ_TL(2);
-          collective_mainloop.mma(mainloop_pipeline, mainloop_pipe_consumer_state, accumulators,
-                                  work_k_tile_count, mma_thread_idx,
-                                  shared_storage.tensors.mainloop, params.mainloop, blk_coord,
-                                  !lora_first);
-
-          collective_mainloop.mma_tail(mainloop_pipeline, mainloop_pipe_consumer_state,
-                                       work_k_tile_count);
-
-          mainloop_pipe_consumer_state.advance(work_k_tile_count);
         }
         SVDQ_TL(3);
 
