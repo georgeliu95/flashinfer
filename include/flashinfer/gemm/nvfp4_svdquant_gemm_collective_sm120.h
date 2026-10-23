@@ -1292,6 +1292,38 @@ struct CollectiveMmaLoRaSm120 {
       Tensor tL1gL1 = block_tma_l1.partition_S(gL1);
       Tensor tL1sL1 = block_tma_l1.partition_D(sL1);
 
+      // One byte-exact step per stage-wide rank chunk (D + L1 overlay the A/B buffers;
+      // SFA/SFB are dummy-reloaded from k-tile 0 so the bytes match the armed budget).
+      auto issue_lora_chunk = [&](int chunk) {
+        pipeline.producer_acquire(smem_pipe_write);
+
+        using BarrierType = typename MainloopPipeline::ProducerBarrierType;
+        BarrierType* tma_barrier = pipeline.producer_get_barrier(smem_pipe_write);
+
+        int write_stage = smem_pipe_write.index();
+        copy(params.tma_load_sfa.with(*tma_barrier), tAgSFA(_, _, _, Int<0>{}),
+             tAsSFA(_, _, _, write_stage));
+        copy(params.tma_load_sfb.with(*tma_barrier), tBgSFB(_, _, _, Int<0>{}),
+             tBsSFB(_, _, _, write_stage));
+        copy(params.tma_load_d.with(*tma_barrier), tDgD(_, _, _, chunk),
+             tDsD(_, _, _, write_stage));
+        copy(params.tma_load_l1.with(*tma_barrier), tL1gL1(_, _, _, chunk),
+             tL1sL1(_, _, _, write_stage));
+
+        ++smem_pipe_write;
+      };
+      bool const lora_spread = lora_spread_for(params, do_lora);
+      int const k_total = k_tile_count;
+      int next_chunk = 0;
+      int issued = 0;
+      auto issue_due_chunks = [&]() {
+        while (lora_spread && next_chunk < LoRaChunks &&
+               lora_spread_pos(next_chunk, k_total) == issued) {
+          issue_lora_chunk(next_chunk++);
+        }
+      };
+      issue_due_chunks();
+
       // Residual mainloop: each step arms LoRaTmaBytes by default and adds the residual
       // remainder BEFORE issuing its TMAs.
       CUTLASS_PRAGMA_NO_UNROLL
@@ -1314,12 +1346,14 @@ struct CollectiveMmaLoRaSm120 {
 
         ++k_tile_iter;
         ++smem_pipe_write;
+        ++issued;
+        issue_due_chunks();
       }
 
       // One extra producer step: D + L1 into the next freed stage (epilogue owner only).
       // SFA/SFB are dummy-reloaded (k-tile 0) so the arrived bytes exactly match the
       // armed A+B+SF budget; the D/L1 boxes are byte-exact stage overlays.
-      if (do_lora) {
+      if (do_lora && !lora_spread) {
         if constexpr (CompileInlineDown) {
           wait_for_inline_lora_down(params, m_coord, n_coord);
         }
@@ -1336,26 +1370,34 @@ struct CollectiveMmaLoRaSm120 {
         // One byte-exact step per stage-wide rank chunk, consumed in the same order.
         CUTLASS_PRAGMA_UNROLL
         for (int chunk = 0; chunk < LoRaChunks; ++chunk) {
-          pipeline.producer_acquire(smem_pipe_write);
-
-          using BarrierType = typename MainloopPipeline::ProducerBarrierType;
-          BarrierType* tma_barrier = pipeline.producer_get_barrier(smem_pipe_write);
-
-          int write_stage = smem_pipe_write.index();
-          copy(params.tma_load_sfa.with(*tma_barrier), tAgSFA(_, _, _, Int<0>{}),
-               tAsSFA(_, _, _, write_stage));
-          copy(params.tma_load_sfb.with(*tma_barrier), tBgSFB(_, _, _, Int<0>{}),
-               tBsSFB(_, _, _, write_stage));
-          copy(params.tma_load_d.with(*tma_barrier), tDgD(_, _, _, chunk),
-               tDsD(_, _, _, write_stage));
-          copy(params.tma_load_l1.with(*tma_barrier), tL1gL1(_, _, _, chunk),
-               tL1sL1(_, _, _, write_stage));
-
-          ++smem_pipe_write;
+          issue_lora_chunk(chunk);
         }
       }
     }
     __syncwarp();
+  }
+
+  /// Experiment (SVDQ_SM120_LORA_SPREAD): the epilogue owner interleaves its LoRA chunks
+  /// into the residual K stream (chunk c after K tile lora_spread_pos(c, k)), so the D/L1
+  /// stages ride the weight stream and the bf16 fold runs while later K stages are in
+  /// flight. Byte-exact policy only; never when the GEMM must wait for LoRA-down.
+  CUTLASS_DEVICE static bool lora_spread_for(Params const& params, bool do_lora) {
+#ifdef SVDQ_SM120_LORA_SPREAD
+    if constexpr (!UseDedicatedLoRaTma) {
+      bool inline_down = false;
+      if constexpr (CompileInlineDown) {
+        inline_down = params.ptr_inline_down_counters != nullptr;
+      }
+      return do_lora && !params.defer_lora_down_wait && !inline_down;
+    }
+#endif
+    (void)params;
+    (void)do_lora;
+    return false;
+  }
+
+  CUTLASS_DEVICE static int lora_spread_pos(int chunk, int k_tile_count) {
+    return ((chunk + 1) * k_tile_count) / (LoRaChunks + 1);
   }
 
   /// Producer perspective for the dedicated LoRA policy. The
@@ -1518,12 +1560,14 @@ struct CollectiveMmaLoRaSm120 {
   CUTLASS_DEVICE void mma(MainloopPipeline pipeline, PipelineState smem_pipe_read,
                           FrgTensorC& accum, int k_tile_count, int thread_idx,
                           TensorStorage& shared_tensors, [[maybe_unused]] Params const& params,
-                          BlockCoord const& blk_coord) {
+                          BlockCoord const& blk_coord, bool clear_accum = true) {
     using namespace cute;
 
     static_assert(is_rmem<FrgTensorC>::value, "C tensor must be rmem resident.");
 
-    clear(accum);
+    if (clear_accum) {
+      clear(accum);
+    }
 
     Tensor sA = make_tensor(make_smem_ptr(shared_tensors.smem_A.begin()), SmemLayoutA{});
     Tensor sB = make_tensor(make_smem_ptr(shared_tensors.smem_B.begin()), SmemLayoutB{});
@@ -1675,7 +1719,8 @@ struct CollectiveMmaLoRaSm120 {
   /// the epilogue, only by the epilogue-owning work unit; consumes exactly one stage.
   template <class FrgTensorC>
   CUTLASS_DEVICE void mma_lora(MainloopPipeline pipeline, PipelineState smem_pipe_read,
-                               FrgTensorC& accum, int thread_idx, TensorStorage& shared_tensors) {
+                               FrgTensorC& accum, int thread_idx, TensorStorage& shared_tensors,
+                               int num_chunks = LoRaChunks) {
     using namespace cute;
 
     static_assert(is_rmem<FrgTensorC>::value, "C tensor must be rmem resident.");
@@ -1715,7 +1760,7 @@ struct CollectiveMmaLoRaSm120 {
     // its stage released before the next is staged, so register pressure stays at one
     // chunk regardless of the rank.
     CUTLASS_PRAGMA_UNROLL
-    for (int chunk = 0; chunk < LoRaChunks; ++chunk) {
+    for (int chunk = 0; chunk < num_chunks; ++chunk) {
       pipeline.consumer_wait(smem_pipe_read);
       int read_stage = smem_pipe_read.index();
 
@@ -2647,7 +2692,32 @@ class GemmUniversalLoRaSm120 {
         bool valid_work = TileScheduler::valid_warpgroup_in_work_tile(work_tile_info);
         bool do_epilogue = TileScheduler::compute_epilogue(work_tile_info, params.scheduler);
         bool do_lora = do_epilogue;
-        if (valid_work) {
+        bool const lora_spread =
+            valid_work && CollectiveMainloop::lora_spread_for(params.mainloop, do_lora);
+        if (valid_work && lora_spread) {
+          clear(accumulators);
+          int done = 0;
+          CUTLASS_PRAGMA_NO_UNROLL
+          for (int c = 0; c <= CollectiveMainloop::LoRaChunks; ++c) {
+            int const end = c < CollectiveMainloop::LoRaChunks
+                                ? CollectiveMainloop::lora_spread_pos(c, work_k_tile_count)
+                                : work_k_tile_count;
+            if (end > done) {
+              collective_mainloop.mma(mainloop_pipeline, mainloop_pipe_consumer_state,
+                                      accumulators, end - done, mma_thread_idx,
+                                      shared_storage.tensors.mainloop, params.mainloop, blk_coord,
+                                      false);
+              mainloop_pipe_consumer_state.advance(end - done);
+              done = end;
+            }
+            if (c < CollectiveMainloop::LoRaChunks) {
+              collective_mainloop.mma_lora(mainloop_pipeline, mainloop_pipe_consumer_state,
+                                           accumulators, mma_thread_idx,
+                                           shared_storage.tensors.mainloop, 1);
+              mainloop_pipe_consumer_state.advance(1);
+            }
+          }
+        } else if (valid_work) {
           collective_mainloop.mma(mainloop_pipeline, mainloop_pipe_consumer_state, accumulators,
                                   work_k_tile_count, mma_thread_idx,
                                   shared_storage.tensors.mainloop, params.mainloop, blk_coord);
@@ -2678,13 +2748,13 @@ class GemmUniversalLoRaSm120 {
                       CollectiveMainloop::LoRaChunks == 1 &&
                       flashinfer::gemm::svdquant_sm120::is_sm120_lora_hooked_epilogue_v<
                           CollectiveEpilogue>) {
-          lora_in_epilogue =
-              valid_work && do_lora && do_epilogue && work_tile_info.reduction_subtile_idx() == -1;
+          lora_in_epilogue = valid_work && do_lora && do_epilogue && !lora_spread &&
+                             work_tile_info.reduction_subtile_idx() == -1;
         }
 
         // Fold in the rank-32 LoRA-up exactly once per output tile: the accumulator is
         // fully reduced here, and only the epilogue owner produced (and consumes) the stage.
-        if (valid_work && do_lora && !lora_in_epilogue) {
+        if (valid_work && do_lora && !lora_in_epilogue && !lora_spread) {
           if constexpr (UseDedicatedLoRaTma) {
             collective_mainloop.mma_lora(lora_pipeline, lora_pipe_consumer_state, accumulators,
                                          mma_thread_idx, shared_storage.tensors.mainloop);
