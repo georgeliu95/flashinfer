@@ -2556,6 +2556,9 @@ class GemmUniversalLoRaSm120 {
 
           // The epilogue-owning work unit produces one extra D/L1 stage after its K range.
           bool do_lora = TileScheduler::compute_epilogue(work_tile_info, params.scheduler);
+#ifdef SVDQ_SM120_ABLATE_LORA
+          do_lora = false;  // experiment only: wrong output, measures the LoRA tail's cost
+#endif
 
           if (requires_clc_query) {
             scheduler_throttle_pipeline.producer_acquire(scheduler_pipe_throttle_producer_state);
@@ -2667,6 +2670,9 @@ class GemmUniversalLoRaSm120 {
         bool valid_work = TileScheduler::valid_warpgroup_in_work_tile(work_tile_info);
         bool do_epilogue = TileScheduler::compute_epilogue(work_tile_info, params.scheduler);
         bool do_lora = do_epilogue;
+#ifdef SVDQ_SM120_ABLATE_LORA
+        do_lora = false;
+#endif
         bool const lora_first =
             valid_work && CollectiveMainloop::lora_first_for(params.mainloop, do_lora);
         if (valid_work) {
