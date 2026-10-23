@@ -1599,12 +1599,7 @@ inline cudaError_t launch_large_m_dyn_kernel(void const* x, void const* pre_quan
 // Rank-128 split-K small-M tilings: (block threads, down tile columns, K splits).
 // Mirrors SM120_SMALL_M_SPLIT_TILING_LADDER in svdquant_sm120_routes.py.
 #define FI_SVDQ_SMALL_M_SPLIT_TILINGS(X) \
-  X(256, 16, 4)                          \
-  X(512, 16, 2)                          \
   X(512, 16, 4)                          \
-  X(512, 16, 8)                          \
-  X(768, 16, 2)                          \
-  X(768, 16, 4)                          \
   X(1024, 16, 2)                         \
   X(1024, 16, 4)
 

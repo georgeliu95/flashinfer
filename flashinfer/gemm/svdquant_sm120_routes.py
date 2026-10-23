@@ -240,12 +240,7 @@ SM120_SMALL_M_TILING_LADDER: Final[tuple[tuple[int, int, int], ...]] = (
 # (block threads, down tile columns, K splits). Mirrors
 # FI_SVDQ_SMALL_M_SPLIT_TILINGS in nvfp4_smooth_quantize_lora_down_sm120.cuh.
 SM120_SMALL_M_SPLIT_TILING_LADDER: Final[tuple[tuple[int, int, int], ...]] = (
-    (256, 16, 4),
-    (512, 16, 2),
     (512, 16, 4),
-    (512, 16, 8),
-    (768, 16, 2),
-    (768, 16, 4),
     (1024, 16, 2),
     (1024, 16, 4),
 )
