@@ -33,6 +33,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -782,6 +783,11 @@ void run_tactic_impl(RuntimeTacticSm120 const& rt, void* out, void const* A, voi
       narrow_sf_layout(Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(sf_shape));
   args.mainloop.lora_rank = lora_rank;
   args.mainloop.defer_lora_down_wait = rt.defer_lora_down_wait;
+#ifdef SVDQ_SM120_LORA_MID
+  if (char const* lora_at = std::getenv("SVDQ_LORA_AT")) {
+    args.mainloop.lora_at_policy = std::atoi(lora_at);
+  }
+#endif
   bool const use_inline_down = inline_down_x != nullptr && inline_down_l2t != nullptr;
   if constexpr (!CompileInlineDown) {
     if (use_inline_down)

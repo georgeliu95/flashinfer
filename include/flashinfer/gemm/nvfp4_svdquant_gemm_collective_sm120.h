@@ -702,6 +702,8 @@ struct CollectiveMmaLoRaSm120 {
     cutlass::bfloat16_t const* ptr_inline_down_l2t{nullptr};
     cutlass::bfloat16_t* ptr_inline_down_output{nullptr};
     uint32_t* ptr_inline_down_counters{nullptr};
+    // Experiment (SVDQ_SM120_LORA_MID): LoRA fold position policy; -(1 << 30) keeps the tail.
+    int lora_at_policy{(-(1 << 30))};
     int inline_down_m{0};
     int inline_down_k{0};
     bool inline_down_wait_on_n{false};
@@ -791,6 +793,7 @@ struct CollectiveMmaLoRaSm120 {
     cutlass::bfloat16_t const* ptr_inline_down_l2t = nullptr;
     cutlass::bfloat16_t* ptr_inline_down_output = nullptr;
     uint32_t* ptr_inline_down_counters = nullptr;
+    int lora_at_policy = (-(1 << 30));
     int inline_down_m = 0;
     int inline_down_k = 0;
     bool inline_down_wait_on_n = false;
@@ -865,6 +868,7 @@ struct CollectiveMmaLoRaSm120 {
     params.ptr_inline_down_l2t = args.ptr_inline_down_l2t;
     params.ptr_inline_down_output = args.ptr_inline_down_output;
     params.ptr_inline_down_counters = args.ptr_inline_down_counters;
+    params.lora_at_policy = args.lora_at_policy;
     params.inline_down_m = args.inline_down_m;
     params.inline_down_k = args.inline_down_k;
     params.inline_down_wait_on_n = args.inline_down_wait_on_n;
@@ -1362,9 +1366,10 @@ struct CollectiveMmaLoRaSm120 {
     __syncwarp();
   }
 
-  /// Experiment (SVDQ_SM120_LORA_FIRST / SVDQ_SM120_LORA_MID=p): the epilogue owner stages
+  /// Experiment (SVDQ_SM120_LORA_FIRST / SVDQ_SM120_LORA_MID): the epilogue owner stages
   /// and folds LoRA-up after `lora_at` of its residual K tiles instead of after Stream-K
-  /// fixup (LORA_FIRST: 0; LORA_MID: p >= 0 -> min(p, k), p < 0 -> max(0, k + p)), so the
+  /// fixup (LORA_FIRST: 0; LORA_MID: runtime policy p from the launcher's SVDQ_LORA_AT,
+  /// p >= 0 -> min(p, k), p < 0 -> max(0, k + p)), so the
   /// D/L1 stages ride the K stream rather than lengthen the tail. -1 keeps the post-fixup
   /// fold. Byte-exact policy only, and never when the GEMM must wait for LoRA-down.
   CUTLASS_DEVICE static int lora_at_for(Params const& params, bool do_lora, int k_tile_count) {
@@ -1376,7 +1381,10 @@ struct CollectiveMmaLoRaSm120 {
       }
       if (do_lora && !params.defer_lora_down_wait && !inline_down) {
 #if defined(SVDQ_SM120_LORA_MID)
-        int const at = SVDQ_SM120_LORA_MID;
+        int const at = params.lora_at_policy;
+        if (at == (-(1 << 30))) {
+          return -1;
+        }
         return at >= 0 ? (at < k_tile_count ? at : k_tile_count)
                        : (k_tile_count + at > 0 ? k_tile_count + at : 0);
 #else
