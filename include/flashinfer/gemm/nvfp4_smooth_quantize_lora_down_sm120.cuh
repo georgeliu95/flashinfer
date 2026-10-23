@@ -57,10 +57,6 @@ __device__ __forceinline__ void mma_m16n8k16_row_col(float& d0, float& d1, float
 
 }  // namespace smooth_quantize_lora_down_sm120_detail
 
-#ifndef SVDQ_SMALL_M_KSPLIT
-#define SVDQ_SMALL_M_KSPLIT 1
-#endif
-
 namespace smooth_quantize_lora_down_small_m_sm120_detail {
 
 namespace base = smooth_quantize_lora_down_sm120_detail;
@@ -1602,6 +1598,19 @@ inline cudaError_t launch_large_m_dyn_kernel(void const* x, void const* pre_quan
   X(1024, 8, 16)                   \
   X(1024, 16, 16)
 
+// Rank-128 split-K small-M tilings: (block threads, down tile columns, K splits).
+// Mirrors SM120_SMALL_M_SPLIT_TILING_LADDER in svdquant_sm120_routes.py.
+#define FI_SVDQ_SMALL_M_SPLIT_TILINGS(X) \
+  X(128, 16, 4)                          \
+  X(128, 16, 8)                          \
+  X(256, 16, 2)                          \
+  X(256, 16, 4)                          \
+  X(256, 16, 8)                          \
+  X(256, 32, 2)                          \
+  X(256, 32, 4)                          \
+  X(512, 16, 2)                          \
+  X(512, 16, 4)
+
 // Rank 64 reserves eight warps for LoRA-down; the remaining warps quantize.
 // Rank 128 reuses the same eight down warps, each owning two n8 fragments.
 #define FI_SVDQ_RANK64_LARGE_M_GEOMETRIES(X) \
@@ -1694,6 +1703,26 @@ inline cudaError_t nvfp4_smooth_quantize_lora_down_family_sm120(
           x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, m, k, a, b, c,
           address_policy, stream);
     }
+    if (family == 6) {
+      // The small-M kernel with LoRA-down split over K across a KSplit-CTA cluster;
+      // same launch signaling and address policies as family 1.
+#define FI_SVDQ_SPLIT_CASE(BT, DTC, KS)                                                         \
+  if (a == (BT) && b == (DTC) && c == (KS)) {                                                   \
+    if (signal_launch && address_policy == 1) {                                                 \
+      return small_m::launch_small_m_dyn_kernel<BT, DTC, 4, false, true, Rank, true, KS>(       \
+          x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, m, k, stream);          \
+    }                                                                                           \
+    if (signal_launch) {                                                                        \
+      return small_m::launch_small_m_dyn_kernel<BT, DTC, 4, false, true, Rank, false, KS>(      \
+          x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, m, k, stream);          \
+    }                                                                                           \
+    return small_m::launch_small_m_dyn_kernel<BT, DTC, 4, false, false, Rank, false, KS>(       \
+        x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, m, k, stream);            \
+  }
+      FI_SVDQ_SMALL_M_SPLIT_TILINGS(FI_SVDQ_SPLIT_CASE)
+#undef FI_SVDQ_SPLIT_CASE
+      return cudaErrorInvalidValue;
+    }
     if (family != 0 && family != 1) return cudaErrorInvalidValue;
   }
   if (family == 2) {
@@ -1739,18 +1768,13 @@ inline cudaError_t nvfp4_smooth_quantize_lora_down_family_sm120(
   if (a == (BT) && b == (DTC) && c == (RPQB)) {                                            \
     if constexpr (Rank == 128) {                                                           \
       if (signal_launch && address_policy == 1) {                                          \
-        return small_m::launch_small_m_dyn_kernel<BT, DTC, RPQB, false, true, Rank, true,  \
-                                                  SVDQ_SMALL_M_KSPLIT>(                    \
+        return small_m::launch_small_m_dyn_kernel<BT, DTC, RPQB, false, true, Rank, true>( \
             x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, m, k, stream);   \
       }                                                                                    \
       if (signal_launch) {                                                                 \
-        return small_m::launch_small_m_dyn_kernel<BT, DTC, RPQB, false, true, Rank, false, \
-                                                  SVDQ_SMALL_M_KSPLIT>(                    \
+        return small_m::launch_small_m_dyn_kernel<BT, DTC, RPQB, false, true, Rank>(       \
             x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, m, k, stream);   \
       }                                                                                    \
-      return small_m::launch_small_m_dyn_kernel<BT, DTC, RPQB, false, false, Rank, false,  \
-                                                SVDQ_SMALL_M_KSPLIT>(                      \
-          x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, m, k, stream);     \
     }                                                                                      \
     return small_m::launch_small_m_dyn_kernel<BT, DTC, RPQB, false, false, Rank>(          \
         x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, m, k, stream);       \
