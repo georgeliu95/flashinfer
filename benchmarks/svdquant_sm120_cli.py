@@ -38,6 +38,7 @@ class Options:
     ranks: tuple[int, ...]
     untuned: bool
     eager: bool
+    eager_events: bool = False
 
 
 def parse_shape(text: str) -> ShapeCase:
@@ -80,6 +81,11 @@ def parse_options(
         "--eager",
         action="store_true",
         help="measure completed eager batches with a host wall clock",
+    )
+    parser.add_argument(
+        "--eager-events",
+        action="store_true",
+        help="time each eager call with CUDA events (L2 per --cold-l2)",
     )
     parser.add_argument("--trials", type=int, default=5)
     parser.add_argument(
@@ -125,6 +131,8 @@ def parse_options(
         help="use the SM120 public API default (on); --no-enable-pdl disables it",
     )
     args = parser.parse_args(argv)
+    if args.eager and args.eager_events:
+        parser.error("--eager and --eager-events are separate timers")
     if args.eager and args.cold_l2:
         parser.error(
             "--eager measures warm batches and cannot be combined with --cold-l2"
@@ -172,4 +180,5 @@ def parse_options(
         tuple(dict.fromkeys(args.rank or (32,))),
         args.untuned,
         args.eager,
+        args.eager_events,
     )

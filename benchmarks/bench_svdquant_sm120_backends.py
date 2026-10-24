@@ -90,7 +90,19 @@ def measure(
     warmup_ms: int,
     repeat_ms: int,
     eager: bool = False,
+    eager_events: bool = False,
 ) -> list[float]:
+    if eager_events:
+        # Eager launches, CUDA events around each call; host gaps between the
+        # call's kernels count, the L2 flush does not.
+        samples = bench_gpu_time_with_cuda_event(
+            call.function,
+            input_args=call.operands,
+            dry_run_time_ms=warmup_ms,
+            repeat_time_ms=repeat_ms,
+            cold_l2_cache=cold_l2,
+        )
+        return [float(value) * 1000.0 for value in samples]
     if eager:
         samples_us = []
         for duration, collect in ((warmup_ms, False), (repeat_ms, True)):
@@ -191,6 +203,7 @@ def run_operation(
                         options.warmup_ms,
                         options.repeat_ms,
                         options.eager,
+                        options.eager_events,
                     )
                 )
                 windows[backend] = {
@@ -215,10 +228,16 @@ def run_operation(
             "seed": options.seed,
             "enable_pdl": options.enable_pdl,
             "inference_mode": options.inference_mode,
-            "timer": "host-wall-eager" if options.eager else "cuda-event-graph",
+            "timer": "host-wall-eager"
+            if options.eager
+            else "cuda-event-eager"
+            if options.eager_events
+            else "cuda-event-graph",
             "sample_observable": (
                 "completed_eager_batch_elapsed_us_divided_by_calls"
                 if options.eager
+                else "eager_call_event_elapsed_us"
+                if options.eager_events
                 else "isolated_graph_replay_elapsed_us"
                 if options.cold_l2
                 else "graph_replay_elapsed_us_divided_by_graph_calls"
