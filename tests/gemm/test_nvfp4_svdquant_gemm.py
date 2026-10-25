@@ -1927,7 +1927,7 @@ def test_sm120_zero_output_has_positive_sign(tactic: int) -> None:
     assert torch.count_nonzero(out.view(torch.int16)).item() == 0
 
 
-@pytest.mark.parametrize("rank", [32, 64])
+@pytest.mark.parametrize("rank", [32, 64, 96])
 @pytest.mark.parametrize("m,n,k", [(4096, 3072, 3072), (512, 5120, 5120)])
 def test_public_entry_serves_rank_64(m, n, k, rank):
     """The rank reaches the module through the public API, not a private getter.
@@ -1961,6 +1961,66 @@ def test_public_entry_serves_rank_64(m, n, k, rank):
 
     module = _get_nvfp4_svdquant_module_for_device(torch.device("cuda"), rank)
     assert module.nvfp4_svdquant_gemm_lora_rank() == rank
+
+
+@pytest.mark.parametrize("m", [129, 4096])
+def test_sm120_rank96_every_tactic_matches_cute_dsl(m):
+    """Rank 96 is three 32-column chunks on K128 tiles and, on K256 tiles, one full
+    64-column chunk plus a half-real chunk whose tail TMA zero-fills.
+
+    Every config that stages rank 128 also stages rank 96, so the tactic plane is
+    the rank-128 one, and every tactic matches CuTe DSL (which runs rank 96 on
+    32-column stages only) bit for bit on these inputs.
+    """
+    _skip_unless_svdquant_supported()
+    if not _is_sm120():
+        pytest.skip("requires SM120")
+    torch.manual_seed(m)
+    n, k, rank = 3072, 3072, 96
+    device = torch.device("cuda")
+    module = _get_nvfp4_svdquant_module_for_device(device, rank)
+    module128 = _get_nvfp4_svdquant_module_for_device(device, 128)
+    tactics = svdquant_sm120_cutlass._nvfp4_svdquant_valid_tactics(
+        module, m, n, k, rank
+    )
+    assert tactics == svdquant_sm120_cutlass._nvfp4_svdquant_valid_tactics(
+        module128, m, n, k, 128
+    )
+
+    p = _make_gemm_problem(m, n, k, rank=rank)
+    expected = mm_nvfp4_svdquant(
+        p["xq"],
+        p["wq"],
+        p["x_sf_flat"],
+        p["w_sf_flat"],
+        p["alpha"],
+        p["d"],
+        p["l1_scaled"],
+        bias=p["bias"],
+        backend="cute-dsl",
+    )
+    for tactic in tactics:
+        ws_bytes = max(
+            DEFAULT_WORKSPACE_SIZE,
+            int(module.nvfp4_svdquant_gemm_workspace_size(m, n, k, tactic)),
+        )
+        workspace = torch.zeros(ws_bytes, dtype=torch.uint8, device=device)
+        out = torch.full((m, n), float("nan"), dtype=torch.bfloat16, device=device)
+        module.nvfp4_svdquant_gemm(
+            p["xq"],
+            p["wq"],
+            p["x_sf_flat"],
+            p["w_sf_flat"],
+            p["alpha"],
+            p["d"],
+            p["l1_scaled"],
+            p["bias"],
+            out,
+            workspace,
+            tactic,
+            device_support_pdl(device),
+        )
+        assert torch.equal(out, expected), f"tactic {tactic} differs from CuTe DSL"
 
 
 @pytest.mark.parametrize("rank", (32, 64))
@@ -4961,7 +5021,7 @@ def _check_linear_graph_replay(
     assert _sqnr_db(expected_fresh, captured.float()) > 40.0
 
 
-@pytest.mark.parametrize("rank", [32, 64, 128])
+@pytest.mark.parametrize("rank", [32, 64, 96, 128])
 @pytest.mark.parametrize(
     "shape", [(129, 256, 256), (537, 5376, 7168), (64, 3072, 3072)]
 )

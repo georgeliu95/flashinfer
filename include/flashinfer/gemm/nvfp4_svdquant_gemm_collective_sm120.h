@@ -388,10 +388,12 @@ struct CollectiveMmaLoRaSm120 {
                        sizeof_bits<cutlass::bfloat16_t>::value);
   // A rank wider than one stage is staged as LoRaChunks consecutive stage-wide chunks,
   // each one more byte-exact producer step after the residual K-loop. Rank <= stage width
-  // keeps the original single step (LoRaChunkK == LoRaK, LoRaChunks == 1).
+  // keeps the original single step (LoRaChunkK == LoRaK, LoRaChunks == 1). A rank that is
+  // not a whole number of stages (96 on K256) ends in a partial chunk: its TMA box runs
+  // past the [M/N, LoRaK] gmem tensor, the tail columns are zero-filled, and mma_lora
+  // folds them as acc + 0, which turns an exactly -0.0 accumulator lane into +0.0.
   static constexpr int LoRaChunkK = LoRaK < LoRaStorageK ? LoRaK : LoRaStorageK;
-  static constexpr int LoRaChunks = LoRaK / LoRaChunkK;
-  static_assert(LoRaK % LoRaChunkK == 0, "the rank must be a whole number of stage-wide chunks");
+  static constexpr int LoRaChunks = (LoRaK + LoRaChunkK - 1) / LoRaChunkK;
 
   static constexpr int AStageBf16Elems = static_cast<int>(
       cutlass::bits_to_bytes(size(take<0, 2>(SmemLayoutA{})) * sizeof_bits<ElementA>::value) /
@@ -844,7 +846,8 @@ struct CollectiveMmaLoRaSm120 {
         make_shape(shape<1>(TileShapeSFB{}), shape<2>(TileShapeSFB{})), _1{});
 
     // The gmem view is (M/N, LoRaK, L): the rank is this collective's LoRaK (validated in
-    // can_implement), so no out-of-bounds chunk handling is needed.
+    // can_implement). Only a partial last chunk (see LoRaChunks) reads past it, and TMA
+    // zero-fills those columns, as it does for the rank-32 tail of a K256 stage.
     Tensor tensor_d = make_tensor(args.ptr_D, make_layout(make_shape(M, Int<LoRaK>{}, L), args.dD));
     Tensor tensor_l1 =
         make_tensor(args.ptr_L1, make_layout(make_shape(N, Int<LoRaK>{}, L), args.dL1));

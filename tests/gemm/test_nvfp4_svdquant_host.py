@@ -300,8 +300,22 @@ def test_auto_linear_measures_both_native_prefixes(auto_backend_case):
     assert all(size == 10 for _, size in profiles)
 
 
+@pytest.mark.parametrize("auto_backend_case", [(64, 128, 3072, 96)], indirect=True)
+def test_auto_linear_measures_only_the_separate_native_route_at_rank_96(
+    auto_backend_case,
+):
+    """Rank 96 has CUTLASS GEMM tactics but no fused prefix family."""
+    from flashinfer import autotune
+
+    _, call, _, builds, _ = auto_backend_case
+    with autotune(True):
+        assert torch.all(call("linear") == 2)
+    assert "cutlass" in builds
+    assert "cutlass-fused" not in builds
+
+
 @pytest.mark.parametrize(
-    "auto_backend_case", [(64, 128, 3072, 96), (64, 128, 3072, 160)], indirect=True
+    "auto_backend_case", [(64, 128, 3072, 160), (64, 128, 3072, 192)], indirect=True
 )
 @pytest.mark.parametrize("operation", ["gemm", "linear"])
 def test_auto_skips_native_build_for_unsupported_rank(auto_backend_case, operation):
@@ -313,7 +327,7 @@ def test_auto_skips_native_build_for_unsupported_rank(auto_backend_case, operati
     assert not builds, "no native tactic stages this rank; do not load the module"
 
 
-@pytest.mark.parametrize("rank", [96, 160])
+@pytest.mark.parametrize("rank", [160, 192])
 def test_explicit_cutlass_rejects_unsupported_rank_before_build(
     auto_backend_case, rank
 ):
@@ -1463,7 +1477,7 @@ def test_linear_runners_load_the_requested_rank(
     assert type(runners[0]).__name__ == expected_fallback
 
 
-@pytest.mark.parametrize("rank", [0, 48, 96, 160])
+@pytest.mark.parametrize("rank", [0, 48, 160, 192])
 def test_linear_rejects_unsupported_ranks_before_loading_kernels(rank: int) -> None:
     with pytest.raises(ValueError, match="rank"):
         svdquant_linear(

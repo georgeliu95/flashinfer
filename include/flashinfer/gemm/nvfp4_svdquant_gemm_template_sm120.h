@@ -137,12 +137,12 @@ struct SvdquantGemmConfigSm120 {
   // would otherwise have to be regenerated per rank.
   //
   // The byte-exact path stages a rank wider than one stage as consecutive stage-wide
-  // chunks (CollectiveMmaLoRaSm120::LoRaChunks), so any multiple of the stage width
-  // compiles. The row80 dedicated side slot is still sized for one chunk.
+  // chunks (CollectiveMmaLoRaSm120::LoRaChunks); a rank that is not a whole number of
+  // stages (96 on K256) ends in a partial chunk whose tail columns TMA zero-fills.
+  // The row80 dedicated side slot is still sized for one chunk.
   static constexpr int kLoRaStageCapacity = cute::size<2>(MmaTileShape{}) / 4;
   static constexpr bool kStagesModuleRank =
-      kSvdqSm120ModuleLoRaRank <= kLoRaStageCapacity ||
-      (!IsRow80SideSlot && kSvdqSm120ModuleLoRaRank % kLoRaStageCapacity == 0);
+      kSvdqSm120ModuleLoRaRank <= kLoRaStageCapacity || !IsRow80SideSlot;
   static constexpr int LoRaRank = kStagesModuleRank ? kSvdqSm120ModuleLoRaRank : 32;
   static_assert(!IsRow80SideSlot || IsRow80, "the production side slot is row80-only");
   static_assert(IsRow80 ||

@@ -251,7 +251,11 @@ SM120_SMALL_M_SPLIT_MAX_M: Final = 512
 
 # LoRA ranks the native CUTLASS kernels can stage. Other multiples of 32 compile
 # but leave no tactic, so callers exclude them before loading a module.
-SM120_CUTLASS_LORA_RANKS: Final[tuple[int, ...]] = (32, 64, 128)
+SM120_CUTLASS_LORA_RANKS: Final[tuple[int, ...]] = (32, 64, 96, 128)
+# Ranks with fused smooth-quantize + LoRA-down producer families. The other
+# CUTLASS ranks (96) run complete linear on the separate route only: CUTLASS
+# quantize, torch.mm LoRA-down, then the GEMM.
+SM120_FUSED_PREFIX_RANKS: Final[tuple[int, ...]] = (32, 64, 128)
 
 SM120_FAMILY_LARGE_M: Final = 0
 SM120_FAMILY_SMALL_M: Final = 1
@@ -402,7 +406,7 @@ def sm120_producer_variants(
     GEMM held until the quantize half is done, so that the GEMM mainloop runs
     under LoRA-down instead of after it.
     """
-    if rank not in SM120_CUTLASS_LORA_RANKS:
+    if rank not in SM120_FUSED_PREFIX_RANKS:
         return ()
     geometries = (
         SM120_RANK64_PRODUCER_GEOMETRY_LADDER

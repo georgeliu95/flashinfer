@@ -195,7 +195,7 @@ def prepare_sm120_l2t(l2t_smoothed: torch.Tensor) -> None:
     layouts: dict[str, torch.Tensor] = {}
     if rank == 32 and l2t_smoothed.shape[0] in _SM120_M537_PACKED_L2T_K:
         layouts["m537"] = _pack_sm120_m537_l2t(l2t_smoothed)
-    if rank > 64:
+    if rank == 128:
         layouts["kmajor"] = _pack_sm120_kmajor_l2t(l2t_smoothed)
     key = _prepared_l2t_key(l2t_smoothed)
     if not layouts:
@@ -1036,7 +1036,8 @@ def svdquant_linear(
     is a route the tuner selects over -- one fused launch where the composed
     path spends two -- and the tactic it picks names the prefix and the GEMM
     together, so the pair is chosen on measured cost rather than independently.
-    Both ranks offer fused and separate preprocessing to the autotuner.
+    Ranks 32, 64 and 128 offer fused and separate preprocessing to the
+    autotuner; rank 96 has no fused prefix and runs the separate route.
     """
     m, k = x.shape if x.ndim == 2 else (-1, -1)
     n = weight_fp4.shape[0] if weight_fp4.ndim == 2 else -1
@@ -1044,7 +1045,7 @@ def svdquant_linear(
     if rank not in _SM120_CUTLASS_LORA_RANKS:
         raise ValueError(
             "the SM120 CUTLASS SVDQuant linear backend supports LoRA ranks "
-            f"32, 64 and 128, got {rank}"
+            f"32, 64, 96 and 128, got {rank}"
         )
 
     if m == 0:
