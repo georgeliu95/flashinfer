@@ -28,6 +28,9 @@ SM120_PACKED_SMALL_M_ROUTE_ABI_VERSION: Final = 10
 SM120_RANK64_FUSED_ROUTE_ABI_VERSION: Final = 11
 # 16: the split-K small-M producer family joined the rank-128 candidates.
 SM120_RANK128_FUSED_ROUTE_ABI_VERSION: Final = 16
+# 17: rank 96 offers the rank-128 producers (on a zero-padded L2T) next to the
+# separate route.
+SM120_RANK96_FUSED_ROUTE_ABI_VERSION: Final = 17
 
 # Historical route versions remain the fallback for shapes without the new
 # packed small-M family. Candidate admission below determines the v10 scope.
@@ -84,6 +87,8 @@ def sm120_linear_route_abi_version(m: int, k: int, rank: int) -> int:
         return SM120_RANK64_FUSED_ROUTE_ABI_VERSION
     if rank == 128:
         return SM120_RANK128_FUSED_ROUTE_ABI_VERSION
+    if rank == 96:
+        return SM120_RANK96_FUSED_ROUTE_ABI_VERSION
     if rank == 32 and any(
         family == SM120_FAMILY_SMALL_M_PACKED
         for family, _, _ in sm120_producer_variants(m, k)
@@ -252,10 +257,20 @@ SM120_SMALL_M_SPLIT_MAX_M: Final = 512
 # LoRA ranks the native CUTLASS kernels can stage. Other multiples of 32 compile
 # but leave no tactic, so callers exclude them before loading a module.
 SM120_CUTLASS_LORA_RANKS: Final[tuple[int, ...]] = (32, 64, 96, 128)
-# Ranks with fused smooth-quantize + LoRA-down producer families. The other
-# CUTLASS ranks (96) run complete linear on the separate route only: CUTLASS
-# quantize, torch.mm LoRA-down, then the GEMM.
+# Ranks with fused smooth-quantize + LoRA-down producer families of their own.
 SM120_FUSED_PREFIX_RANKS: Final[tuple[int, ...]] = (32, 64, 128)
+
+
+def sm120_prefix_rank(rank: int) -> int:
+    """The producer rank a CUTLASS LoRA rank's fused prefix runs at.
+
+    Rank 96 has no producer of its own. Its fused route runs the rank-128
+    producers on an L2T zero-padded to 128 columns; they write a [M, 128] down
+    whose leading 96 columns the rank-96 GEMM reads (the zero columns are never
+    read), so LoRA-up stays at rank 96.
+    """
+    return 128 if rank == 96 else rank
+
 
 SM120_FAMILY_LARGE_M: Final = 0
 SM120_FAMILY_SMALL_M: Final = 1

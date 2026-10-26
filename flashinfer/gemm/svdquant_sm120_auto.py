@@ -92,7 +92,18 @@ class _CutlassAutoRunner(TunableRunner):
             scratch = [None, None, None]
             if prepare:
                 values = _linear_gemm_inputs(inputs)
-                scratch = [values[0], values[2], values[5]]
+                down = values[5]
+                # The native routes share a down buffer as wide as the fused
+                # producer's rank (128 for rank 96); the GEMM reads its leading
+                # r columns.
+                prefix_rank = cutlass._sm120_prefix_rank(down.shape[1])
+                if prefix_rank != down.shape[1]:
+                    down = torch.empty(
+                        (down.shape[0], prefix_rank),
+                        dtype=down.dtype,
+                        device=down.device,
+                    )
+                scratch = [values[0], values[2], down]
             return inputs[:9] + scratch + [inputs[9], workspace]
         return [*inputs, workspace]
 

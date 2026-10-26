@@ -208,11 +208,13 @@ int nvfp4_svdquant_gemm_fallback_tactic(int m, int n, int k, int lora_rank) {
 // Fused residual NVFP4 GEMM + rank-32 LoRA-up: D @ L1ᵀ via the 2nd bf16 mma.sync in the custom
 // collective. 1/alpha folded into L1 so the epilogue yields alpha*residual + D@L1ᵀ + bias.
 // defer_lora_down_wait: see RuntimeTacticSm120; only the fused linear route sets it.
+// d_ld: row stride of D in elements (>= lora_rank); D may be a column prefix of a wider buffer.
 void nvfp4_svdquant_gemm_run_sm120(void* out, void const* A, void const* B, void const* sfa,
                                    void const* sfb, float const* alpha, void const* D,
                                    void const* L1, void const* bias, int m, int n, int k,
-                                   int lora_rank, char* ws, size_t wsBytes, cudaStream_t stream,
-                                   int tactic, bool enable_pdl, bool defer_lora_down_wait) {
+                                   int lora_rank, int d_ld, char* ws, size_t wsBytes,
+                                   cudaStream_t stream, int tactic, bool enable_pdl,
+                                   bool defer_lora_down_wait) {
   auto rt = sd::decode_runtime_tactic(tactic);
   rt.defer_lora_down_wait = defer_lora_down_wait;
   // The production entry never supplies the inline-down pointers, so every config
@@ -224,10 +226,11 @@ void nvfp4_svdquant_gemm_run_sm120(void* out, void const* A, void const* B, void
       rt.kernel_id,
       if constexpr (sd::kCompileInlineDownSm120<C>) {
         return sd::run_tactic<C>(rt, out, A, B, sfa, sfb, alpha, D, L1, bias, nullptr, nullptr, m,
-                                 n, k, lora_rank, ws, wsBytes, stream, enable_pdl);
+                                 n, k, lora_rank, d_ld, ws, wsBytes, stream, enable_pdl);
       } else {
         return sd::run_tactic_no_inline_down<C>(rt, out, A, B, sfa, sfb, alpha, D, L1, bias, m, n,
-                                                k, lora_rank, ws, wsBytes, stream, enable_pdl);
+                                                k, lora_rank, d_ld, ws, wsBytes, stream,
+                                                enable_pdl);
       })
 }
 
@@ -235,8 +238,8 @@ void nvfp4_svdquant_gemm_run(void* out, void const* A, void const* B, void const
                              void const* sfb, float const* alpha, void const* D, void const* L1,
                              void const* bias, int m, int n, int k, int lora_rank, char* ws,
                              size_t wsBytes, cudaStream_t stream, int tactic, bool enable_pdl) {
-  nvfp4_svdquant_gemm_run_sm120(out, A, B, sfa, sfb, alpha, D, L1, bias, m, n, k, lora_rank, ws,
-                                wsBytes, stream, tactic, enable_pdl, false);
+  nvfp4_svdquant_gemm_run_sm120(out, A, B, sfa, sfb, alpha, D, L1, bias, m, n, k, lora_rank,
+                                lora_rank, ws, wsBytes, stream, tactic, enable_pdl, false);
 }
 
 void nvfp4_svdquant_gemm_run_inline_down(void* out, void const* A, void const* B, void const* sfa,
@@ -252,7 +255,8 @@ void nvfp4_svdquant_gemm_run_inline_down(void* out, void const* A, void const* B
   }
   using C = sd::Tactic256x128x128SwapStaticConfig;
   return sd::run_tactic<C>(rt, out, A, B, sfa, sfb, alpha, D, L1, bias, inline_down_x,
-                           inline_down_l2t, m, n, k, lora_rank, ws, wsBytes, stream, enable_pdl);
+                           inline_down_l2t, m, n, k, lora_rank, lora_rank, ws, wsBytes, stream,
+                           enable_pdl);
 }
 
 }  // namespace gemm
@@ -616,20 +620,26 @@ void nvfp4_svdquant_gemm_impl(TensorView a, TensorView b, TensorView a_sf, Tenso
       << "a_sf is smaller than the required swizzled scale layout";
   TVM_FFI_ICHECK_GE(b_sf.numel(), swizzled_sf_size(n, k / 16))
       << "b_sf is smaller than the required swizzled scale layout";
-  TVM_FFI_ICHECK(d.ndim() == 2 && d.size(0) == m)
-      << "d must have shape [m, r] (rank-r LoRA-down output)";
-  int64_t const loraRank = d.size(1);
+  TVM_FFI_ICHECK(l1.ndim() == 2 && l1.size(0) == n)
+      << "l1 must have shape [n, r] (pre-divided by alpha)";
+  int64_t const loraRank = l1.size(1);
   // Legality only. Which ranks this module can actually stage is a per-tactic
   // property -- a module built for rank 64 still serves rank 32 on its K128
   // tactics -- so the decision belongs to can_implement, not to a module-wide
   // equality test. Infeasibility surfaces below as "no feasible fallback
   // tactic", or from run_tactic_impl when an explicit tactic is passed.
   TVM_FFI_ICHECK(loraRank > 0 && fits_nonnegative_int(loraRank) && loraRank % 32 == 0)
-      << "the LoRA rank (d.shape[1]) must be a positive int32 multiple of 32, got " << loraRank;
+      << "the LoRA rank (l1.shape[1]) must be a positive int32 multiple of 32, got " << loraRank;
+  // d is the row-major [m, r] LoRA-down output, or a buffer whose leading r columns are:
+  // the rank-96 fused linear route hands over its rank-128 prefix output whole, and only
+  // those columns are read. TMA needs a 16-byte row stride.
+  TVM_FFI_ICHECK(d.ndim() == 2 && d.size(0) == m && d.size(1) >= loraRank && d.stride(1) == 1)
+      << "d must be a row-major [m, >= r] LoRA-down output with r = l1.shape[1] = " << loraRank;
+  int64_t const dLd = d.stride(0);
+  TVM_FFI_ICHECK(dLd >= loraRank && dLd % 8 == 0 && fits_nonnegative_int(dLd))
+      << "d row stride must be at least the rank and a multiple of 8 elements, got " << dLd;
   TVM_FFI_ICHECK_EQ(reinterpret_cast<std::uintptr_t>(d.data_ptr()) % 16, 0)
       << "d must be 16-byte aligned for TMA";
-  TVM_FFI_ICHECK(l1.ndim() == 2 && l1.size(0) == n && l1.size(1) == loraRank)
-      << "l1 must have shape [n, r] with the same LoRA rank as d (pre-divided by alpha)";
   TVM_FFI_ICHECK_EQ(reinterpret_cast<std::uintptr_t>(l1.data_ptr()) % 16, 0)
       << "l1 must be 16-byte aligned for TMA";
   TVM_FFI_ICHECK(out.ndim() == 2 && out.size(0) == m && out.size(1) == n)
@@ -681,6 +691,7 @@ void nvfp4_svdquant_gemm_impl(TensorView a, TensorView b, TensorView a_sf, Tenso
       << " bytes, got " << provided_workspace_size
       << " (query nvfp4_svdquant_gemm_workspace_size and pre-provision before launch)";
   if (inline_down_x != nullptr && inline_down_l2t != nullptr) {
+    TVM_FFI_ICHECK_EQ(dLd, loraRank) << "inline LoRA-down writes a dense [m, r] d";
     flashinfer::gemm::nvfp4_svdquant_gemm_run_inline_down(
         out.data_ptr(), a.data_ptr(), b.data_ptr(), a_sf.data_ptr(), b_sf.data_ptr(),
         static_cast<float const*>(alpha.data_ptr()), d.data_ptr(), l1.data_ptr(), biasPtr,
@@ -693,8 +704,8 @@ void nvfp4_svdquant_gemm_impl(TensorView a, TensorView b, TensorView a_sf, Tenso
         out.data_ptr(), a.data_ptr(), b.data_ptr(), a_sf.data_ptr(), b_sf.data_ptr(),
         static_cast<float const*>(alpha.data_ptr()), d.data_ptr(), l1.data_ptr(), biasPtr,
         static_cast<int>(m), static_cast<int>(n), static_cast<int>(k), static_cast<int>(loraRank),
-        reinterpret_cast<char*>(workspace_buffer.data_ptr()), requiredWorkspaceBytes, stream,
-        tacticId, enable_pdl, defer_lora_down_wait);
+        static_cast<int>(dLd), reinterpret_cast<char*>(workspace_buffer.data_ptr()),
+        requiredWorkspaceBytes, stream, tacticId, enable_pdl, defer_lora_down_wait);
   }
 }
 

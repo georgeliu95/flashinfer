@@ -47,6 +47,10 @@ int32_t getMultiProcessorCount(int32_t device_index) {
 #if defined(FLASHINFER_ENABLE_SVDQ_SM120_K1_K2_FUSION)
 #if defined(SVDQ_SM120_LORA_RANK) && (SVDQ_SM120_LORA_RANK == 64 || SVDQ_SM120_LORA_RANK == 128)
 constexpr int kSm120PrefixRank = SVDQ_SM120_LORA_RANK;
+#elif defined(SVDQ_SM120_LORA_RANK) && SVDQ_SM120_LORA_RANK == 96
+// Rank 96 has no producer of its own: the rank-128 producers run on an L2T zero-padded to
+// 128 columns and write a [m, 128] down whose leading 96 columns the rank-96 GEMM reads.
+constexpr int kSm120PrefixRank = 128;
 #else
 constexpr int kSm120PrefixRank = 32;
 #endif

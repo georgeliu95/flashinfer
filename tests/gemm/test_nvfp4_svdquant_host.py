@@ -288,7 +288,9 @@ def test_auto_linear_quantization_policy_excludes_cached_native(
 
 
 @pytest.mark.parametrize(
-    "auto_backend_case", [(64, 128, 3072, 32), (64, 128, 3072, 64)], indirect=True
+    "auto_backend_case",
+    [(64, 128, 3072, 32), (64, 128, 3072, 64), (64, 128, 3072, 96)],
+    indirect=True,
 )
 def test_auto_linear_measures_both_native_prefixes(auto_backend_case):
     from flashinfer import autotune
@@ -298,20 +300,6 @@ def test_auto_linear_measures_both_native_prefixes(auto_backend_case):
         assert torch.all(call("linear") == 2)
     assert {"cutlass", "cutlass-fused"} <= set(builds)
     assert all(size == 10 for _, size in profiles)
-
-
-@pytest.mark.parametrize("auto_backend_case", [(64, 128, 3072, 96)], indirect=True)
-def test_auto_linear_measures_only_the_separate_native_route_at_rank_96(
-    auto_backend_case,
-):
-    """Rank 96 has CUTLASS GEMM tactics but no fused prefix family."""
-    from flashinfer import autotune
-
-    _, call, _, builds, _ = auto_backend_case
-    with autotune(True):
-        assert torch.all(call("linear") == 2)
-    assert "cutlass" in builds
-    assert "cutlass-fused" not in builds
 
 
 @pytest.mark.parametrize(
@@ -556,11 +544,11 @@ def test_ranks_off_the_granularity_are_refused(monkeypatch, rank):
         gemm_svdquant._check_mm_nvfp4_svdquant_problem(*_problem(rank=rank))
 
 
-def test_fused_linear_admission_supports_ranks_32_64_and_128():
-    """The fused prefix has separate rank-32, rank-64 and rank-128 specializations."""
-    for rank in (96, 160):
+def test_fused_linear_admission_supports_ranks_32_64_96_and_128():
+    """Ranks 32, 64 and 128 have fused prefixes; rank 96 borrows the rank-128 one."""
+    for rank in (160, 192):
         assert not svdquant_sm120_cutlass._sm120_fused_linear_supported(64, 3072, rank)
-    for rank in (32, 64, 128):
+    for rank in (32, 64, 96, 128):
         assert svdquant_sm120_cutlass._sm120_fused_linear_supported(64, 3072, rank)
 
 
@@ -574,7 +562,7 @@ def test_sm120_accepts_rank_32(monkeypatch):
 def test_fused_prefix_rank_limit_does_not_restrict_shared_gemm_validation():
     """The shared GEMM check also admits ranks with no SM120 fused prefix."""
     m, k = 64, 3072
-    for rank in (96, 160):
+    for rank in (160, 192):
         assert not svdquant_sm120_cutlass._sm120_fused_linear_supported(m, k, rank)
         assert (
             gemm_svdquant._check_mm_nvfp4_svdquant_problem(*_problem(rank=rank)) is True
@@ -1541,6 +1529,7 @@ def test_route_manifest_containers_are_immutable() -> None:
         (64, 1536, 32, 5),
         (64, 3072, 16, 5),
         (64, 3072, 64, 11),
+        (64, 3072, 96, 17),
     ],
 )
 def test_route_abi_version_matches_manifest(

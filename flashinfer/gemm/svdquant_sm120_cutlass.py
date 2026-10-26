@@ -55,6 +55,7 @@ _sm120_producer_variants = _sm120_routes.sm120_producer_variants
 _sm120_decode_producer_variant = _sm120_routes.sm120_decode_producer_variant
 _sm120_variant_packs_l2t = _sm120_routes.sm120_variant_packs_l2t
 _sm120_variant_reads_kmajor_l2t = _sm120_routes.sm120_variant_reads_kmajor_l2t
+_sm120_prefix_rank = _sm120_routes.sm120_prefix_rank
 _sm120_pack_tactic = _sm120_routes.sm120_pack_tactic
 _sm120_unpack_tactic = _sm120_routes.sm120_unpack_tactic
 _SM120_LINEAR_ROUTE_ABI_VERSION = _sm120_routes.SM120_LINEAR_ROUTE_ABI_VERSION
@@ -197,6 +198,9 @@ def prepare_sm120_l2t(l2t_smoothed: torch.Tensor) -> None:
         layouts["m537"] = _pack_sm120_m537_l2t(l2t_smoothed)
     if rank == 128:
         layouts["kmajor"] = _pack_sm120_kmajor_l2t(l2t_smoothed)
+    if _sm120_prefix_rank(rank) != rank:
+        layouts["padded"] = _pad_sm120_l2t(l2t_smoothed)
+        layouts["padded_kmajor"] = _pack_sm120_kmajor_l2t(layouts["padded"])
     key = _prepared_l2t_key(l2t_smoothed)
     if not layouts:
         _SM120_PREPARED_L2T.pop(key, None)
@@ -281,10 +285,44 @@ def _cached_sm120_kmajor_l2t(l2t_smoothed: torch.Tensor) -> torch.Tensor:
     )
 
 
+_SM120_PADDED_L2T_CACHE: OrderedDict[
+    int, tuple[weakref.ReferenceType, int, torch.Tensor]
+] = OrderedDict()
+_SM120_PADDED_KMAJOR_L2T_CACHE: OrderedDict[
+    int, tuple[weakref.ReferenceType, int, torch.Tensor]
+] = OrderedDict()
+
+
+def _pad_sm120_l2t(l2t_smoothed: torch.Tensor) -> torch.Tensor:
+    """[K, r] -> [K, prefix rank] with zero tail columns, for the producer r borrows."""
+    k, rank = l2t_smoothed.shape
+    padded = l2t_smoothed.new_zeros((k, _sm120_prefix_rank(rank)))
+    padded[:, :rank].copy_(l2t_smoothed)
+    return padded
+
+
+def _pack_sm120_padded_kmajor_l2t(l2t_smoothed: torch.Tensor) -> torch.Tensor:
+    return _pack_sm120_kmajor_l2t(_pad_sm120_l2t(l2t_smoothed))
+
+
 def _sm120_fused_l2t(
     l2t_smoothed: torch.Tensor, m: int, k: int, producer_variant: int, rank: int
 ) -> torch.Tensor:
     """The L2T layout the chosen fused producer reads."""
+    prefix_rank = _sm120_prefix_rank(rank)
+    if prefix_rank != rank:
+        # Both packs are keyed on the caller's [K, r] tensor, so a weight update
+        # invalidates them and graph capture records the padding.
+        if _sm120_variant_reads_kmajor_l2t(m, k, producer_variant, prefix_rank):
+            return _cached_l2t_pack(
+                l2t_smoothed,
+                _pack_sm120_padded_kmajor_l2t,
+                _SM120_PADDED_KMAJOR_L2T_CACHE,
+                "padded_kmajor",
+            )
+        return _cached_l2t_pack(
+            l2t_smoothed, _pad_sm120_l2t, _SM120_PADDED_L2T_CACHE, "padded"
+        )
     if _sm120_variant_packs_l2t(m, k, producer_variant, rank):
         return _cached_sm120_m537_l2t(l2t_smoothed)
     if _sm120_variant_reads_kmajor_l2t(m, k, producer_variant, rank):
@@ -314,7 +352,7 @@ def _sm120_fused_linear_supported(m: int, k: int, rank: int) -> bool:
     """
     if rank not in _SM120_CUTLASS_LORA_RANKS:
         return False
-    return bool(_sm120_producer_variants(m, k, rank))
+    return bool(_sm120_producer_variants(m, k, _sm120_prefix_rank(rank)))
 
 
 def _svdquant_op_name(
@@ -489,7 +527,7 @@ def _sm120_linear_tactics(module, inputs: List[torch.Tensor]) -> List[int]:
     """
     m, n, k, rank = _sm120_linear_inputs_shape(inputs)
     rows = _nvfp4_svdquant_valid_tactics(module, m, n, k, rank, inputs[0].device)
-    variants = range(len(_sm120_producer_variants(m, k, rank)))
+    variants = range(len(_sm120_producer_variants(m, k, _sm120_prefix_rank(rank))))
     return [_sm120_pack_tactic(row, v) for v in variants for row in rows]
 
 
@@ -527,7 +565,9 @@ def _sm120_run_unfused_linear_prefix(
         x_sf,
         enable_pdl,
     )
-    torch.mm(x, l2t_smoothed, out=down)
+    # down may be wider than the rank (rank 96 shares the fused route's
+    # [M, 128] buffer); the GEMM reads its leading r columns.
+    torch.mm(x, l2t_smoothed, out=down[:, : l2t_smoothed.shape[1]])
 
 
 def _sm120_fused_linear_runner(
@@ -578,7 +618,7 @@ def _sm120_fused_linear_runner(
             m_rt, k_rt = x.shape[0], x.shape[1]
             _, producer_variant = _sm120_unpack_tactic(tactic)
             family, tiling, address_policy = _sm120_decode_producer_variant(
-                m_rt, k_rt, producer_variant, rank
+                m_rt, k_rt, producer_variant, _sm120_prefix_rank(rank)
             )
             # M537 and packed small-M producers share the packed L2T layout;
             # the remaining producers read the original row-major matrix.
@@ -1036,8 +1076,8 @@ def svdquant_linear(
     is a route the tuner selects over -- one fused launch where the composed
     path spends two -- and the tactic it picks names the prefix and the GEMM
     together, so the pair is chosen on measured cost rather than independently.
-    Ranks 32, 64 and 128 offer fused and separate preprocessing to the
-    autotuner; rank 96 has no fused prefix and runs the separate route.
+    Every rank offers fused and separate preprocessing to the autotuner; rank 96
+    fuses through the rank-128 producers on a zero-padded L2T.
     """
     m, k = x.shape if x.ndim == 2 else (-1, -1)
     n = weight_fp4.shape[0] if weight_fp4.ndim == 2 else -1
@@ -1058,7 +1098,9 @@ def svdquant_linear(
     x_sf = torch.empty(
         (_swizzled_sf_size(m, k // 16),), dtype=torch.uint8, device=x.device
     )
-    down = torch.empty((m, rank), dtype=torch.bfloat16, device=x.device)
+    down = torch.empty(
+        (m, _sm120_prefix_rank(rank)), dtype=torch.bfloat16, device=x.device
+    )
     out = torch.empty((m, n), dtype=torch.bfloat16, device=x.device)
     # Sized before the tactic is known, so it must cover every tactic the
     # tuner can select for this shape.

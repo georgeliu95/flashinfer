@@ -1133,7 +1133,8 @@ def svdquant_linear(
         architecture-based automatic selection.
         ``"cutlass-sm120"`` supports ranks 32, 64, 96 and 128, with fused or
         separate quantization and LoRA-down selected by complete-linear
-        autotuning; rank 96 always runs them separately.
+        autotuning (rank 96 fuses through the rank-128 producers on a
+        zero-padded L2T).
         On SM120, ``"auto"`` also compares complete CuTe DSL and CUTLASS chains
         for these ranks. Without a cached winner, CuTe DSL remains the default
         when available. CuTe-specific quantization policies exclude native

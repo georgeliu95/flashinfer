@@ -731,8 +731,8 @@ template <class Config, bool CompileInlineDown>
 void run_tactic_impl(RuntimeTacticSm120 const& rt, void* out, void const* A, void const* B,
                      void const* sfa, void const* sfb, float const* alpha, void const* D,
                      void const* L1, void const* bias, void const* inline_down_x,
-                     void const* inline_down_l2t, int m, int n, int k, int lora_rank, char* ws,
-                     size_t wsBytes, cudaStream_t stream, bool enable_pdl) {
+                     void const* inline_down_l2t, int m, int n, int k, int lora_rank, int d_ld,
+                     char* ws, size_t wsBytes, cudaStream_t stream, bool enable_pdl) {
   if (!runtime_tactic_feasible<Config>(rt, m, n, k))
     throw std::invalid_argument("nvfp4_svdquant_gemm (sm120): tactic infeasible for this shape");
   using Gemm = std::conditional_t<CompileInlineDown, typename Config::Gemm,
@@ -748,6 +748,13 @@ void run_tactic_impl(RuntimeTacticSm120 const& rt, void* out, void const* A, voi
                                 std::to_string(Config::LoRaRank) + ", got " +
                                 std::to_string(lora_rank));
   int64_t const r = lora_rank;
+  // D may be the leading lora_rank columns of a wider row-major buffer: the rank-96
+  // fused linear route reads the first 96 columns of its rank-128 prefix's output.
+  // TMA needs a 16-byte row stride.
+  if (d_ld < lora_rank || d_ld % 8 != 0)
+    throw std::invalid_argument("nvfp4_svdquant_gemm (sm120): D row stride " +
+                                std::to_string(d_ld) + " is below the rank or not 16-byte aligned");
+  int64_t const ld_d = d_ld;
 
   if constexpr (Config::SwapAB) {
     // out^T[N,M] = alpha*(B@A^T) + L1@D^T [+ bias per swapped row]: swap the operand roles
@@ -760,7 +767,7 @@ void run_tactic_impl(RuntimeTacticSm120 const& rt, void* out, void const* A, voi
     args.mainloop.ptr_D = static_cast<cutlass::bfloat16_t const*>(L1);
     args.mainloop.dD = cute::make_stride(r, cute::_1{}, int64_t(n) * r);
     args.mainloop.ptr_L1 = static_cast<cutlass::bfloat16_t const*>(D);
-    args.mainloop.dL1 = cute::make_stride(r, cute::_1{}, int64_t(m) * r);
+    args.mainloop.dL1 = cute::make_stride(ld_d, cute::_1{}, int64_t(m) * ld_d);
   } else {
     args.problem_shape = cute::make_shape(m, n, k, 1);
     args.mainloop.ptr_A = static_cast<ElementType const*>(A);
@@ -768,7 +775,7 @@ void run_tactic_impl(RuntimeTacticSm120 const& rt, void* out, void const* A, voi
     args.mainloop.ptr_SFA = static_cast<SFType const*>(sfa);
     args.mainloop.ptr_SFB = static_cast<SFType const*>(sfb);
     args.mainloop.ptr_D = static_cast<cutlass::bfloat16_t const*>(D);
-    args.mainloop.dD = cute::make_stride(r, cute::_1{}, int64_t(m) * r);
+    args.mainloop.dD = cute::make_stride(ld_d, cute::_1{}, int64_t(m) * ld_d);
     args.mainloop.ptr_L1 = static_cast<cutlass::bfloat16_t const*>(L1);
     args.mainloop.dL1 = cute::make_stride(r, cute::_1{}, int64_t(n) * r);
   }
@@ -787,7 +794,7 @@ void run_tactic_impl(RuntimeTacticSm120 const& rt, void* out, void const* A, voi
     if (use_inline_down)
       throw std::invalid_argument("nvfp4_svdquant_gemm (sm120): inline LoRA-down is compiled out");
   }
-  if (use_inline_down && (m != 537 || n != 5376 || k != 5120 || !Config::SwapAB))
+  if (use_inline_down && (m != 537 || n != 5376 || k != 5120 || !Config::SwapAB || d_ld != r))
     throw std::invalid_argument(
         "nvfp4_svdquant_gemm (sm120): inline LoRA-down requires exact "
         "M537/N5376/K5120 swap configuration");
@@ -842,10 +849,10 @@ template <class Config>
 void run_tactic(RuntimeTacticSm120 const& rt, void* out, void const* A, void const* B,
                 void const* sfa, void const* sfb, float const* alpha, void const* D, void const* L1,
                 void const* bias, void const* inline_down_x, void const* inline_down_l2t, int m,
-                int n, int k, int lora_rank, char* ws, size_t wsBytes, cudaStream_t stream,
-                bool enable_pdl) {
+                int n, int k, int lora_rank, int d_ld, char* ws, size_t wsBytes,
+                cudaStream_t stream, bool enable_pdl) {
   run_tactic_impl<Config, true>(rt, out, A, B, sfa, sfb, alpha, D, L1, bias, inline_down_x,
-                                inline_down_l2t, m, n, k, lora_rank, ws, wsBytes, stream,
+                                inline_down_l2t, m, n, k, lora_rank, d_ld, ws, wsBytes, stream,
                                 enable_pdl);
 }
 
@@ -853,10 +860,10 @@ template <class Config>
 void run_tactic_no_inline_down(RuntimeTacticSm120 const& rt, void* out, void const* A,
                                void const* B, void const* sfa, void const* sfb, float const* alpha,
                                void const* D, void const* L1, void const* bias, int m, int n, int k,
-                               int lora_rank, char* ws, size_t wsBytes, cudaStream_t stream,
-                               bool enable_pdl) {
+                               int lora_rank, int d_ld, char* ws, size_t wsBytes,
+                               cudaStream_t stream, bool enable_pdl) {
   run_tactic_impl<Config, false>(rt, out, A, B, sfa, sfb, alpha, D, L1, bias, nullptr, nullptr, m,
-                                 n, k, lora_rank, ws, wsBytes, stream, enable_pdl);
+                                 n, k, lora_rank, d_ld, ws, wsBytes, stream, enable_pdl);
 }
 
 // ---------------------------------------------------------------------------
@@ -922,13 +929,13 @@ SVDQ_SM120_NO_INLINE_DOWN_CONFIG_LIST(SVDQ_SM120_DECLARE_NO_INLINE_DOWN)
       RuntimeTacticSm120 const& rt, void* out, void const* A, void const* B, void const* sfa,     \
       void const* sfb, float const* alpha, void const* D, void const* L1, void const* bias,       \
       void const* inline_down_x, void const* inline_down_l2t, int m, int n, int k, int lora_rank, \
-      char* ws, size_t wsBytes, cudaStream_t stream, bool enable_pdl);
+      int d_ld, char* ws, size_t wsBytes, cudaStream_t stream, bool enable_pdl);
 
 #define INSTANTIATE_NVFP4_SVDQUANT_GEMM_SM120_NO_INLINE_DOWN_TACTIC(Config)                        \
   template void run_tactic_no_inline_down<Config>(                                                 \
       RuntimeTacticSm120 const& rt, void* out, void const* A, void const* B, void const* sfa,      \
       void const* sfb, float const* alpha, void const* D, void const* L1, void const* bias, int m, \
-      int n, int k, int lora_rank, char* ws, size_t wsBytes, cudaStream_t stream,                  \
+      int n, int k, int lora_rank, int d_ld, char* ws, size_t wsBytes, cudaStream_t stream,        \
       bool enable_pdl);
 
 // The per-shape static-scheduler configs alias their base configs under the global
@@ -947,13 +954,13 @@ SVDQ_SM120_NO_INLINE_DOWN_CONFIG_LIST(SVDQ_SM120_DECLARE_NO_INLINE_DOWN)
       RuntimeTacticSm120 const& rt, void* out, void const* A, void const* B, void const* sfa,     \
       void const* sfb, float const* alpha, void const* D, void const* L1, void const* bias,       \
       void const* inline_down_x, void const* inline_down_l2t, int m, int n, int k, int lora_rank, \
-      char* ws, size_t wsBytes, cudaStream_t stream, bool enable_pdl);
+      int d_ld, char* ws, size_t wsBytes, cudaStream_t stream, bool enable_pdl);
 
 #define EXTERN_NVFP4_SVDQUANT_GEMM_SM120_NO_INLINE_DOWN_TACTIC(Config)                             \
   extern template void run_tactic_no_inline_down<Config>(                                          \
       RuntimeTacticSm120 const& rt, void* out, void const* A, void const* B, void const* sfa,      \
       void const* sfb, float const* alpha, void const* D, void const* L1, void const* bias, int m, \
-      int n, int k, int lora_rank, char* ws, size_t wsBytes, cudaStream_t stream,                  \
+      int n, int k, int lora_rank, int d_ld, char* ws, size_t wsBytes, cudaStream_t stream,        \
       bool enable_pdl);
 SVDQ_SM120_NO_INLINE_DOWN_CONFIG_LIST(EXTERN_NVFP4_SVDQUANT_GEMM_SM120_NO_INLINE_DOWN_TACTIC)
 

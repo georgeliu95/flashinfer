@@ -2287,6 +2287,25 @@ def test_sm120_prepare_l2t_skips_layouts_no_producer_reads() -> None:
         _clear_prepared_l2t()
 
 
+def test_sm120_prepare_l2t_pads_rank_96_for_the_rank128_producers() -> None:
+    _clear_prepared_l2t()
+    try:
+        source = torch.randn((3072, 96))
+        svdquant_sm120_cutlass.prepare_sm120_l2t(source)
+        key = svdquant_sm120_cutlass._prepared_l2t_key(source)
+        layouts = svdquant_sm120_cutlass._SM120_PREPARED_L2T[key][2]
+        padded = layouts["padded"]
+        assert padded.shape == (3072, 128)
+        assert torch.equal(padded[:, :96], source)
+        assert not padded[:, 96:].any()
+        assert torch.equal(
+            layouts["padded_kmajor"],
+            svdquant_sm120_cutlass._pack_sm120_kmajor_l2t(padded),
+        )
+    finally:
+        _clear_prepared_l2t()
+
+
 def test_sm120_jit_module_exports_fused_k1_k2_operator() -> None:
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0):
         pytest.skip("requires SM120")
@@ -5132,9 +5151,10 @@ def test_fused_prefix_observes_graph_weight_updates(
         check()
 
 
+@pytest.mark.parametrize("rank", [64, 96])
 @pytest.mark.parametrize("shape", [(64, 3072, 3072), (537, 5376, 7168)])
-def test_rank64_complete_linear_with_fused_runner_only(
-    monkeypatch: pytest.MonkeyPatch, shape: tuple[int, int, int]
+def test_complete_linear_with_fused_runner_only(
+    monkeypatch: pytest.MonkeyPatch, shape: tuple[int, int, int], rank: int
 ) -> None:
     def fused_runners(
         enable_pdl: bool, device: torch.device, m: int, n: int, k: int, rank: int
@@ -5144,9 +5164,88 @@ def test_rank64_complete_linear_with_fused_runner_only(
     monkeypatch.setattr(backend, "_cached_sm120_linear_runners", fused_runners)
     backend.AutoTuner.get().clear_cache()
     try:
-        _check_linear_graph_replay(64, shape, True, True)
+        _check_linear_graph_replay(rank, shape, True, True)
     finally:
         backend.AutoTuner.get().clear_cache()
+
+
+@pytest.mark.parametrize("m,k", [(64, 3072), (4096, 3072)])
+def test_rank96_fused_route_runs_every_rank128_producer(m: int, k: int) -> None:
+    """Rank 96 runs each rank-128 producer on a zero-padded L2T.
+
+    The producer writes a [M, 128] down whose last 32 columns stay zero, and the
+    rank-96 GEMM reads its leading 96 columns. Against the separate route (CUTLASS
+    quantize, torch.mm LoRA-down) the quantized activations and scale factors are
+    bit-identical; only the LoRA-down accumulation order differs.
+    """
+    if not _is_sm120():
+        pytest.skip("requires SM120")
+    torch.manual_seed(96)
+    n, rank = 3072, 96
+    device = torch.device("cuda")
+    x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16) / k**0.25
+    pqs = (1 + 0.3 * torch.randn(k, device="cuda", dtype=torch.bfloat16)).abs()
+    global_scale = (448.0 * 6.0 / (x * pqs).float().abs().max()).reshape(1)
+    l2t = (
+        pqs[:, None]
+        * torch.randn(k, rank, device="cuda", dtype=torch.bfloat16)
+        / k**0.25
+    ).contiguous()
+    weight = torch.randint(0, 256, (n, k // 2), device="cuda", dtype=torch.uint8)
+    weight_sf = torch.full(
+        ((n + 127) // 128 * 128 * (k // 16),), 0x38, device="cuda", dtype=torch.uint8
+    )
+    alpha = (1.0 / global_scale).float()
+    l1 = (
+        torch.randn(n, rank, device="cuda", dtype=torch.bfloat16).float()
+        / (rank**0.25 * alpha)
+    ).to(torch.bfloat16)
+    bias = torch.randn(n, device="cuda", dtype=torch.bfloat16)
+    workspace_bytes = max(
+        backend.DEFAULT_WORKSPACE_SIZE,
+        backend._sm120_max_workspace_bytes(device, m, n, k, rank),
+    )
+
+    def inputs() -> list[torch.Tensor]:
+        return [
+            x,
+            weight,
+            weight_sf,
+            alpha,
+            pqs,
+            l2t,
+            l1,
+            global_scale,
+            bias,
+            torch.empty(m, k // 2, device="cuda", dtype=torch.uint8),
+            torch.empty(
+                (m + 127) // 128 * 128 * (k // 16), device="cuda", dtype=torch.uint8
+            ),
+            torch.full((m, 128), float("nan"), device="cuda", dtype=torch.bfloat16),
+            torch.empty(m, n, device="cuda", dtype=torch.bfloat16),
+            torch.empty(workspace_bytes, device="cuda", dtype=torch.uint8),
+        ]
+
+    enable_pdl = device_support_pdl(device)
+    fused = backend._sm120_fused_linear_runner(enable_pdl, device, rank)
+    separate = backend._sm120_cutlass_linear_runner(enable_pdl, device, rank)
+    tactics = fused.get_valid_tactics(inputs(), None)
+    first_row: dict[int, int] = {}
+    for tactic in tactics:
+        row, variant = backend._sm120_unpack_tactic(tactic)
+        first_row.setdefault(variant, row)
+    assert len(first_row) == len(routes.sm120_producer_variants(m, k, 128))
+
+    for variant, row in first_row.items():
+        expected_inputs = inputs()
+        expected = separate(expected_inputs, tactic=row).clone()
+        actual_inputs = inputs()
+        actual = fused(actual_inputs, tactic=backend._sm120_pack_tactic(row, variant))
+        torch.cuda.synchronize()
+        assert torch.equal(actual_inputs[9], expected_inputs[9]), variant
+        assert torch.equal(actual_inputs[10], expected_inputs[10]), variant
+        assert torch.all(actual_inputs[11][:, rank:] == 0), variant
+        assert _sqnr_db(expected.float(), actual.float()) > 40.0, variant
 
 
 # Native prefix input validation on CUDA tensors.
