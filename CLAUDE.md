@@ -458,6 +458,11 @@ Every public API decorated with `@flashinfer_api` should also carry a `trace=` a
 6. **Run tests**: `pytest tests/trace/ -v` — all template-consistency and end-to-end tests must pass.
 7. **Commit the new JSON files** under `tests/trace/fi_trace_out/` alongside the code changes.
 
+For an init shared by multiple Const shapes, list the keyword-only parameters in
+`init._trace_init_const_axes` to bind their defaults to each dumped definition's
+resolved Const values. Test the exported snippet with only Var axes supplied so
+standalone replay does not depend on callers overriding Const defaults.
+
 **Example implementations:**
 - **Simple**: `flashinfer/norm/__init__.py` (RMSNorm) - no Jinja, good starting point
 - **Moderate**: `flashinfer/sampling.py` - with Jinja templating
@@ -733,6 +738,16 @@ Used by `flashinfer.trace` / `fi_trace`.
 | `FLASHINFER_NVFP4_4OVER6_E4M3_USE_256` | unset | `flashinfer/quantization/nvfp4_quantization_utils.py`, `csrc/nv_internal/cpp/common/envUtils.cpp` | **Legacy.** `1` treats 256, not the full-range 448, as the top of the E4M3 block-scale range: the per-tensor global scale becomes `256 * 6 / amax` (per-token: `1 / (256 * 6)`) and the kernel's error normalization follows. This is what keeps the 1.5x-larger `amax / 4` candidate representable — `256 * 1.5 = 384` still fits E4M3, whereas a 448-based scale would need `672` and saturate for blocks near the tensor amax. The global scale **must** be built from the same recipe (`make_nvfp4_global_scale(..., nvfp4_4over6_config=...)`); a mismatch silently rescales the whole tensor. Same gating as `FLASHINFER_NVFP4_4OVER6_ERR_MODE`. Parameter spelling: `NVFP44Over6Config(e4m3_max=256)`. |
 | `FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH` | unset | `flashinfer/quantization/kernels/nvfp4_quantize.py`, `csrc/nv_internal/cpp/common/envUtils.cpp` | `1` makes the NVFP4 quantizer derive its block/global scales with IEEE round-to-nearest arithmetic (`fdiv_rn`, `nvfp4_scale_from_amax_rn`) instead of the default fast approximate reciprocal (`rcp_approx_ftz`). Slower, but reproduces a reference implementation bit-exactly — use it when bisecting an NVFP4 accuracy mismatch. The flag is part of the CuTe-DSL specialization name (`_nofastmath` suffix), so toggling it compiles a separate kernel rather than reusing the cached one. The C++ side (`getEnvDisableFP4QuantFastMath()`) also accepts TRT-LLM's `TRTLLM_DISABLE_FP4_QUANT_FAST_MATH` as an alias. |
 
+##### Ulysses PCIe / RDMA Transport (experimental)
+
+Read when `UlyssesCommunicator` uses the PCIe backend -- named explicitly, or selected by `backend="auto"` where NVLink is unavailable and `FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS=1` is set. Every rank must set these identically (rank-ordered lists take one comma-separated value per rank).
+
+| Variable | Default | Read in | Effect |
+|----------|---------|---------|--------|
+| `FLASHINFER_ULYSSES_PCIE_NICS` | unset (auto) | `flashinfer/comm/ulysses_topology.py` | Override automatic PCI-distance NIC routing for the RDMA routes: mlx5 device names, one per rank in rank order. |
+| `FLASHINFER_ULYSSES_PCIE_GID_INDICES` | unset (auto) | `flashinfer/comm/ulysses_topology.py` | Pick one GID table index per rank when a chosen NIC has several usable IPv4 RoCE v2 entries. |
+| `FLASHINFER_ULYSSES_PCIE_ROUTE` | `auto` | `flashinfer/comm/ulysses_topology.py` | `p2p` forces the all-P2P route; `rdma` forces all-RDMA (per-rank mlx5 to every peer) at world size 2/4/8; `hybrid` forces the eight-rank 4+4 NUMA hybrid; forced RDMA routes fall back to all-P2P with a `RuntimeWarning` when their requirements are unmet; `auto` prefers the all-RDMA route at world sizes 4 and 8. |
+
 ##### Experimental KDA Output-Only Decode Tuning
 
 Low-level overrides for the output-only / RecoverSSM-verify KDA decode
@@ -894,3 +909,12 @@ These dependencies are included in FlashInfer's `3rdparty/` directory or `requir
 - New patterns or conventions → Document them for future reference
 - Deprecated approaches → Remove or mark as deprecated in docs
 - New error handling patterns, macros, or utilities → Add to relevant skill tutorials
+
+### Local H3 Ulysses integration
+
+The `integrate/h3-ulysses-cake` branch combines PR #4876 (PCIe/RDMA) with
+PR #4924 (prepared Sage2 QKV) on main, which already contains CAKE SSA (#4951).
+`prepare_qkv` uses the selected communicator's `exchange_chunks`: byte payloads
+use PCIe registrations on the PCIe backend and NCCL otherwise. The FP32 stats
+AllGather continues to use NCCL. Capacity normalization preserves the legacy
+`max_elems` alias while collective config checks retain backend-specific dtypes.

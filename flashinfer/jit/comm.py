@@ -14,6 +14,15 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import os
+import pathlib
+import sys
+from itertools import product
+from typing import Any, Dict, List, Literal, Tuple
+
+import jinja2
+
+from . import env as jit_env
 from .core import (
     JitSpec,
     current_compilation_context,
@@ -22,12 +31,6 @@ from .core import (
     sm103a_nvcc_flags,
 )
 from .utils import write_if_different
-from . import env as jit_env
-import os
-import pathlib
-import jinja2
-from itertools import product
-from typing import Any, Dict, List, Literal, Tuple
 
 
 def gen_comm_alltoall_module() -> JitSpec:
@@ -301,6 +304,70 @@ def gen_ulysses_a2a_module() -> JitSpec:
         [
             jit_env.FLASHINFER_CSRC_DIR / "ulysses_all_to_all.cu",
         ],
+    )
+
+
+def gen_ulysses_pcie_module() -> JitSpec:
+    """Build the optional single-node PCIe/mlx5 Ulysses transport.
+
+    Reached for ``backend="pcie"`` -- named explicitly, or chosen by ``auto``
+    behind the experimental opt-in -- and deliberately absent from
+    ``flashinfer/aot.py``, so nothing else ever needs rdma-core.
+
+    ``csrc/ulysses_pcie_transport.cuh`` is intentionally not in ``sources``
+    (a ``.cuh`` there would become its own translation unit); ninja's depfile
+    tracks it for rebuilds.
+    """
+    # The CI Conda environment provides rdma-core headers and libraries under
+    # sys.prefix rather than the system paths searched by nvcc and the linker.
+    rdma_prefix = pathlib.Path(sys.prefix)
+    rdma_include = rdma_prefix / "include"
+    rdma_lib = rdma_prefix / "lib"
+    return gen_jit_spec(
+        "ulysses_pcie",
+        [jit_env.FLASHINFER_CSRC_DIR / "ulysses_pcie.cu"],
+        extra_include_paths=[rdma_include]
+        if (rdma_include / "infiniband/mlx5dv.h").is_file()
+        else [],
+        extra_ldflags=([f"-L{rdma_lib}"] if (rdma_lib / "libmlx5.so").is_file() else [])
+        + ["-libverbs", "-lmlx5", "-lcuda"],
+    )
+
+
+def gen_ulysses_lowp_module() -> JitSpec:
+    # Byte-parity contract: the golden reference (SageAttention fork) compiles
+    # with --use_fast_math (the gen_jit_spec default, do NOT override) and
+    # targets sm_120a.  The explicit 120a gencode matters: the default
+    # compilation context normalizes SM 12.0 to compute_120f, whose FMA
+    # semantics can drift from the anchored sm_120a golden by ULPs.
+    #
+    # SM89 (Ada L40S / RTX 4090) uses the same Q_GROUP=32 / K_GROUP=64 tile
+    # sizes as SM120 (both are HMMA warp-level per_warp_int8), so the same
+    # source file covers both architectures.  We emit a fat binary with both
+    # gencodes so UlyssesLowpSageLayout.is_supported() returns True on either.
+    from .core import sm120a_nvcc_flags
+
+    sm89_gencode = "-gencode=arch=compute_89,code=sm_89"
+    return gen_jit_spec(
+        "ulysses_lowp",
+        [
+            jit_env.FLASHINFER_CSRC_DIR / "ulysses_lowp.cu",
+        ],
+        extra_cuda_cflags=[sm89_gencode] + sm120a_nvcc_flags,
+    )
+
+
+def gen_ulysses_lowp_sm90_module() -> JitSpec:
+    # SM90 (Hopper H100/H200) variant: Q_GROUP=16, K_GROUP=128 to match
+    # SageAttention2's WGMMA-based SM90 kernel tile sizes.
+    from .core import sm90a_nvcc_flags
+
+    return gen_jit_spec(
+        "ulysses_lowp_sm90",
+        [
+            jit_env.FLASHINFER_CSRC_DIR / "ulysses_lowp_sm90.cu",
+        ],
+        extra_cuda_cflags=sm90a_nvcc_flags,
     )
 
 

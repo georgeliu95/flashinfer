@@ -340,7 +340,18 @@ output through ``gather_heads``):
   the inverse, returning all heads of this rank's sequence shard,
 
 with ``H_local = H // world_size`` and ``S_global = S_local * world_size``.
-Both backends produce bit-identical results.
+All backends produce bit-identical results.
+
+A third entry point, ``exchange_chunks``, takes ``[1, 1, world_size, chunk]``
+to the same shape: chunk ``r`` goes to peer ``r`` and lands in slot ``rank``
+there, which is ``dist.all_to_all_single`` over an already-packed payload. It
+interleaves nothing, so it is for operands a preceding pack (a quantizer, say)
+already laid out destination-major — the head-axis transforms would make such a
+producer emit head-major and repack. On the ``"pcie"`` RDMA routes it is also
+the cheaper descriptor: each peer's bytes are contiguous on both ends, so the
+NIC addresses them with the plain memory region and a linear offset instead of
+an interleaved MKey, which is what exempts it from the 65535-byte stride limit
+that bounds ``H*D*element_size`` for the other two.
 
 **Backend policy.** :class:`UlyssesCommunicator` selects its backend in the
 constructor, strictly before any IPC allocation or JIT compilation:
@@ -350,11 +361,26 @@ constructor, strictly before any IPC allocation or JIT compilation:
 ============== ==================================================================
 ``"auto"``     fused-transpose NVLink-P2P kernel when the group is a verified
                single-node all-pairs NVLink mesh with a supported world size
-               (2/4/6/8); NCCL otherwise. The instance exposes ``.backend``
+               (2/4/6/8); the experimental PCIe transport where NVLink is
+               unavailable and ``FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS=1``
+               is set on every rank; NCCL otherwise. The instance exposes ``.backend``
                (effective), ``.fallback_reason`` and ``.decision`` /
                ``.topology_decision``.
 ``"nvlink"``   force the fused kernel; raises on every rank (before IPC/JIT for
                topology failures) when it cannot be used.
+``"pcie"``     force the experimental single-node PCIe transport at world size
+               1/2/4/8. Size 1 is an identity path and does not JIT-compile or
+               arm a native transport. Size 2 uses CUDA P2P. Sizes 4/8 prefer
+               an all-RDMA route (per-rank mlx5 to every peer) and fall
+               back to all-P2P; ``FLASHINFER_ULYSSES_PCIE_ROUTE`` can force
+               all-P2P, all-RDMA at any multi-rank world size, or the
+               eight-rank 4+4 NUMA P2P/mlx5 hybrid. Every route requires
+               full-group CUDA P2P access for the epoch signal barrier.
+               This backend is experimental: ``auto`` considers it only
+               where NVLink is unavailable and
+               ``FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS=1`` is set on
+               every rank. Naming it explicitly never needs that variable.
+               Either way it warns once.
 ``"nccl"``     force ``dist.all_to_all_single`` + permute; skips the
                topology/NVML probe and all IPC/JIT (the constructor still
                resolves/guards the CUDA device and performs CUDA-backed
@@ -371,21 +397,24 @@ inconsistent per-rank decisions, or a runtime NVLink initialization failure
 after a positive topology decision.
 
 **Constraints.** The constructor is always collective (all ranks together);
-:meth:`UlyssesCommunicator.close` is collective only when the NVLink backend
+:meth:`UlyssesCommunicator.close` is collective when the NVLink or PCIe backend
 was armed — for the pure NCCL backend, ``world_size == 1``, or an auto
 fallback whose NVLink cleanup already completed, ``close`` is local and
-idempotent. Rank-local failures inside the NVLink initialization or a
+idempotent. Rank-local failures inside backend initialization or a
 collective ``close`` are exchanged as group outcomes so all ranks jointly
 clean up and raise (or fall back) instead of deadlocking, and a failed
 ``close`` may be retried. All ranks must request the same ``backend`` and
-agree on ``max_elems`` and ``dtype``; each rank may bind a different CUDA
+agree on ``max_bytes`` and ``dtype``; each rank may bind a different CUDA
 device (``device`` accepts ``torch.device``, ``str`` or an ``int`` ordinal,
-e.g. ``cuda:rank``). With ``world_size > 1`` the NCCL backend (forced or
-fallen back to) requires ``group`` to support CUDA all-to-all (an NCCL
-process group), checked at construction. Operands must be contiguous 4-D
+e.g. ``cuda:rank``). With ``world_size > 1`` the NCCL and NVLink backends
+(NVLink's ``exchange_chunks`` runs ``all_to_all_single`` too) require
+``group`` to support CUDA all-to-all (an NCCL process group), checked at
+construction before any resource is armed. Operands must be contiguous 4-D
 CUDA tensors of the construction ``dtype`` (float16 / bfloat16 / float32
-only) on the construction device, every dim positive, at most ``max_elems``
-(≤ 2^31 − 1) elements; ``scatter_heads`` requires ``H % world_size == 0``
+only) on the construction device, every dim positive, and ``nbytes`` at most
+``max_bytes``; the element count of any one operand must additionally stay
+within the int32 kernel index range. ``scatter_heads`` requires
+``H % world_size == 0``
 and ``gather_heads`` requires ``S_global % world_size == 0``. Collectives
 run on the current CUDA stream; all ranks must issue the same call sequence
 with consistent shapes, one collective in flight per communicator at a
@@ -398,6 +427,34 @@ buffers and removes their per-call allocations. Omitting both keywords keeps
 the original allocation path unchanged. The NVLink backend uses ``out=`` but
 does not consume the workspace because its IPC staging allocation is owned by
 the communicator.
+
+**PCIe backend (experimental).** It additionally accepts the 1-, 2- and
+4-byte element types float16 / bfloat16 / float32, int8 / uint8 and
+float8_e4m3fn / float8_e5m2; its mlx5 routes — the eight-rank 4+4 NUMA
+hybrid and the ``FLASHINFER_ULYSSES_PCIE_ROUTE=rdma`` all-RDMA route —
+require batch size 1 and a head-row pitch ``H * D * element_size <= 65,535``
+bytes and refuse CUDA graph capture, while the all-P2P route takes any batch
+size and can be captured when every output comes from
+:meth:`UlyssesCommunicator.allocate_output`. The JIT module links
+libibverbs, libmlx5 and the CUDA driver library even when topology selects
+the all-P2P route, so the rdma-core development packages must be present;
+it is the only FlashInfer JIT module that links them. Multi-rank PCIe calls
+require ``out=`` from :meth:`UlyssesCommunicator.allocate_output`; the
+backend has no staging buffers, so ``workspace=``,
+:meth:`UlyssesCommunicator.create_workspace` and the head-chunk primitives
+are refused at world size above one. A rejection before native code runs
+(a bad operand, a refused capture, a second stream) leaves the RDMA routes
+usable, since every rank rejects the same call under the SPMD contract; the
+all-P2P route, whose barrier has no abort protocol, treats it as fail-stop.
+A failure inside the transport is fail-stop on every route: the communicator
+enters a BROKEN state that permits only a collective ``close``. On the RDMA
+routes it publishes a sticky abort that releases the peers and ``close``
+completes; on all-P2P ``close`` refuses to synchronize and the process must
+exit.
+See the `PCIe Ulysses design note
+<https://github.com/flashinfer-ai/flashinfer/blob/main/docs/design_docs/ulysses_pcie.md>`_
+for the support matrix, output-lifetime rules, teardown protocol, routing
+controls, and benchmark.
 
 **Known limitations.**
 
@@ -420,13 +477,21 @@ the communicator.
 `wan example <https://github.com/flashinfer-ai/flashinfer/tree/main/examples/pytorch/wan>`_
 for the full integration)::
 
-    with UlyssesCommunicator(group, max_elems=B * S_local * H * D,
-                             dtype=torch.bfloat16) as comm:
+    torch.cuda.set_device(local_rank)
+    device = torch.device("cuda", local_rank)
+    with UlyssesCommunicator(group, max_bytes=q.nbytes,
+                             dtype=torch.bfloat16, device=device) as comm:
         q_ = comm.scatter_heads(q)   # [B,S_local,H,D] -> [B,S_global,H_local,D]
         k_ = comm.scatter_heads(k)
         v_ = comm.scatter_heads(v)
         o_ = attention(q_, k_, v_)
         o = comm.gather_heads(o_)    # [B,S_global,H_local,D] -> [B,S_local,H,D]
+
+Existing callers can continue passing ``max_elems=...`` instead of
+``max_bytes=...``; the constructor multiplies it by ``dtype.itemsize``.
+Pass only one capacity argument. ``comm.max_elems`` remains available in the
+construction dtype, while ``comm.max_bytes`` is the byte capacity used by the
+new packed-chunk API.
 
 Preallocated outputs and NCCL staging can be reused across serialized calls::
 
@@ -434,6 +499,24 @@ Preallocated outputs and NCCL staging can be reused across serialized calls::
     q_global = torch.empty(B, S_global, H_local, D,
                            dtype=q.dtype, device=q.device)
     comm.scatter_heads(q, out=q_global, workspace=workspace)
+
+**Packed chunk exchange.** ``exchange_chunks`` follows the byte-oriented
+communicator API: it accepts contiguous ``[1, 1, P, C]`` tensors, sends chunk
+``r`` to rank ``r``, and receives chunks in source-rank order. A packed Lowp
+payload uses ``dtype=torch.uint8``; this describes its existing encoding and
+does not quantize or cast it. Both current backends use NCCL for this operation;
+the fused NVLink kernel applies only to the ordinary head-layout transforms.
+No PCIe or RDMA backend is added. A one-rank exchange is an identity.
+
+``allocate_output(x, op, dtype=...)`` creates ordinary PyTorch output storage
+for ``scatter_heads``, ``gather_heads`` or ``exchange_chunks``. No transport
+registration is needed by these backends. ``create_workspace(max_elems=...)``
+and ``UlyssesWorkspace`` retain their element-based staging capacities::
+
+    # send_u8: destination-major, contiguous uint8 [P, chunk_bytes].
+    chunks = send_u8.view(1, 1, P, -1)
+    received = comm.allocate_output(chunks, "exchange_chunks", dtype=torch.uint8)
+    comm.exchange_chunks(chunks, out=received, dtype=torch.uint8)
 
 .. autoclass:: UlyssesCommunicator
     :members:
@@ -446,6 +529,64 @@ Preallocated outputs and NCCL staging can be reused across serialized calls::
     :show-inheritance:
 
     .. automethod:: __init__
+
+Prepared Low-Precision QKV Exchange
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The public Lowp interface is :class:`UlyssesCommunicator` together with
+:class:`UlyssesQKVWorkspace` and :class:`UlyssesQKV`. Statistics, quantization
+and payload primitives are private implementation details. See the
+:download:`design document <../design_docs/ulysses_lowp.md>` for the numerical
+contract and kernel-level validation.
+
+``prepare_qkv`` is a collective preparation method; all ranks call it in the
+same order before attention. It allocates a dedicated mixed-dtype workspace
+from the local QKV shape. Ordinary ``create_workspace`` remains rank-local.
+``scatter_qkv`` currently supports the SageAttention2 encoding only::
+
+    # The original floating Q/K/V total is a conservative wire-byte budget.
+    with UlyssesCommunicator(group, max_bytes=3 * q.nbytes, dtype=q.dtype,
+                             device=q.device, backend="auto") as comm:
+        workspace = comm.prepare_qkv(q.shape, used_sequence=used)
+        encoded = comm.scatter_qkv(q, k, v, workspace=workspace)
+        # A framework adapter calls Sage with encoded.q/k/v and the scales.
+        # It returns [B, P*L, H/P, D], in encoded.input_dtype, with a zero tail.
+        output = comm.gather_heads(sage_adapter(encoded))
+        # After the previous attention has consumed the buffers:
+        encoded = comm.scatter_qkv(q_next, k_next, v_next,
+                                   workspace=workspace, out=encoded)
+
+The result contains INT8 Q/K, FP8 E4M3 V, three FP32 scales, the Sage layout,
+logical and used sequence lengths, and the original input dtype. It accepts
+FP16/BF16 inputs on homogeneous SM90 or SM120 groups, D=64/128, and P=2/4/8.
+The last input dimension is dense and each row must be 16-byte aligned;
+projection views need not be fully contiguous. The input padding after the
+used global prefix must already be zero.
+
+Statistics use NCCL on the communicator's group. The packed payload goes
+through ``exchange_chunks`` using PCIe/P2P/RDMA when ``backend="pcie"``;
+NCCL and NVLink communicators use NCCL for this byte exchange.
+``workspace.transport`` reports ``"pcie"`` or ``"nccl"`` accordingly. Preparation checks NCCL
+capability even for an NVLink communicator.
+``max_bytes`` must cover the full combined Q/K/V payload, including scales and
+chunk alignment. Preparation computes and validates the exact requirement;
+one floating Q tensor's byte size is generally insufficient. The example's
+``3 * q.nbytes`` covers both supported layouts. NCCL preparation allocates the
+actual payload size, not the full budget. Statistics and final outputs are
+additional allocations, so ``max_bytes`` is not a total memory budget.
+
+``out=None`` returns independent storage. ``out=`` requires matching tensor
+geometry and metadata, including the exact used length and original dtype.
+Output fields must not overlap one another, inputs or workspace scratch.
+A workspace belongs to its creating communicator and cannot be used after
+that communicator closes. Calls are serialized on the current CUDA stream.
+Prepared QKV workspaces and ordinary staging workspaces are not interchangeable.
+
+.. autoclass:: UlyssesQKV
+    :members:
+
+.. autoclass:: UlyssesQKVWorkspace
+    :members:
 
 Head-Chunk Layout and Transport Primitives
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -504,7 +645,12 @@ Topology Probing and Backend Selection
 
     UlyssesBackendDecision
     UlyssesRankTopology
+    UlyssesPciePlan
     UlyssesBackendError
+
+The communicator exposes ``.backend`` (the effective backend), ``.transport``
+(``"p2p"``, ``"hybrid"`` or ``"rdma"``, PCIe only), ``.decision`` /
+``.topology_decision`` and ``.fallback_reason``.
 
 .. autofunction:: resolve_ulysses_backend
 
