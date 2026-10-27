@@ -27,6 +27,7 @@ limitations under the License.
 import dataclasses
 import functools
 import math
+import os
 from types import SimpleNamespace
 from typing import Any, Dict, Optional, Tuple, Union
 
@@ -264,7 +265,10 @@ def _require_tensor(name: str, tensor: torch.Tensor) -> None:
 
 def _require_sm89_or_sm120(tensor: torch.Tensor) -> None:
     capability = torch.cuda.get_device_capability(tensor.device)
-    if capability not in {(8, 9), (12, 0)}:
+    if capability not in {(8, 9), (12, 0)} and not (
+        capability == (12, 1)
+        and os.environ.get("SGLANG_H3_GB10_DELIVERY") == "1"
+    ):
         raise RuntimeError(
             "low-precision Ulysses V2-G operations require CUDA capability "
             f"(8, 9) or (12, 0), but device {tensor.device} reports {capability}"
@@ -474,6 +478,8 @@ _ARCH_LAYOUT_CLASS: Dict[Tuple[int, int], str] = {
     (12, 0): "UlyssesLowpSageLayout",
     (9, 0): "UlyssesLowpSageLayoutSM90",
 }
+if os.environ.get("SGLANG_H3_GB10_DELIVERY") == "1":
+    _ARCH_LAYOUT_CLASS[(12, 1)] = "UlyssesLowpSageLayout"
 
 
 def _device_capability(

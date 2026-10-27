@@ -20,6 +20,7 @@
 # No AOT-compiled quant runtime fallback and no external-workspace reuse
 # parameter -- both are optional performance paths, not required for correctness.
 
+import os
 from typing import Optional, Sequence
 
 import torch
@@ -360,7 +361,10 @@ def _require_sm120_bf16_bhsd(name: str, tensor: torch.Tensor) -> None:
         raise ValueError(f"{name} must have head dimension 128")
     if tensor.shape[0] < 1 or tensor.shape[1] < 1 or tensor.shape[2] < 1:
         raise ValueError(f"{name} requires positive B, H, and sequence length")
-    if torch.cuda.get_device_capability(tensor.device) != (12, 0):
+    if torch.cuda.get_device_capability(tensor.device) != (12, 0) and not (
+        torch.cuda.get_device_capability(tensor.device) == (12, 1)
+        and os.environ.get("SGLANG_H3_GB10_DELIVERY") == "1"
+    ):
         raise RuntimeError("SM120 Sage quantization requires compute capability 12.0")
 
 

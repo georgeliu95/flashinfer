@@ -1832,10 +1832,14 @@ class UlyssesCommunicator:
 
             with torch.cuda.device(self.device):
                 cap = lowp.capability(self.device)
+                gb10_delivery = (
+                    os.environ.get("SGLANG_H3_GB10_DELIVERY") == "1"
+                    and cap["device_capability"] == (12, 1)
+                )
                 if (
                     cap["device_capability"] not in ((9, 0), (12, 0))
-                    or not cap["supported"]
-                ):
+                    and not gb10_delivery
+                ) or not cap["supported"]:
                     raise RuntimeError(
                         f"Sage2 QKV kernels unavailable on SM90/SM120: {cap}"
                     )

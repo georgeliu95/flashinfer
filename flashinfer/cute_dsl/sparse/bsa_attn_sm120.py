@@ -14,6 +14,7 @@
 
 import functools
 import math
+import os
 from typing import Optional, Tuple
 
 import torch
@@ -423,7 +424,10 @@ def _bsa_attn_sm120_blk64_sage_fwd_cake(
             raise ValueError(f"{name} must be contiguous on {device}")
 
     capability = _device_capability(device.index)
-    if capability != (12, 0):
+    if capability != (12, 0) and not (
+        capability == (12, 1)
+        and os.environ.get("SGLANG_H3_GB10_DELIVERY") == "1"
+    ):
         raise RuntimeError(
             f"SM120 Sage attention requires compute capability 12.0, got {capability}"
         )
@@ -734,7 +738,10 @@ def bsa_attn_sm120_blk64_sage_fwd(
             raise ValueError(f"{name} must use torch.float32, got {tensor.dtype}")
 
     capability = tuple(int(v) for v in torch.cuda.get_device_capability(q_int8.device))
-    if capability != (12, 0):
+    if capability != (12, 0) and not (
+        capability == (12, 1)
+        and os.environ.get("SGLANG_H3_GB10_DELIVERY") == "1"
+    ):
         raise RuntimeError(
             f"bsa_attn_sm120_blk64_sage_fwd (cute_dsl) requires SM120 (12.0), "
             f"got {capability}"

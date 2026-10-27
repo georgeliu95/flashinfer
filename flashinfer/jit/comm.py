@@ -345,15 +345,21 @@ def gen_ulysses_lowp_module() -> JitSpec:
     # sizes as SM120 (both are HMMA warp-level per_warp_int8), so the same
     # source file covers both architectures.  We emit a fat binary with both
     # gencodes so UlyssesLowpSageLayout.is_supported() returns True on either.
-    from .core import sm120a_nvcc_flags
+    import torch
 
+    from .core import sm120a_nvcc_flags, sm121a_nvcc_flags
+
+    gb10 = (
+        os.environ.get("SGLANG_H3_GB10_DELIVERY") == "1"
+        and torch.cuda.get_device_capability() == (12, 1)
+    )
     sm89_gencode = "-gencode=arch=compute_89,code=sm_89"
     return gen_jit_spec(
-        "ulysses_lowp",
+        "ulysses_lowp_sm121a" if gb10 else "ulysses_lowp",
         [
             jit_env.FLASHINFER_CSRC_DIR / "ulysses_lowp.cu",
         ],
-        extra_cuda_cflags=[sm89_gencode] + sm120a_nvcc_flags,
+        extra_cuda_cflags=sm121a_nvcc_flags if gb10 else [sm89_gencode] + sm120a_nvcc_flags,
     )
 
 

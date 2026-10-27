@@ -30,6 +30,9 @@ Sources live under ``csrc/cake_sage_block_sparse_attention``:
 from __future__ import annotations
 
 import functools
+import os
+
+import torch
 from pathlib import Path
 
 from . import env as jit_env
@@ -40,6 +43,7 @@ from .core import (
     sm100a_nvcc_flags,
     sm103a_nvcc_flags,
     sm120a_nvcc_flags,
+    sm121a_nvcc_flags,
 )
 
 _GENERATED_ROOT = "csrc/cake_sage_block_sparse_attention"
@@ -166,10 +170,14 @@ def gen_cake_sage_block_sparse_attention_module(
         )
     name = source.removesuffix("_kernel.cu")
     root = _get_csrc_dir() / "sm_120a"
+    gb10 = (
+        os.environ.get("SGLANG_H3_GB10_DELIVERY") == "1"
+        and torch.cuda.get_device_capability() == (12, 1)
+    )
     return _spec(
-        name,
+        name + ("_sm121a" if gb10 else ""),
         [root / source, root / _SM120_BINDING],
-        sm120a_nvcc_flags,
+        sm121a_nvcc_flags if gb10 else sm120a_nvcc_flags,
         [f"-DCAKE_SAGE_SM120_KERNEL=kernel_{name}"],
     )
 
