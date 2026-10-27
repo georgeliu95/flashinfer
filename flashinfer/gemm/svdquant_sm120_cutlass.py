@@ -809,6 +809,8 @@ _NVFP4_SVDQUANT_GEMM_TUNING_CONFIG_EXACT = TuningConfig(
 _SM120_LINEAR_TUNING_CONFIG_COLD = TuningConfig(
     use_cuda_graph=False,
     use_cold_l2_cache=True,
+    # Local measurement branch only: re-rank close linear finalists as for the GEMM.
+    finalist_rounds=5,
     tensor_initializers=((13, autotuner_initializer_empty),),
     constraint_specs=(
         ConstraintSpec(
