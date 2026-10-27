@@ -135,9 +135,25 @@ struct SvdquantGemmConfigSm120 {
   // compiled rather than dropping it is what keeps kernel ids stable, since the
   // KernelShapeSm120 enum and SVDQ_SM120_DISPATCH are written out by hand and
   // would otherwise have to be regenerated per rank.
+  //
+  // Tiles above 128x128 keep the serial LoRA tail (see UseLoRaEpiOverlap below), which folds
+  // any number of stage-wide chunks: there a wider module rank is staged as
+  // LoRaSteps = rank / capacity chunks through consecutive stages, so the K128 big tiles
+  // serve rank 64 as two rank-32 steps.
   static constexpr int kLoRaStageCapacity = cute::size<2>(MmaTileShape{}) / 4;
-  static constexpr int LoRaRank =
-      kSvdqSm120ModuleLoRaRank <= kLoRaStageCapacity ? kSvdqSm120ModuleLoRaRank : 32;
+  static constexpr bool kSerialLoRaTail = cute::size<0>(MmaTileShape{}) > 128 ||
+                                          cute::size<1>(MmaTileShape{}) > 128;
+  static constexpr bool kChunkedLoRa =
+      kSerialLoRaTail && !IsRow80SideSlot &&
+      kSvdqSm120ModuleLoRaRank >
+              kLoRaStageCapacity&& kSvdqSm120ModuleLoRaRank % kLoRaStageCapacity ==
+          0;
+  static constexpr int LoRaSteps = kChunkedLoRa ? kSvdqSm120ModuleLoRaRank / kLoRaStageCapacity : 1;
+  static constexpr int LoRaRank =  // per step
+      kChunkedLoRa                                     ? kLoRaStageCapacity
+      : kSvdqSm120ModuleLoRaRank <= kLoRaStageCapacity ? kSvdqSm120ModuleLoRaRank
+                                                       : 32;
+  static constexpr int LoRaRankTotal = LoRaRank * LoRaSteps;
   static_assert(!IsRow80SideSlot || IsRow80, "the production side slot is row80-only");
   static_assert(IsRow80 ||
                     LoRaPathSm120 == cutlass::gemm::collective::Sm120LoRaPath::kByteExactMainloop,
@@ -166,6 +182,8 @@ struct SvdquantGemmConfigSm120 {
   // win measured on the 128x128 rows (t1/t36/t37).
   static constexpr bool UseLoRaEpiOverlap =
       cute::size<0>(MmaTileShape{}) <= 128 && cute::size<1>(MmaTileShape{}) <= 128;
+  static_assert(UseLoRaEpiOverlap == !kSerialLoRaTail,
+                "chunked LoRA staging is only folded by the serial tail");
   using CollectiveEpilogue =
       cute::conditional_t<UseLoRaEpiOverlap,
                           typename MakeSm120LoRaOverlapEpilogue<CollectiveEpilogueBase>::Type,
@@ -248,7 +266,7 @@ struct SvdquantGemmConfigSm120 {
       typename CollectiveMainloopBase::GmemTiledCopyPairB,
       typename CollectiveMainloopBase::SmemLayoutAtomsB,
       typename CollectiveMainloopBase::SmemCopyAtomsB, typename CollectiveMainloopBase::TransformB,
-      LoRaPathSm120, IsProductionRow80, CompileInlineDown, LoRaRank>;
+      LoRaPathSm120, IsProductionRow80, CompileInlineDown, LoRaRank, LoRaSteps>;
   using CollectiveMainloop = CollectiveMainloopT<true>;
   using CollectiveMainloopNoInlineDown = CollectiveMainloopT<false>;
 
@@ -732,11 +750,11 @@ void run_tactic_impl(RuntimeTacticSm120 const& rt, void* out, void const* A, voi
   typename Gemm::Arguments args{};
   args.mode = cutlass::gemm::GemmUniversalMode::kGemm;
 
-  // This config stages Config::LoRaRank; a launcher that hands it anything else
+  // This config stages Config::LoRaRankTotal; a launcher that hands it anything else
   // would read the D/L1 tiles at the wrong extent rather than fail, so refuse.
-  if (lora_rank != Config::LoRaRank)
+  if (lora_rank != Config::LoRaRankTotal)
     throw std::invalid_argument("nvfp4_svdquant_gemm (sm120): this tactic stages LoRA rank " +
-                                std::to_string(Config::LoRaRank) + ", got " +
+                                std::to_string(Config::LoRaRankTotal) + ", got " +
                                 std::to_string(lora_rank));
   int64_t const r = lora_rank;
 
