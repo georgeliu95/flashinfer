@@ -763,6 +763,7 @@ void run_tactic_impl(RuntimeTacticSm120 const& rt, void* out, void const* A, voi
     args.mainloop.ptr_L1 = static_cast<cutlass::bfloat16_t const*>(L1);
     args.mainloop.dL1 = cute::make_stride(r, cute::_1{}, int64_t(n) * r);
   }
+  args.mainloop.weights_are_a = Config::SwapAB;  // B carries the weights unless swapped
   args.mainloop.dA = cute::make_int_tuple_from<typename Gemm::GemmKernel::StrideA>(k, 0);
   args.mainloop.dB = cute::make_int_tuple_from<typename Gemm::GemmKernel::StrideB>(k, 0);
   auto const sf_shape = cute::make_shape(int64_t(Config::SwapAB ? n : m),

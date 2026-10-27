@@ -673,6 +673,8 @@ struct CollectiveMmaLoRaSm120 {
     int inline_down_m{0};
     int inline_down_k{0};
     bool inline_down_wait_on_n{false};
+    // Weights are A under SwapAB; issued before the PDL wait on the first work tile.
+    bool weights_are_a{false};
   };
 
   // Device side kernel params
@@ -758,6 +760,7 @@ struct CollectiveMmaLoRaSm120 {
     int inline_down_m = 0;
     int inline_down_k = 0;
     bool inline_down_wait_on_n = false;
+    bool weights_are_a = false;
   };
 
   //
@@ -831,6 +834,7 @@ struct CollectiveMmaLoRaSm120 {
     params.inline_down_m = args.inline_down_m;
     params.inline_down_k = args.inline_down_k;
     params.inline_down_wait_on_n = args.inline_down_wait_on_n;
+    params.weights_are_a = args.weights_are_a;
     if constexpr (UseLoRaPipeline) {
       auto tensor_d_dedicated = cute::recast<LoRaDedicatedTmaInternalElement>(tensor_d);
       auto tensor_l1_dedicated = cute::recast<LoRaDedicatedTmaInternalElement>(tensor_l1);
@@ -1181,7 +1185,8 @@ struct CollectiveMmaLoRaSm120 {
       Params const& params, MainloopPipeline pipeline, PipelineState smem_pipe_write,
       cute::tuple<TensorA, TensorB, TensorSFA, TensorSFB, TensorD, TensorL1> const& load_inputs,
       BlockCoord const& blk_coord, KTileIterator k_tile_iter, int k_tile_count, int thread_idx,
-      uint32_t block_rank_in_cluster, TensorStorage& shared_tensors, bool do_lora) {
+      uint32_t block_rank_in_cluster, TensorStorage& shared_tensors, bool do_lora,
+      bool weights_before_pdl_wait = false) {
     int lane_predicate = cute::elect_one_sync();
 
     if (lane_predicate) {
@@ -1243,6 +1248,57 @@ struct CollectiveMmaLoRaSm120 {
 
       Tensor tL1gL1 = block_tma_l1.partition_S(gL1);
       Tensor tL1sL1 = block_tma_l1.partition_D(sL1);
+
+      // PDL: the weight operand and its scales (B/SFB, or A/SFA under SwapAB) do not depend on the
+      // preceding kernel. On the producer's first work tile, issue them for the first Stages
+      // k-tiles before waiting on the dependent grid, then issue the activation operand for the
+      // same stages. producer_acquire armed each stage's barrier with its full byte budget, so
+      // splitting the issue keeps the arrivals byte-exact.
+      if (weights_before_pdl_wait) {
+        using EarlyBarrierType = typename MainloopPipeline::ProducerBarrierType;
+        int const early = cute::min(k_tile_count, int(DispatchPolicy::Stages));
+        auto early_write = smem_pipe_write;
+        auto early_k = k_tile_iter;
+        CUTLASS_PRAGMA_NO_UNROLL
+        for (int i = 0; i < early; ++i) {
+          pipeline.producer_acquire(early_write);
+          EarlyBarrierType* tma_barrier = pipeline.producer_get_barrier(early_write);
+          int write_stage = early_write.index();
+          if (params.weights_are_a) {
+            copy(params.tma_load_a.with(*tma_barrier), tAgA(_, _, _, *early_k),
+                 tAsA(_, _, _, write_stage));
+            copy(params.tma_load_sfa.with(*tma_barrier), tAgSFA(_, _, _, *early_k),
+                 tAsSFA(_, _, _, write_stage));
+          } else {
+            copy(params.tma_load_b.with(*tma_barrier), tBgB(_, _, _, *early_k),
+                 tBsB(_, _, _, write_stage));
+            copy(params.tma_load_sfb.with(*tma_barrier), tBgSFB(_, _, _, *early_k),
+                 tBsSFB(_, _, _, write_stage));
+          }
+          ++early_k;
+          ++early_write;
+        }
+        cutlass::arch::wait_on_dependent_grids();
+        CUTLASS_PRAGMA_NO_UNROLL
+        for (int i = 0; i < early; ++i) {
+          EarlyBarrierType* tma_barrier = pipeline.producer_get_barrier(smem_pipe_write);
+          int write_stage = smem_pipe_write.index();
+          if (params.weights_are_a) {
+            copy(params.tma_load_b.with(*tma_barrier), tBgB(_, _, _, *k_tile_iter),
+                 tBsB(_, _, _, write_stage));
+            copy(params.tma_load_sfb.with(*tma_barrier), tBgSFB(_, _, _, *k_tile_iter),
+                 tBsSFB(_, _, _, write_stage));
+          } else {
+            copy(params.tma_load_a.with(*tma_barrier), tAgA(_, _, _, *k_tile_iter),
+                 tAsA(_, _, _, write_stage));
+            copy(params.tma_load_sfa.with(*tma_barrier), tAgSFA(_, _, _, *k_tile_iter),
+                 tAsSFA(_, _, _, write_stage));
+          }
+          ++k_tile_iter;
+          ++smem_pipe_write;
+        }
+        k_tile_count -= early;
+      }
 
       // Residual mainloop: each step arms LoRaTmaBytes by default and adds the residual
       // remainder BEFORE issuing its TMAs.
@@ -1313,7 +1369,8 @@ struct CollectiveMmaLoRaSm120 {
       LoRaPipeline lora_pipeline, LoRaPipelineState lora_pipe_write,
       cute::tuple<TensorA, TensorB, TensorSFA, TensorSFB, TensorD, TensorL1> const& load_inputs,
       BlockCoord const& blk_coord, KTileIterator k_tile_iter, int k_tile_count, int thread_idx,
-      uint32_t block_rank_in_cluster, TensorStorage& shared_tensors, bool do_lora) {
+      uint32_t block_rank_in_cluster, TensorStorage& shared_tensors, bool do_lora,
+      bool weights_before_pdl_wait = false) {
     int lane_predicate = cute::elect_one_sync();
 
     if (lane_predicate) {
@@ -1366,6 +1423,57 @@ struct CollectiveMmaLoRaSm120 {
       // partitioned inside the do_lora branch below.
       Tensor tDgD = block_tma_d.partition_S(gD);
       Tensor tL1gL1 = block_tma_l1.partition_S(gL1);
+
+      // PDL: the weight operand and its scales (B/SFB, or A/SFA under SwapAB) do not depend on the
+      // preceding kernel. On the producer's first work tile, issue them for the first Stages
+      // k-tiles before waiting on the dependent grid, then issue the activation operand for the
+      // same stages. producer_acquire armed each stage's barrier with its full byte budget, so
+      // splitting the issue keeps the arrivals byte-exact.
+      if (weights_before_pdl_wait) {
+        using EarlyBarrierType = typename MainloopPipeline::ProducerBarrierType;
+        int const early = cute::min(k_tile_count, int(DispatchPolicy::Stages));
+        auto early_write = smem_pipe_write;
+        auto early_k = k_tile_iter;
+        CUTLASS_PRAGMA_NO_UNROLL
+        for (int i = 0; i < early; ++i) {
+          pipeline.producer_acquire(early_write);
+          EarlyBarrierType* tma_barrier = pipeline.producer_get_barrier(early_write);
+          int write_stage = early_write.index();
+          if (params.weights_are_a) {
+            copy(params.tma_load_a.with(*tma_barrier), tAgA(_, _, _, *early_k),
+                 tAsA(_, _, _, write_stage));
+            copy(params.tma_load_sfa.with(*tma_barrier), tAgSFA(_, _, _, *early_k),
+                 tAsSFA(_, _, _, write_stage));
+          } else {
+            copy(params.tma_load_b.with(*tma_barrier), tBgB(_, _, _, *early_k),
+                 tBsB(_, _, _, write_stage));
+            copy(params.tma_load_sfb.with(*tma_barrier), tBgSFB(_, _, _, *early_k),
+                 tBsSFB(_, _, _, write_stage));
+          }
+          ++early_k;
+          ++early_write;
+        }
+        cutlass::arch::wait_on_dependent_grids();
+        CUTLASS_PRAGMA_NO_UNROLL
+        for (int i = 0; i < early; ++i) {
+          EarlyBarrierType* tma_barrier = pipeline.producer_get_barrier(smem_pipe_write);
+          int write_stage = smem_pipe_write.index();
+          if (params.weights_are_a) {
+            copy(params.tma_load_b.with(*tma_barrier), tBgB(_, _, _, *k_tile_iter),
+                 tBsB(_, _, _, write_stage));
+            copy(params.tma_load_sfb.with(*tma_barrier), tBgSFB(_, _, _, *k_tile_iter),
+                 tBsSFB(_, _, _, write_stage));
+          } else {
+            copy(params.tma_load_a.with(*tma_barrier), tAgA(_, _, _, *k_tile_iter),
+                 tAsA(_, _, _, write_stage));
+            copy(params.tma_load_sfa.with(*tma_barrier), tAgSFA(_, _, _, *k_tile_iter),
+                 tAsSFA(_, _, _, write_stage));
+          }
+          ++k_tile_iter;
+          ++smem_pipe_write;
+        }
+        k_tile_count -= early;
+      }
 
       // Residual mainloop, byte-identical to the byte-exact policy: every step arms and
       // arrives the full residual budget.
@@ -2434,7 +2542,8 @@ class GemmUniversalLoRaSm120 {
 
       // Mainloop Producer Warp
       else if (producer_warp_role == ProducerWarpRole::Mainloop) {
-        cutlass::arch::wait_on_dependent_grids();
+        // The first load() waits on the dependent grid itself, after issuing its weight TMAs.
+        bool weights_before_pdl_wait = true;
         bool do_load_order_arrive = true;
         bool requires_clc_query = true;
         while (work_tile_info.is_valid()) {
@@ -2468,7 +2577,8 @@ class GemmUniversalLoRaSm120 {
             collective_mainloop.load(
                 params.mainloop, mainloop_pipeline, mainloop_pipe_producer_state, lora_pipeline,
                 lora_pipe_producer_state, load_inputs, blk_coord, k_tile_iter, work_k_tile_count,
-                lane_idx, block_rank_in_cluster, shared_storage.tensors.mainloop, do_lora);
+                lane_idx, block_rank_in_cluster, shared_storage.tensors.mainloop, do_lora,
+                weights_before_pdl_wait);
             // The mainloop state advances by the residual K tiles only; the LoRA pipeline
             // advances by exactly do_lora.
             mainloop_pipe_producer_state.advance(work_k_tile_count);
@@ -2477,11 +2587,12 @@ class GemmUniversalLoRaSm120 {
             collective_mainloop.load(
                 params.mainloop, mainloop_pipeline, mainloop_pipe_producer_state, load_inputs,
                 blk_coord, k_tile_iter, work_k_tile_count, lane_idx, block_rank_in_cluster,
-                shared_storage.tensors.mainloop, do_lora);
+                shared_storage.tensors.mainloop, do_lora, weights_before_pdl_wait);
             // Update starting pipeline state for the next tile (+1 for the LoRA stage).
             mainloop_pipe_producer_state.advance(work_k_tile_count + (do_lora ? 1 : 0));
           }
 
+          weights_before_pdl_wait = false;
           if (do_load_order_arrive) {
             load_order_barrier.arrive();
             do_load_order_arrive = false;
@@ -2550,6 +2661,10 @@ class GemmUniversalLoRaSm120 {
       work_tile_info = scheduler.initial_work_tile_info(ClusterShape{});
       cutlass::arch::warpgroup_reg_alloc<MmaRegisterRequirement>();
 
+      // The epilogue's scalar broadcast reads *alpha_ptr in its constructor. Under PDL the
+      // preceding kernel (which writes alpha) may still be running when this grid starts, so wait
+      // first; the consumers would block on the mainloop pipeline anyway, so this costs nothing.
+      cutlass::arch::wait_on_dependent_grids();
       CollectiveEpilogue local_collective_epilogue(params.epilogue,
                                                    shared_storage.tensors.epilogue);
 

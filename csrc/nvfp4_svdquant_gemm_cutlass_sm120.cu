@@ -855,6 +855,11 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(nvfp4_quantize_smooth_lora_down_cublaslt_sm120,
                               torch_ext::nvfp4_quantize_smooth_lora_down_cublaslt_sm120);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(nvfp4_svdquant_linear_sm120, torch_ext::nvfp4_svdquant_linear_sm120);
 #endif
+// True when every warp role reads data written by the preceding kernel only after
+// griddepcontrol.wait, so that kernel may trigger launch_dependents early (weights-first PDL).
+bool nvfp4_svdquant_gemm_pdl_early_safe() { return true; }
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(nvfp4_svdquant_gemm_pdl_early_safe,
+                              nvfp4_svdquant_gemm_pdl_early_safe);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(nvfp4_svdquant_gemm_tactic_num,
                               torch_ext::nvfp4_svdquant_gemm_tactic_num);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(nvfp4_svdquant_gemm_lora_rank,
