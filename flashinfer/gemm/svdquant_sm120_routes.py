@@ -28,6 +28,10 @@ SM120_PACKED_SMALL_M_ROUTE_ABI_VERSION: Final = 10
 SM120_RANK64_FUSED_ROUTE_ABI_VERSION: Final = 11
 # 17: rank-128 PDL routes include an explicit quantize-output handoff.
 SM120_RANK128_FUSED_ROUTE_ABI_VERSION: Final = 17
+# 18: rank-128 shapes that admit the QuantB linear runner (sm120_quant_b_variants).
+# Its tactics index that enumeration, so changing the SM120_QUANT_B_* ladders or the
+# small-M producers it pairs with needs a new version.
+SM120_RANK128_QUANT_B_ROUTE_ABI_VERSION: Final = 18
 
 # Historical route versions remain the fallback for shapes without the new
 # packed small-M family. Candidate admission below determines the v10 scope.
@@ -83,6 +87,8 @@ def sm120_linear_route_abi_version(m: int, k: int, rank: int) -> int:
     if rank == 64:
         return SM120_RANK64_FUSED_ROUTE_ABI_VERSION
     if rank == 128:
+        if sm120_quant_b_variants(m, k, rank):
+            return SM120_RANK128_QUANT_B_ROUTE_ABI_VERSION
         return SM120_RANK128_FUSED_ROUTE_ABI_VERSION
     if rank == 32 and any(
         family == SM120_FAMILY_SMALL_M_PACKED
@@ -524,6 +530,112 @@ def sm120_decode_producer_variant(
     persisted tactic must still run something correct after the ladder moves.
     """
     variants = sm120_producer_variants(m, k, rank)
+    if not 0 <= variant < len(variants):
+        return variants[0]
+    return variants[variant]
+
+
+# --- the QuantB linear route ---------------------------------------------------
+#
+# A QuantB GEMM's consumer warps quantize bf16 X straight into the B operand's
+# shared-memory stages, so the GEMM launches at once instead of after a
+# quantize kernel; a small-M prefix computes LoRA-down beside it. In the hybrid
+# form the consumers quantize only the first head-tiles K tiles, and a chunked
+# prefix writes XQ for the rest, which the GEMM loads by TMA group by group.
+# Every weight tile requantizes its whole activation tile, so the work grows
+# with M x K x N / 128: candidates are offered for small M only.
+
+# (activation rows per tile, tile K), indexed as SVDQ_SM120_QUANT_B_DISPATCH in
+# csrc/nvfp4_svdquant_gemm_cutlass_sm120.cu dispatches them.
+SM120_QUANT_B_KERNELS: Final[tuple[tuple[int, int], ...]] = (
+    (32, 128),
+    (32, 256),
+    (64, 128),
+    (64, 256),
+)
+# (block threads, down tile columns) of the chunked-quantize prefix; mirrors
+# FI_SVDQ_CHUNKED_CASE in csrc/nvfp4_smooth_quantize_sm100.cu.
+SM120_QUANT_B_CHUNKED_TILINGS: Final[tuple[tuple[int, int], ...]] = (
+    (1024, 8),
+    (1024, 16),
+    (768, 16),
+    (768, 32),
+)
+# Hybrid head tiles quantized by the consumers, and persistent quantize CTAs of
+# the chunked prefix.
+SM120_QUANT_B_HEAD_TILES: Final[tuple[int, ...]] = (0, 4)
+SM120_QUANT_B_QUANT_CTAS: Final[tuple[int, ...]] = (8, 12)
+# Head-tiles value of a pure QuantB launch: the consumers quantize every K tile.
+SM120_QUANT_B_ALL_TILES: Final = -1
+SM120_QUANT_B_CHUNK_K: Final = 128
+SM120_QUANT_B_MAX_M: Final = 256
+
+QuantBVariant: TypeAlias = tuple[int, int, int, int, tuple[int, int, int]]
+
+
+@functools.cache
+def sm120_quant_b_variants(m: int, k: int, rank: int = 32) -> tuple[QuantBVariant, ...]:
+    """Every (kernel, head tiles, quantize CTAs, family, tiling) QuantB launch of a shape.
+
+    Pure launches (head tiles SM120_QUANT_B_ALL_TILES) pair each kernel with every
+    small-M LoRA-down producer this shape admits; a family-1 tiling's third field
+    only shapes quantize work, which these launches do not run, so one tiling per
+    (block threads, tile columns) is kept. Hybrid launches pair each kernel with
+    the head-tile and quantize-CTA ladders and the chunked prefix tilings.
+    """
+    if (
+        rank != 128
+        or not 0 < m <= SM120_QUANT_B_MAX_M
+        or k <= 0
+        or k % SM120_QUANT_B_CHUNK_K
+    ):
+        return ()
+    down: list[tuple[int, tuple[int, int, int]]] = []
+    seen: set[tuple[int, int, int]] = set()
+    for family, tiling, policy in sm120_producer_variants(m, k, rank):
+        if policy != 0 or family not in (
+            SM120_FAMILY_SMALL_M,
+            SM120_FAMILY_SMALL_M_SPLIT,
+        ):
+            continue
+        key = (
+            (family, tiling[0], tiling[1])
+            if family == SM120_FAMILY_SMALL_M
+            else (family, tiling[0], tiling[1] * 1000 + tiling[2])
+        )
+        if key not in seen:
+            seen.add(key)
+            down.append((family, tiling))
+    chunked = tuple(
+        (block_threads, tile_cols, 4)
+        for block_threads, tile_cols in SM120_QUANT_B_CHUNKED_TILINGS
+        if sm120_small_m_tiling_is_valid(m, k, block_threads, tile_cols, 4, rank)
+    )
+    variants: list[QuantBVariant] = []
+    for kernel, (_, tile_k) in enumerate(SM120_QUANT_B_KERNELS):
+        if k % tile_k:
+            continue
+        variants.extend(
+            (kernel, SM120_QUANT_B_ALL_TILES, 0, family, tiling)
+            for family, tiling in down
+        )
+        variants.extend(
+            (kernel, head, ctas, SM120_FAMILY_SMALL_M, tiling)
+            for head in SM120_QUANT_B_HEAD_TILES
+            if head < k // tile_k
+            for ctas in SM120_QUANT_B_QUANT_CTAS
+            for tiling in chunked
+        )
+    return tuple(variants)
+
+
+def sm120_decode_quant_b_variant(
+    m: int, k: int, variant: int, rank: int = 32
+) -> QuantBVariant:
+    """Resolve a QuantB tactic to its launch; out of range selects the first one."""
+    variants = sm120_quant_b_variants(m, k, rank)
+    if not variants:
+        raise ValueError(f"no SM120 QuantB launch for m={m}, k={k}, rank={rank}")
     if not 0 <= variant < len(variants):
         return variants[0]
     return variants[variant]

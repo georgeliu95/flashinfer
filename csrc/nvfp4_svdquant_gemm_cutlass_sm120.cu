@@ -537,7 +537,12 @@ void nvfp4_quantize_smooth_lora_down_dyn_sm120_impl(
     TensorView x, TensorView pqs, TensorView global_scale, TensorView l2t_smoothed, TensorView xq,
     TensorView sf, TensorView down, int family, int tiling0, int tiling1, int tiling2,
     int address_policy, bool signal_launch,
-    flashinfer::gemm::SvdquantQuantizeBarrierSm120 quantize_barrier);
+    flashinfer::gemm::SvdquantQuantizeBarrierSm120 quantize_barrier, bool down_only);
+
+void nvfp4_quantize_smooth_lora_down_chunked_sm120_impl(
+    TensorView x, TensorView pqs, TensorView global_scale, TensorView l2t_smoothed, TensorView xq,
+    TensorView sf, TensorView down, std::uint32_t* chunk_group_counts, int quant_ctas,
+    int block_threads, int down_tile_cols);
 
 void nvfp4_quantize_smooth_lora_down_overlap_sm120(TensorView x, TensorView pqs,
                                                    TensorView global_scale, TensorView l2t_smoothed,
@@ -716,13 +721,17 @@ void nvfp4_svdquant_gemm(TensorView a, TensorView b, TensorView a_sf, TensorView
 /**
  * @brief Dispatch the producer half of a runtime tactic using its matching L2T layout.
  * A negative family selects the default prefix; explicit families own their
- * geometry validation and optional quantize-ready signaling.
+ * geometry validation and optional quantize-ready signaling. down_only skips the
+ * quantization (QuantB GEMMs; rank-128 family 1 or 6 only).
  */
 void dispatch_svdquant_producer_sm120(
     TensorView x, TensorView pqs, TensorView global_scale, TensorView l2t_smoothed, TensorView xq,
     TensorView a_sf, TensorView down, TensorView workspace_buffer, int producer_family = -1,
     int tiling0 = 0, int tiling1 = 0, int tiling2 = 0, int address_policy = 0,
-    bool enable_pdl = false, flashinfer::gemm::SvdquantQuantizeBarrierSm120 quantize_barrier = {}) {
+    bool enable_pdl = false, flashinfer::gemm::SvdquantQuantizeBarrierSm120 quantize_barrier = {},
+    bool down_only = false) {
+  TVM_FFI_ICHECK(!down_only || producer_family == 1 || producer_family == 6)
+      << "a LoRA-down-only prefix needs family 1 or 6";
   if (producer_family == 3) {
     nvfp4_quantize_smooth_lora_down_cublaslt_sm120(x, pqs, global_scale, l2t_smoothed, xq, a_sf,
                                                    down, workspace_buffer);
@@ -733,7 +742,7 @@ void dispatch_svdquant_producer_sm120(
         x, pqs, global_scale, l2t_smoothed, xq, a_sf, down, producer_family, tiling0, tiling1,
         tiling2, address_policy,
         (producer_family == 4 || producer_family == 1 || producer_family == 6) && enable_pdl,
-        quantize_barrier);
+        quantize_barrier, down_only);
     return;
   }
   nvfp4_quantize_smooth_lora_down_geometry_sm120(x, pqs, global_scale, l2t_smoothed, xq, a_sf, down,
@@ -853,6 +862,194 @@ void nvfp4_svdquant_linear_sm120(TensorView x, TensorView pqs, TensorView global
   }
 }
 
+// Dispatch a callable over the QuantB swap tiles. Kernel ids mirror
+// SM120_QUANT_B_KERNELS in flashinfer/gemm/svdquant_sm120_routes.py. Only the rank-128
+// module compiles these configs (gen_gemm_sm120_module_cutlass_nvfp4_svdquant).
+#if defined(SVDQ_SM120_LORA_RANK) && SVDQ_SM120_LORA_RANK == 128
+#define SVDQ_SM120_QUANT_B_DISPATCH(kernel, EXPR)                                   \
+  switch (kernel) {                                                                 \
+    case 0: {                                                                       \
+      using C = flashinfer::gemm::svdquant_sm120::Tactic128x32x128SwapQuantBConfig; \
+      EXPR;                                                                         \
+      break;                                                                        \
+    }                                                                               \
+    case 1: {                                                                       \
+      using C = flashinfer::gemm::svdquant_sm120::Tactic128x32x256SwapQuantBConfig; \
+      EXPR;                                                                         \
+      break;                                                                        \
+    }                                                                               \
+    case 2: {                                                                       \
+      using C = flashinfer::gemm::svdquant_sm120::Tactic128x64x128SwapQuantBConfig; \
+      EXPR;                                                                         \
+      break;                                                                        \
+    }                                                                               \
+    case 3: {                                                                       \
+      using C = flashinfer::gemm::svdquant_sm120::Tactic128x64x256SwapQuantBConfig; \
+      EXPR;                                                                         \
+      break;                                                                        \
+    }                                                                               \
+    default:                                                                        \
+      TVM_FFI_ICHECK(false) << "invalid SM120 QuantB kernel " << (kernel);          \
+  }
+#else
+#define SVDQ_SM120_QUANT_B_DISPATCH(kernel, EXPR) \
+  TVM_FFI_ICHECK(false) << "SM120 QuantB kernels are compiled for LoRA rank 128 only"
+#endif
+
+namespace {
+
+int quant_b_chunk_groups(int k) {
+  int const chunks = k / flashinfer::gemm::kSvdquantQuantChunkK;
+  return (chunks + flashinfer::gemm::kSvdquantQuantChunksPerGroup - 1) /
+         flashinfer::gemm::kSvdquantQuantChunksPerGroup;
+}
+
+}  // namespace
+
+/**
+ * @brief Scratch bytes nvfp4_svdquant_linear_quant_b_sm120 needs for one QuantB kernel: the
+ * GEMM workspace followed by the hybrid's chunk-group counters.
+ */
+int64_t nvfp4_svdquant_quant_b_workspace_size(int64_t m, int64_t n, int64_t k,
+                                              int64_t quant_b_kernel) {
+  TVM_FFI_ICHECK(fits_nonnegative_int(m) && fits_nonnegative_int(n) && fits_nonnegative_int(k))
+      << "NVFP4 SVDQuant SM120 dimensions must fit in int32";
+  std::size_t offset = 0;
+  SVDQ_SM120_QUANT_B_DISPATCH(quant_b_kernel,
+                              offset = flashinfer::gemm::svdquant_sm120::quant_b_counters_offset<C>(
+                                  static_cast<int>(m), static_cast<int>(n), static_cast<int>(k)));
+  return static_cast<int64_t>(offset) +
+         quant_b_chunk_groups(static_cast<int>(k)) * static_cast<int64_t>(sizeof(std::uint32_t));
+}
+
+/**
+ * @brief Launch a rank-128 small-M prefix followed by a QuantB GEMM whose consumers quantize
+ * x themselves. quant_b_kernel selects the swap tile (0 = 128x32x128, 1 = 128x32x256,
+ * 2 = 128x64x128, 3 = 128x64x256).
+ *
+ * With head_tiles < 0 (or covering K) the prefix computes LoRA-down only (family 1 or 6,
+ * any small-M tiling) and the consumers quantize every K tile. Otherwise (hybrid) the
+ * consumers quantize K tiles [0, head_tiles) and a family-1 prefix with quant_ctas
+ * persistent quantize CTAs (tiling0 = block threads, tiling1 = down tile cols) writes
+ * xq / a_sf and counts finished K chunks per group in the workspace; the GEMM loads the
+ * remaining tiles by TMA as their groups complete. Every buffer is caller-owned; the
+ * workspace must hold nvfp4_svdquant_quant_b_workspace_size bytes.
+ */
+void nvfp4_svdquant_linear_quant_b_sm120(
+    TensorView x, TensorView pqs, TensorView global_scale, TensorView l2t_smoothed, TensorView b,
+    TensorView b_sf, TensorView alpha, TensorView l1, Optional<TensorView> const& bias,
+    TensorView xq, TensorView a_sf, TensorView down, TensorView out, TensorView workspace_buffer,
+    int64_t quant_b_kernel, int64_t head_tiles, int64_t quant_ctas, int64_t producer_family,
+    int64_t tiling0, int64_t tiling1, int64_t tiling2, bool enable_pdl) {
+  CHECK_INPUT_AND_TYPE(x, dl_bfloat16);
+  CHECK_INPUT_AND_TYPE(pqs, dl_bfloat16);
+  CHECK_INPUT_AND_TYPE(global_scale, dl_float32);
+  CHECK_INPUT_AND_TYPE(b, FLOAT4_E2M1X2);
+  CHECK_INPUT_AND_TYPE(b_sf, SF_DTYPE);
+  CHECK_INPUT_AND_TYPE(alpha, dl_float32);
+  CHECK_INPUT_AND_TYPE(l1, dl_bfloat16);
+  CHECK_INPUT_AND_TYPE(down, dl_bfloat16);
+  CHECK_INPUT_AND_TYPE(workspace_buffer, dl_uint8);
+  CHECK_INPUT_AND_TYPE(out, dl_bfloat16);
+  CHECK_DEVICE(pqs, x);
+  CHECK_DEVICE(global_scale, x);
+  CHECK_DEVICE(b, x);
+  CHECK_DEVICE(b_sf, x);
+  CHECK_DEVICE(alpha, x);
+  CHECK_DEVICE(l1, x);
+  CHECK_DEVICE(down, x);
+  CHECK_DEVICE(out, x);
+  CHECK_DEVICE(workspace_buffer, x);
+  TVM_FFI_ICHECK(x.ndim() == 2 && b.ndim() == 2 && down.ndim() == 2 && l1.ndim() == 2 &&
+                 out.ndim() == 2)
+      << "x, b, down, l1 and out must be 2-D";
+  TVM_FFI_ICHECK(fits_nonnegative_int(x.size(0)) && fits_nonnegative_int(x.size(1)) &&
+                 fits_nonnegative_int(b.size(0)))
+      << "NVFP4 SVDQuant SM120 dimensions must fit in int32";
+  int const m = static_cast<int>(x.size(0));
+  int const k = static_cast<int>(x.size(1));
+  int const n = static_cast<int>(b.size(0));
+  TVM_FFI_ICHECK(b.size(1) * 2 == k && pqs.numel() == k && down.size(0) == m && l1.size(0) == n &&
+                 l1.size(1) == down.size(1) && out.size(0) == m && out.size(1) == n)
+      << "QuantB operand shapes do not match x [m, k], b [n, k/2], down [m, r], l1 [n, r]";
+  TVM_FFI_ICHECK(n > 0 && n % 32 == 0) << "n must be a positive multiple of 32";
+  TVM_FFI_ICHECK_EQ(down.size(1), 128) << "the SM120 QuantB linear supports LoRA rank 128 only";
+  TVM_FFI_ICHECK_GE(alpha.numel(), 1) << "alpha must contain at least one element";
+  TVM_FFI_ICHECK_GE(b_sf.numel(), swizzled_sf_size(n, k / 16))
+      << "b_sf is smaller than the required swizzled scale layout";
+  TVM_FFI_ICHECK_EQ(reinterpret_cast<std::uintptr_t>(down.data_ptr()) % 16, 0)
+      << "down must be 16-byte aligned for TMA";
+  TVM_FFI_ICHECK_EQ(reinterpret_cast<std::uintptr_t>(l1.data_ptr()) % 16, 0)
+      << "l1 must be 16-byte aligned for TMA";
+  TVM_FFI_ICHECK_EQ(k % flashinfer::gemm::kSvdquantQuantChunkK, 0)
+      << "the SM120 QuantB linear needs K to be a multiple of "
+      << flashinfer::gemm::kSvdquantQuantChunkK;
+  TVM_FFI_ICHECK(producer_family == 1 || producer_family == 6)
+      << "the SM120 QuantB linear pairs with a small-M LoRA-down prefix (family 1 or 6)";
+  TVM_FFI_ICHECK(fits_nonnegative_int(tiling0) && fits_nonnegative_int(tiling1) &&
+                 fits_nonnegative_int(tiling2) && fits_nonnegative_int(quant_ctas) &&
+                 head_tiles <= std::numeric_limits<int>::max())
+      << "SM120 QuantB parameters must fit in int32";
+  void const* bias_ptr = nullptr;
+  if (bias.has_value()) {
+    auto const& bias_tensor = bias.value();
+    CHECK_INPUT_AND_TYPE(bias_tensor, dl_bfloat16);
+    CHECK_DEVICE(bias_tensor, x);
+    TVM_FFI_ICHECK(bias_tensor.ndim() == 1 && bias_tensor.size(0) == n)
+        << "bias must have shape [n]";
+    bias_ptr = bias_tensor.data_ptr();
+  }
+  if (m == 0) return;
+
+  std::size_t counters_offset = 0;
+  int tile_k = 0;
+  SVDQ_SM120_QUANT_B_DISPATCH(quant_b_kernel, {
+    counters_offset = flashinfer::gemm::svdquant_sm120::quant_b_counters_offset<C>(m, n, k);
+    tile_k = cute::size<2>(typename C::MmaTileShape{});
+  });
+  TVM_FFI_ICHECK_EQ(k % tile_k, 0) << "K must be a multiple of the QuantB tile K " << tile_k;
+  int const groups = quant_b_chunk_groups(k);
+  auto const workspace_bytes =
+      static_cast<std::size_t>(workspace_buffer.numel()) * get_element_size(workspace_buffer);
+  TVM_FFI_ICHECK_GE(workspace_bytes, counters_offset + groups * sizeof(std::uint32_t))
+      << "workspace buffer too small for the SM120 QuantB linear "
+         "(query nvfp4_svdquant_quant_b_workspace_size)";
+  bool const hybrid = head_tiles >= 0 && head_tiles < k / tile_k;
+  std::uint32_t* chunk_groups = nullptr;
+  if (hybrid) {
+    TVM_FFI_ICHECK(producer_family == 1 && quant_ctas > 0)
+        << "the QuantB hybrid runs the chunked family-1 prefix with quant_ctas > 0";
+    TVM_FFI_ICHECK_EQ(
+        reinterpret_cast<std::uintptr_t>(workspace_buffer.data_ptr()) % alignof(std::uint32_t), 0)
+        << "workspace must be 4-byte aligned for the QuantB chunk counters";
+    chunk_groups = reinterpret_cast<std::uint32_t*>(
+        static_cast<char*>(workspace_buffer.data_ptr()) + counters_offset);
+    // Validates its operands, then zeroes the counters and launches.
+    nvfp4_quantize_smooth_lora_down_chunked_sm120_impl(
+        x, pqs, global_scale, l2t_smoothed, xq, a_sf, down, chunk_groups,
+        static_cast<int>(quant_ctas), static_cast<int>(tiling0), static_cast<int>(tiling1));
+  } else {
+    dispatch_svdquant_producer_sm120(x, pqs, global_scale, l2t_smoothed, xq, a_sf, down,
+                                     workspace_buffer, static_cast<int>(producer_family),
+                                     static_cast<int>(tiling0), static_cast<int>(tiling1),
+                                     static_cast<int>(tiling2), /*address_policy=*/0, enable_pdl,
+                                     /*quantize_barrier=*/{}, /*down_only=*/true);
+  }
+  int const gemm_head_tiles =
+      hybrid ? static_cast<int>(head_tiles) : std::numeric_limits<int>::max();
+  cudaStream_t const stream = get_stream(x.device());
+  SVDQ_SM120_QUANT_B_DISPATCH(
+      quant_b_kernel,
+      flashinfer::gemm::svdquant_sm120::run_quant_b<C>(
+          out.data_ptr(), x.data_ptr(), pqs.data_ptr(),
+          static_cast<float const*>(global_scale.data_ptr()), xq.data_ptr(), a_sf.data_ptr(),
+          chunk_groups, gemm_head_tiles, b.data_ptr(), b_sf.data_ptr(),
+          static_cast<float const*>(alpha.data_ptr()), down.data_ptr(), l1.data_ptr(), bias_ptr, m,
+          n, k, static_cast<int>(down.size(1)),
+          reinterpret_cast<char*>(workspace_buffer.data_ptr()), workspace_bytes, stream,
+          enable_pdl));
+}
+
 #endif
 
 int64_t nvfp4_svdquant_gemm_tactic_num() {
@@ -921,6 +1118,10 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(nvfp4_svdquant_gemm, torch_ext::nvfp4_svdquant_gem
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(nvfp4_quantize_smooth_lora_down_cublaslt_sm120,
                               torch_ext::nvfp4_quantize_smooth_lora_down_cublaslt_sm120);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(nvfp4_svdquant_linear_sm120, torch_ext::nvfp4_svdquant_linear_sm120);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(nvfp4_svdquant_linear_quant_b_sm120,
+                              torch_ext::nvfp4_svdquant_linear_quant_b_sm120);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(nvfp4_svdquant_quant_b_workspace_size,
+                              torch_ext::nvfp4_svdquant_quant_b_workspace_size);
 #endif
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(nvfp4_svdquant_gemm_tactic_num,
                               torch_ext::nvfp4_svdquant_gemm_tactic_num);

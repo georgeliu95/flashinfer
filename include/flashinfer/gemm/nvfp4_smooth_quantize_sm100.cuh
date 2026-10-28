@@ -464,6 +464,9 @@ __global__ void __launch_bounds__(512, 4)
 #endif
 }
 
+// A template, so the SM120 SVDQuant GEMM translation units that include this header for its
+// device helpers share one definition of this kernel.
+template <int = 0>
 __global__ void __launch_bounds__(512, 4)
     smooth_quantize_legacy_kernel(int numRows, int numCols, int numPaddedCols, Type const* in,
                                   Type const* pqs, float const* SFScale, uint32_t* out,
@@ -589,7 +592,7 @@ inline void nvfp4_smooth_quantize(void* out, void* sf_out, void const* in, void 
   cfg.attrs = attrs;
   cfg.numAttrs = 1;
   // No column padding here (n is the padded width); the residual GEMM and the SF layout use n.
-  cudaLaunchKernelEx(&cfg, smooth_quantize_legacy_kernel, m, n, n,
+  cudaLaunchKernelEx(&cfg, smooth_quantize_legacy_kernel<>, m, n, n,
                      reinterpret_cast<Type const*>(in), reinterpret_cast<Type const*>(pqs),
                      sf_scale, reinterpret_cast<uint32_t*>(out),
                      reinterpret_cast<uint32_t*>(sf_out));

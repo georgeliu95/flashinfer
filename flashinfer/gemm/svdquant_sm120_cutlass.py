@@ -57,6 +57,8 @@ _sm120_variant_packs_l2t = _sm120_routes.sm120_variant_packs_l2t
 _sm120_variant_reads_kmajor_l2t = _sm120_routes.sm120_variant_reads_kmajor_l2t
 _sm120_pack_tactic = _sm120_routes.sm120_pack_tactic
 _sm120_unpack_tactic = _sm120_routes.sm120_unpack_tactic
+_sm120_quant_b_variants = _sm120_routes.sm120_quant_b_variants
+_sm120_decode_quant_b_variant = _sm120_routes.sm120_decode_quant_b_variant
 _SM120_LINEAR_ROUTE_ABI_VERSION = _sm120_routes.SM120_LINEAR_ROUTE_ABI_VERSION
 _SM120_LINEAR_ROUTE_V6_MKR = _sm120_routes.SM120_LINEAR_ROUTE_V6_MKR
 _SM120_LINEAR_ROUTE_V7_MKR = _sm120_routes.SM120_LINEAR_ROUTE_V7_MKR
@@ -661,6 +663,111 @@ def _sm120_fused_linear_runner(
     return Sm120FusedLinearRunner()
 
 
+def _sm120_quant_b_workspace_bytes(module, m: int, n: int, k: int, rank: int) -> int:
+    """Largest scratch any QuantB launch of this shape needs (0 when none is admitted)."""
+    kernels = {variant[0] for variant in _sm120_quant_b_variants(m, k, rank)}
+    return max(
+        (
+            int(module.nvfp4_svdquant_quant_b_workspace_size(m, n, k, kernel))
+            for kernel in kernels
+        ),
+        default=0,
+    )
+
+
+def _sm120_quant_b_linear_runner(
+    enable_pdl: bool, device: torch.device, rank: int
+) -> _SvdquantRunner:
+    """Build the runner whose GEMM consumers quantize X themselves (rank 128, small M).
+
+    A tactic indexes ``sm120_quant_b_variants``: the QuantB kernel, how many leading K
+    tiles its consumers quantize (all of them, or a hybrid head with a chunked prefix
+    writing XQ for the rest), and the small-M LoRA-down prefix that runs beside it.
+    """
+    module = get_nvfp4_svdquant_sm120_module(rank)
+
+    class Sm120QuantBLinearRunner(_SvdquantRunner):
+        def validate_tactic(self, inputs: List[torch.Tensor], tactic: int) -> bool:
+            m, n, k, rank_ = _sm120_linear_inputs_shape(inputs)
+            variants = _sm120_quant_b_variants(m, k, rank_)
+            if not 0 <= tactic < len(variants):
+                return False
+            workspace = inputs[-1]
+            return (
+                int(
+                    module.nvfp4_svdquant_quant_b_workspace_size(
+                        m, n, k, variants[tactic][0]
+                    )
+                )
+                <= workspace.numel() * workspace.element_size()
+            )
+
+        def get_valid_tactics(
+            self,
+            inputs: List[torch.Tensor],
+            profile: OptimizationProfile,
+        ) -> List[int]:
+            m, _, k, rank_ = _sm120_linear_inputs_shape(inputs)
+            return list(range(len(_sm120_quant_b_variants(m, k, rank_))))
+
+        def forward(
+            self,
+            inputs: List[torch.Tensor],
+            tactic: int = -1,
+            do_preparation: bool = False,
+            **kwargs,
+        ):
+            """Launch the selected LoRA-down prefix and QuantB GEMM with caller-owned scratch."""
+            (
+                x,
+                weight_fp4,
+                weight_sf,
+                alpha,
+                pre_quant_scale,
+                l2t_smoothed,
+                l1_scaled,
+                global_scale,
+                bias,
+                xq,
+                x_sf,
+                down,
+                out,
+                workspace_buffer,
+            ) = inputs
+            m_rt, k_rt = x.shape[0], x.shape[1]
+            kernel, head_tiles, quant_ctas, family, tiling = (
+                _sm120_decode_quant_b_variant(m_rt, k_rt, tactic, rank)
+            )
+            module.nvfp4_svdquant_linear_quant_b_sm120(
+                x,
+                pre_quant_scale,
+                global_scale,
+                # Every rank-128 small-M producer reads L2T K-major.
+                _cached_sm120_kmajor_l2t(l2t_smoothed),
+                weight_fp4,
+                weight_sf,
+                alpha,
+                l1_scaled,
+                bias,
+                xq,
+                x_sf,
+                down,
+                out,
+                workspace_buffer,
+                kernel,
+                head_tiles,
+                quant_ctas,
+                family,
+                tiling[0],
+                tiling[1],
+                tiling[2],
+                enable_pdl,
+            )
+            return out
+
+    return Sm120QuantBLinearRunner()
+
+
 def _sm120_cutlass_linear_runner(
     enable_pdl: bool, device: torch.device, rank: int
 ) -> _SvdquantRunner:
@@ -753,6 +860,9 @@ def _sm120_linear_runners(
     # Keep rank 64's existing untuned fallback; autotuning can select fusion.
     if rank == 64:
         runners.reverse()
+    # Appended last so it is never the untuned fallback; the tuner measures it.
+    if _sm120_quant_b_variants(m, k, rank):
+        runners.append(_sm120_quant_b_linear_runner(enable_pdl, device, rank))
     return runners
 
 
@@ -958,6 +1068,8 @@ def _sm120_max_workspace_bytes(
     required = 0
     for t in _nvfp4_svdquant_valid_tactics(module, m, n, k, rank, device):
         required = max(required, module.nvfp4_svdquant_gemm_workspace_size(m, n, k, t))
+    # The linear workspace also backs the QuantB runner when this shape offers it.
+    required = max(required, _sm120_quant_b_workspace_bytes(module, m, n, k, rank))
     _SM120_WORKSPACE_BYTES_CACHE[key] = required
     return required
 
@@ -1084,7 +1196,9 @@ def svdquant_linear(
     is a route the tuner selects over -- one fused launch where the composed
     path spends two -- and the tactic it picks names the prefix and the GEMM
     together, so the pair is chosen on measured cost rather than independently.
-    Both ranks offer fused and separate preprocessing to the autotuner.
+    Both ranks offer fused and separate preprocessing to the autotuner. At rank 128
+    and small M it also offers QuantB launches, whose GEMM quantizes X itself so it
+    need not wait for a quantize kernel (``sm120_quant_b_variants``).
     """
     m, k = x.shape if x.ndim == 2 else (-1, -1)
     n = weight_fp4.shape[0] if weight_fp4.ndim == 2 else -1

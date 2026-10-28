@@ -38,3 +38,13 @@ SVDQUANT_SM120_CONFIGS: Final[tuple[str, ...]] = (
     "Tactic256x128x128SwapStaticConfig",
     "Tactic256x64x128SwapStaticConfig",
 )
+
+# QuantB siblings of the small-M swap tiles: no tactic rows, launched by
+# nvfp4_svdquant_linear_quant_b_sm120 (see SM120_QUANT_B_KERNELS). Only the
+# rank-128 module compiles them.
+SVDQUANT_SM120_QUANT_B_CONFIGS: Final[tuple[str, ...]] = (
+    "Tactic128x32x128SwapQuantBConfig",
+    "Tactic128x32x256SwapQuantBConfig",
+    "Tactic128x64x128SwapQuantBConfig",
+    "Tactic128x64x256SwapQuantBConfig",
+)

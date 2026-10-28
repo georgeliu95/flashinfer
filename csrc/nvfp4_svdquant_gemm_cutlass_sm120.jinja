@@ -20,7 +20,9 @@ namespace flashinfer {
 namespace gemm {
 namespace svdquant_sm120 {
 
-{% if config in ("Tactic64x32x256SwapStaticConfig", "Tactic256x64x128SwapStaticConfig") -%}
+{% if "QuantB" in config -%}
+INSTANTIATE_NVFP4_SVDQUANT_GEMM_SM120_QUANT_B({{ config }})
+{%- elif config in ("Tactic64x32x256SwapStaticConfig", "Tactic256x64x128SwapStaticConfig") -%}
 INSTANTIATE_NVFP4_SVDQUANT_GEMM_SM120_TACTIC({{ config }})
 {%- elif "Static" in config -%}
 INSTANTIATE_NVFP4_SVDQUANT_GEMM_SM120_STATIC_TACTIC({{ config }})

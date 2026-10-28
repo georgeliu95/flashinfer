@@ -12,6 +12,12 @@
 
 namespace flashinfer::gemm {
 
+// A chunked quantize prefix publishes XQ/SF in K chunks of this many elements,
+// counting finished chunks per group of kSvdquantQuantChunksPerGroup; a QuantB
+// GEMM acquires one group count at a time before loading those chunks by TMA.
+inline constexpr int kSvdquantQuantChunkK = 128;
+inline constexpr int kSvdquantQuantChunksPerGroup = 8;
+
 // The caller zeroes the counter on the stream before launching the prefix.
 // Each quantize CTA publishes all its stores; the GEMM acquires the complete
 // release sequence before loading XQ/SF through TMA. LoRA-down has its own PDL wait.

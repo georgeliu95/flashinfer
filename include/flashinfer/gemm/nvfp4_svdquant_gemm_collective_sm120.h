@@ -101,6 +101,11 @@
 #include "cutlass/trace.h"
 #include "cutlass/workspace.h"
 
+// QuantB: the K-major swizzle atoms of the B stages and the smooth-quantize helpers the
+// consumers share with the prefix.
+#include "cute/atom/mma_traits_sm90_gmma.hpp"
+#include "flashinfer/gemm/nvfp4_smooth_quantize_sm100.cuh"
+
 // Hook-enabled epilogue copy + the subtile-hook helpers the kernel below threads
 // through the store loop.
 #include "flashinfer/gemm/nvfp4_svdquant_gemm_epilogue_sm120.h"
@@ -166,7 +171,8 @@ template <class DispatchPolicy_, class TileShape_, class ElementPairA_, class St
           class SmemLayoutAtomsA_, class SmemCopyAtomsA_, class TransformA_,
           class GmemTiledCopyPairB_, class SmemLayoutAtomsB_, class SmemCopyAtomsB_,
           class TransformB_, Sm120LoRaPath LoRaPath_ = Sm120LoRaPath::kByteExactMainloop,
-          bool Row80ProductionTraits_ = false, bool CompileInlineDown_ = true, int LoRaK_ = 32>
+          bool Row80ProductionTraits_ = false, bool CompileInlineDown_ = true, int LoRaK_ = 32,
+          bool QuantB_ = false>
 struct CollectiveMmaLoRaSm120 {
   //
   // Type Aliases (identical to the stock SM120 block-scaled collective)
@@ -365,6 +371,36 @@ struct CollectiveMmaLoRaSm120 {
 
   static constexpr uint32_t ResidualTmaBytes = ResidualTmaBytesMK + ResidualTmaBytesNK;
 
+  // QuantB: the consumer warps quantize bf16 activations (the swapped B operand) straight
+  // into the B/SFB stages one K tile ahead, so the GEMM does not wait for a separate
+  // quantize kernel; the producer stages A/SFA and the LoRA step. A hybrid launch leaves
+  // the K tiles from quant_head_tiles on to the producer, which loads the prefix's XQ/SF
+  // by TMA as the prefix publishes them (see quant_wait_chunks).
+  static constexpr bool QuantB = QuantB_;
+  static constexpr int QuantTileN = size<1>(TileShape{});
+  static constexpr int QuantTileK = size<2>(TileShape{});
+  static constexpr int QuantGroupsPerRow = QuantTileK / SFVecSize;
+  static constexpr int QuantThreads = size(TiledMma{});
+  static constexpr int QuantGroupsPerThread = QuantTileN * QuantGroupsPerRow / QuantThreads;
+  static constexpr int QuantRowBytes = QuantTileK / 2;
+  static constexpr int QuantStageBytes = QuantTileN * QuantRowBytes;
+  // TMA swizzle of one FP4 B stage: byte-address bits [4,7) ^= [7,10) for 128-byte rows
+  // (SW128) and [4,6) ^= [7,9) for 64-byte rows (SW64), the builder's two K-major atoms.
+  static constexpr uint32_t QuantSwizzleMask = QuantRowBytes == 128 ? 7u : 3u;
+  // Register slots of in-flight X tiles: the loads run this many K tiles ahead of the stores.
+  static constexpr int QuantDepth = 3;
+  static_assert(!QuantB || (cute::sizeof_bits_v<SmemAllocTypeB> == 4 && !IsF8F6F4 &&
+                            (QuantRowBytes == 64 || QuantRowBytes == 128) &&
+                            QuantGroupsPerThread * QuantThreads == QuantTileN * QuantGroupsPerRow &&
+                            QuantThreads % QuantGroupsPerRow == 0 && QuantStageBytes % 1024 == 0),
+                "QuantB covers packed-FP4 K-major B stages with whole groups per thread");
+  static_assert(!QuantB ||
+                    cute::is_same_v<SmemLayoutAtomB,
+                                    cute::conditional_t<QuantRowBytes == 128,
+                                                        GMMA::Layout_K_SW128_Atom<SmemAllocTypeB>,
+                                                        GMMA::Layout_K_SW64_Atom<SmemAllocTypeB>>>,
+                "QuantB writes B with the SW128/SW64 TMA swizzle");
+
   // === LoRA-up: bf16 D[M,r] (A-side) and L1[N,r] (B-side), r = LoRaK. ===
   // The LoRA math below is written against LoRaK throughout -- the mma atom count
   // (LoRaK / LoRaAtomK), the TMA box extents, and the smem overlay views all follow it.
@@ -532,7 +568,9 @@ struct CollectiveMmaLoRaSm120 {
   // Pipeline byte protocol (byte-exact, matching the proven SM100 scheme): every
   // producer_acquire arms the full residual budget. The LoRA step arrives exactly that
   // budget too: D-box(== A-stage bytes) + L1-box(== B-stage bytes) + dummy SFA/SFB reloads
-  // (== SF bytes). No expect-transaction adjustment is needed on any step.
+  // (== SF bytes). No expect-transaction adjustment is needed on any step. QuantB is the
+  // exception: its acquires arm A+SFA only, and a step adds the B+SFB bytes when B comes
+  // by TMA, or the B-stage bytes on a LoRA step (which skips the SFB reload).
   static constexpr uint32_t LoRaTmaBytes = static_cast<uint32_t>(
       size<0>(TileShape{}) * LoRaStorageK * sizeof(cutlass::bfloat16_t) +
       size<1>(TileShape{}) * LoRaStorageK * sizeof(cutlass::bfloat16_t) +
@@ -655,6 +693,7 @@ struct CollectiveMmaLoRaSm120 {
 
   using SharedStorage =
       cute::conditional_t<UseDedicatedLoRaTma, SharedStorageDedicatedTma, SharedStorageByteExact>;
+  static_assert(!QuantB || !UseDedicatedLoRaTma, "QuantB runs on the byte-exact LoRA path");
 
   // The rank-32 overlays must live inside the residual arrays.
   static_assert(cosize_v<SmemLayoutD> <= cosize_v<SmemLayoutA>,
@@ -719,6 +758,17 @@ struct CollectiveMmaLoRaSm120 {
     // The fused linear route publishes XQ/SF through this barrier. The producer
     // acquires it before loading A and waits for the prefix grid before LoRA-down.
     flashinfer::gemm::SvdquantQuantizeBarrierSm120 quantize_barrier{};
+    // QuantB: row-major bf16 X [quant_rows, K], pre-quant scale [K], global scale.
+    cutlass::bfloat16_t const* ptr_quant_x{nullptr};
+    cutlass::bfloat16_t const* ptr_quant_pqs{nullptr};
+    float const* ptr_quant_scale{nullptr};
+    int quant_rows{0};
+    // Weight (A) tiles sharing one activation tile; they split its L2 prefetch.
+    int quant_m_tiles{1};
+    // Hybrid: the consumers quantize K tiles [0, quant_head_tiles); later tiles load the
+    // prefix's XQ/SF by TMA once quant_chunk_groups counts their K chunks as finished.
+    int quant_head_tiles{cute::numeric_limits<int>::max()};
+    uint32_t* quant_chunk_groups{nullptr};
   };
 
   // Device side kernel params
@@ -805,6 +855,14 @@ struct CollectiveMmaLoRaSm120 {
     int inline_down_k = 0;
     bool inline_down_wait_on_n = false;
     flashinfer::gemm::SvdquantQuantizeBarrierSm120 quantize_barrier{};
+    cutlass::bfloat16_t const* ptr_quant_x = nullptr;
+    cutlass::bfloat16_t const* ptr_quant_pqs = nullptr;
+    float const* ptr_quant_scale = nullptr;
+    int quant_rows = 0;
+    int quant_k = 0;
+    int quant_m_tiles = 1;
+    int quant_head_tiles = cute::numeric_limits<int>::max();
+    uint32_t* quant_chunk_groups = nullptr;
   };
 
   //
@@ -870,7 +928,8 @@ struct CollectiveMmaLoRaSm120 {
     params.tma_load_l1 = tma_load_l1;
     params.layout_SFA = args.layout_SFA;
     params.layout_SFB = args.layout_SFB;
-    params.tma_transaction_bytes = TmaTransactionBytes;
+    // QuantB stages B/SFB from the consumers: every acquire arms A+SFA only.
+    params.tma_transaction_bytes = QuantB ? TmaTransactionBytesMK : TmaTransactionBytes;
     params.tma_transaction_bytes_mk = TmaTransactionBytesMK;
     params.tma_transaction_bytes_nk = TmaTransactionBytesNK;
     params.ptr_bias = args.ptr_bias;
@@ -882,6 +941,14 @@ struct CollectiveMmaLoRaSm120 {
     params.inline_down_k = args.inline_down_k;
     params.inline_down_wait_on_n = args.inline_down_wait_on_n;
     params.quantize_barrier = args.quantize_barrier;
+    params.ptr_quant_x = args.ptr_quant_x;
+    params.ptr_quant_pqs = args.ptr_quant_pqs;
+    params.ptr_quant_scale = args.ptr_quant_scale;
+    params.quant_rows = args.quant_rows;
+    params.quant_k = static_cast<int>(K);
+    params.quant_m_tiles = args.quant_m_tiles;
+    params.quant_head_tiles = args.quant_head_tiles;
+    params.quant_chunk_groups = args.quant_chunk_groups;
     if constexpr (UseLoRaPipeline) {
       auto tensor_d_dedicated = cute::recast<LoRaDedicatedTmaInternalElement>(tensor_d);
       auto tensor_l1_dedicated = cute::recast<LoRaDedicatedTmaInternalElement>(tensor_l1);
@@ -1049,6 +1116,111 @@ struct CollectiveMmaLoRaSm120 {
     while (atomicAdd(params.ptr_inline_down_counters + original_m_tile, 0u) <
            static_cast<uint32_t>(expected_tiles)) {
       __nanosleep(64);
+    }
+  }
+
+  // One consumer thread's bf16 inputs for its QuantGroupsPerThread 16-element groups of a
+  // B tile. All of a thread's groups share one scale column (QuantThreads is a multiple of
+  // QuantGroupsPerRow), so one pre-quant-scale group serves them.
+  struct QuantLoad {
+    flashinfer::gemm::smooth_quantize_detail::Bf16x8 x[QuantGroupsPerThread][2];
+    flashinfer::gemm::smooth_quantize_detail::Bf16x8 pqs[2];
+  };
+
+  /**
+   * @brief Warm L2 with this work unit's X rows and pre-quant scales, so the per-tile loads
+   * issued one K tile ahead wait for L2 only. The weight tiles that share the activation
+   * tile split the 128-byte lines between them.
+   */
+  CUTLASS_DEVICE static void quant_prefetch_l2(Params const& params, int row0, int m_tile,
+                                               int k_tile_start, int k_tile_count, int thread_idx) {
+    int const rows = params.quant_rows - row0 < QuantTileN ? params.quant_rows - row0 : QuantTileN;
+    int64_t const k0 = int64_t(k_tile_start) * QuantTileK;
+    int64_t const lines_per_row = int64_t(k_tile_count) * QuantTileK / 64;
+    int64_t const lines = (rows + 1) * lines_per_row;
+    int64_t const parts = params.quant_m_tiles;
+    for (int64_t i = (m_tile % parts) + int64_t(thread_idx) * parts; i < lines;
+         i += int64_t(QuantThreads) * parts) {
+      int64_t const r = i / lines_per_row;
+      int64_t const k = k0 + (i - r * lines_per_row) * 64;
+      cutlass::bfloat16_t const* line =
+          r < rows ? params.ptr_quant_x + (row0 + r) * int64_t(params.quant_k) + k
+                   : params.ptr_quant_pqs + k;
+      asm volatile("prefetch.global.L2 [%0];" ::"l"(line));
+    }
+  }
+
+  /**
+   * @brief Producer side of the hybrid: make the K chunks up to k_tile's last visible to
+   * TMA. The prefix counts finished chunks per group; ready_end tracks the acquired chunk
+   * prefix. Past it, acquire whole groups (one acquire load each) until the tile is covered,
+   * then order those generic stores before the TMA reads with one proxy fence. A GPU-scope
+   * acquire fence here would also wait for the producer's in-flight TMA, so the per-group
+   * acquire loads stand in for it.
+   */
+  CUTLASS_DEVICE static void quant_wait_chunks(Params const& params, int k_tile, int& ready_end) {
+    constexpr int kChunksPerTile = QuantTileK / flashinfer::gemm::kSvdquantQuantChunkK;
+    constexpr int kGroup = flashinfer::gemm::kSvdquantQuantChunksPerGroup;
+    int const need_end = (k_tile + 1) * kChunksPerTile;
+    if (need_end <= ready_end) {
+      return;
+    }
+    int const chunks = params.quant_k / flashinfer::gemm::kSvdquantQuantChunkK;
+    int group = ready_end / kGroup;
+    while (group * kGroup < need_end) {
+      uint32_t const expected = static_cast<uint32_t>(
+          chunks - group * kGroup < kGroup ? chunks - group * kGroup : kGroup);
+      cuda::atomic_ref<uint32_t, cuda::thread_scope_device> count(params.quant_chunk_groups[group]);
+      while (count.load(cuda::memory_order_acquire) < expected) {
+      }
+      ++group;
+    }
+    ready_end = group * kGroup < chunks ? group * kGroup : chunks;
+    asm volatile("fence.proxy.async.global;" ::: "memory");
+  }
+
+  /** @brief Load this thread's X groups and pre-quant scales of one K tile into registers. */
+  CUTLASS_DEVICE static void quant_issue(QuantLoad& ld, Params const& params, int row0, int k_tile,
+                                         int thread_idx) {
+    namespace sq = flashinfer::gemm::smooth_quantize_detail;
+    int const group = thread_idx % QuantGroupsPerRow;
+    int64_t const k = int64_t(k_tile) * QuantTileK + group * SFVecSize;
+    auto const* pqs = reinterpret_cast<sq::Type const*>(params.ptr_quant_pqs) + k;
+    sq::loadBf16x8(pqs, ld.pqs[0]);
+    sq::loadBf16x8(pqs + 8, ld.pqs[1]);
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < QuantGroupsPerThread; ++i) {
+      int const row = row0 + (thread_idx + i * QuantThreads) / QuantGroupsPerRow;
+      if (row < params.quant_rows) {
+        auto const* x = reinterpret_cast<sq::Type const*>(params.ptr_quant_x) +
+                        int64_t(row) * params.quant_k + k;
+        sq::loadBf16x8(x, ld.x[i][0]);
+        sq::loadBf16x8(x + 8, ld.x[i][1]);
+      }
+    }
+  }
+
+  /**
+   * @brief Quantize the loaded groups with the prefix's exact NVFP4 recipe into one B/SFB
+   * stage. Rows past quant_rows get zero data and scales, as the TMA path's OOB fill does.
+   */
+  template <class SFBStage>
+  CUTLASS_DEVICE static void quant_store(QuantLoad& ld, Params const& params, int row0, float scale,
+                                         uint8_t* sB_stage, SFBStage&& sSFB_stage, int thread_idx) {
+    namespace sq = flashinfer::gemm::smooth_quantize_detail;
+    int const group = thread_idx % QuantGroupsPerRow;
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < QuantGroupsPerThread; ++i) {
+      int const r = (thread_idx + i * QuantThreads) / QuantGroupsPerRow;
+      uint64_t packed = 0;
+      uint8_t sf = 0;
+      if (row0 + r < params.quant_rows) {
+        packed = sq::quantizeSmoothed16(ld.x[i][0], ld.x[i][1], ld.pqs[0], ld.pqs[1], scale, &sf);
+      }
+      uint32_t const linear = uint32_t(r * QuantRowBytes + group * 8);
+      uint32_t const swizzled = linear ^ (((linear >> 7) & QuantSwizzleMask) << 4);
+      *reinterpret_cast<uint64_t*>(sB_stage + swizzled) = packed;
+      reinterpret_cast<uint8_t&>(sSFB_stage(r, group * SFVecSize)) = sf;
     }
   }
 
@@ -1234,7 +1406,8 @@ struct CollectiveMmaLoRaSm120 {
       Params const& params, MainloopPipeline pipeline, PipelineState smem_pipe_write,
       cute::tuple<TensorA, TensorB, TensorSFA, TensorSFB, TensorD, TensorL1> const& load_inputs,
       BlockCoord const& blk_coord, KTileIterator k_tile_iter, int k_tile_count, int thread_idx,
-      uint32_t block_rank_in_cluster, TensorStorage& shared_tensors, bool do_lora) {
+      uint32_t block_rank_in_cluster, TensorStorage& shared_tensors, bool do_lora,
+      [[maybe_unused]] int k_tile_start = 0) {
     int lane_predicate = cute::elect_one_sync();
 
     if (lane_predicate) {
@@ -1297,38 +1470,96 @@ struct CollectiveMmaLoRaSm120 {
       Tensor tL1gL1 = block_tma_l1.partition_S(gL1);
       Tensor tL1sL1 = block_tma_l1.partition_D(sL1);
 
-      // Residual mainloop: each step arms LoRaTmaBytes by default and adds the residual
-      // remainder BEFORE issuing its TMAs.
-      CUTLASS_PRAGMA_NO_UNROLL
-      for (; k_tile_count > 0; --k_tile_count) {
-        pipeline.producer_acquire(smem_pipe_write);
-
+      if constexpr (QuantB) {
+        // Every acquire arms A+SFA. K tiles the consumers do not quantize add the B+SFB
+        // budget before any TMA of the step and load the prefix's XQ/SF once their chunks
+        // are published. The first pipeline's worth of A goes out before any chunk wait,
+        // so weight prefetch never queues behind the prefix.
         using BarrierType = typename MainloopPipeline::ProducerBarrierType;
-        BarrierType* tma_barrier = pipeline.producer_get_barrier(smem_pipe_write);
+        constexpr int kStages = DispatchPolicy::Stages;
+        int const head = k_tile_count < kStages ? k_tile_count : kStages;
+        auto issue_a = [&](bool tma_b) {
+          pipeline.producer_acquire(smem_pipe_write);
+          BarrierType* tma_barrier = pipeline.producer_get_barrier(smem_pipe_write);
+          if (tma_b) {
+            cutlass::arch::ClusterTransactionBarrier::expect_transaction(
+                tma_barrier, static_cast<uint32_t>(TmaTransactionBytesNK));
+          }
+          int write_stage = smem_pipe_write.index();
+          copy(params.tma_load_a.with(*tma_barrier), tAgA(_, _, _, *k_tile_iter),
+               tAsA(_, _, _, write_stage));
+          copy(params.tma_load_sfa.with(*tma_barrier), tAgSFA(_, _, _, *k_tile_iter),
+               tAsSFA(_, _, _, write_stage));
+        };
+        int chunks_ready_end = k_tile_start * (QuantTileK / flashinfer::gemm::kSvdquantQuantChunkK);
+        auto issue_b = [&](int tile, PipelineState state, auto k_coord) {
+          quant_wait_chunks(params, tile, chunks_ready_end);
+          BarrierType* tma_barrier = pipeline.producer_get_barrier(state);
+          int write_stage = state.index();
+          copy(params.tma_load_b.with(*tma_barrier), tBgB(_, _, _, k_coord),
+               tBsB(_, _, _, write_stage));
+          copy(params.tma_load_sfb.with(*tma_barrier), tBgSFB(_, _, _, k_coord),
+               tBsSFB(_, _, _, write_stage));
+        };
+        PipelineState head_state = smem_pipe_write;
+        auto head_k_iter = k_tile_iter;
+        for (int j = 0; j < head; ++j) {
+          issue_a(k_tile_start + j >= params.quant_head_tiles);
+          ++k_tile_iter;
+          ++smem_pipe_write;
+        }
+        for (int j = 0; j < head; ++j) {
+          if (k_tile_start + j >= params.quant_head_tiles) {
+            issue_b(k_tile_start + j, head_state, *head_k_iter);
+          }
+          ++head_k_iter;
+          ++head_state;
+        }
+        CUTLASS_PRAGMA_NO_UNROLL
+        for (int j = head; j < k_tile_count; ++j) {
+          bool const tma_b = k_tile_start + j >= params.quant_head_tiles;
+          issue_a(tma_b);
+          if (tma_b) {
+            issue_b(k_tile_start + j, smem_pipe_write, *k_tile_iter);
+          }
+          ++k_tile_iter;
+          ++smem_pipe_write;
+        }
+      } else {
+        // Residual mainloop: each step arms LoRaTmaBytes by default and adds the residual
+        // remainder BEFORE issuing its TMAs.
+        CUTLASS_PRAGMA_NO_UNROLL
+        for (; k_tile_count > 0; --k_tile_count) {
+          pipeline.producer_acquire(smem_pipe_write);
 
-        int write_stage = smem_pipe_write.index();
-        copy(params.tma_load_a.with(*tma_barrier), tAgA(_, _, _, *k_tile_iter),
-             tAsA(_, _, _, write_stage));
-        copy(params.tma_load_b.with(*tma_barrier), tBgB(_, _, _, *k_tile_iter),
-             tBsB(_, _, _, write_stage));
+          using BarrierType = typename MainloopPipeline::ProducerBarrierType;
+          BarrierType* tma_barrier = pipeline.producer_get_barrier(smem_pipe_write);
 
-        copy(params.tma_load_sfa.with(*tma_barrier), tAgSFA(_, _, _, *k_tile_iter),
-             tAsSFA(_, _, _, write_stage));
-        copy(params.tma_load_sfb.with(*tma_barrier), tBgSFB(_, _, _, *k_tile_iter),
-             tBsSFB(_, _, _, write_stage));
+          int write_stage = smem_pipe_write.index();
+          copy(params.tma_load_a.with(*tma_barrier), tAgA(_, _, _, *k_tile_iter),
+               tAsA(_, _, _, write_stage));
+          copy(params.tma_load_b.with(*tma_barrier), tBgB(_, _, _, *k_tile_iter),
+               tBsB(_, _, _, write_stage));
 
-        ++k_tile_iter;
-        ++smem_pipe_write;
+          copy(params.tma_load_sfa.with(*tma_barrier), tAgSFA(_, _, _, *k_tile_iter),
+               tAsSFA(_, _, _, write_stage));
+          copy(params.tma_load_sfb.with(*tma_barrier), tBgSFB(_, _, _, *k_tile_iter),
+               tBsSFB(_, _, _, write_stage));
+
+          ++k_tile_iter;
+          ++smem_pipe_write;
+        }
       }
 
       // One extra producer step: D + L1 into the next freed stage (epilogue owner only).
       // SFA/SFB are dummy-reloaded (k-tile 0) so the arrived bytes exactly match the
-      // armed A+B+SF budget; the D/L1 boxes are byte-exact stage overlays.
+      // armed A+B+SF budget; the D/L1 boxes are byte-exact stage overlays. QuantB
+      // reloads SFA only and adds the B-stage bytes itself (see below).
       if (do_lora) {
         if constexpr (CompileInlineDown) {
           wait_for_inline_lora_down(params, m_coord, n_coord);
         }
-        if (params.quantize_barrier.counter != nullptr) {
+        if (QuantB || params.quantize_barrier.counter != nullptr) {
           // LoRA-down is the one prefix output still in flight; see the producer.
           cutlass::arch::wait_on_dependent_grids();
         }
@@ -1347,10 +1578,18 @@ struct CollectiveMmaLoRaSm120 {
           BarrierType* tma_barrier = pipeline.producer_get_barrier(smem_pipe_write);
 
           int write_stage = smem_pipe_write.index();
+          if constexpr (QuantB) {
+            // The acquire armed A+SFA only: add the B-side overlay before any TMA lands,
+            // and skip the dummy SFB reload (there is no SFB tensor).
+            cutlass::arch::ClusterTransactionBarrier::expect_transaction(
+                tma_barrier, static_cast<uint32_t>(QuantStageBytes));
+          }
           copy(params.tma_load_sfa.with(*tma_barrier), tAgSFA(_, _, _, Int<0>{}),
                tAsSFA(_, _, _, write_stage));
-          copy(params.tma_load_sfb.with(*tma_barrier), tBgSFB(_, _, _, Int<0>{}),
-               tBsSFB(_, _, _, write_stage));
+          if constexpr (!QuantB) {
+            copy(params.tma_load_sfb.with(*tma_barrier), tBgSFB(_, _, _, Int<0>{}),
+                 tBsSFB(_, _, _, write_stage));
+          }
           copy(params.tma_load_d.with(*tma_barrier), tDgD(_, _, _, chunk),
                tDsD(_, _, _, write_stage));
           copy(params.tma_load_l1.with(*tma_barrier), tL1gL1(_, _, _, chunk),
@@ -1525,7 +1764,7 @@ struct CollectiveMmaLoRaSm120 {
   CUTLASS_DEVICE void mma(MainloopPipeline pipeline, PipelineState smem_pipe_read,
                           FrgTensorC& accum, int k_tile_count, int thread_idx,
                           TensorStorage& shared_tensors, [[maybe_unused]] Params const& params,
-                          BlockCoord const& blk_coord) {
+                          BlockCoord const& blk_coord, [[maybe_unused]] int k_tile_start = 0) {
     using namespace cute;
 
     static_assert(is_rmem<FrgTensorC>::value, "C tensor must be rmem resident.");
@@ -1634,31 +1873,126 @@ struct CollectiveMmaLoRaSm120 {
                  make_zip_tensor(tCrB(_, _, k_block), tCrSFB(_, _, k_block)), accum);
     };
 
+    // QuantB: the consumers quantize this unit's first quant_tiles K tiles (all of them
+    // unless the hybrid prefix supplies the rest). Tile j's X sits in register slot
+    // j % QuantDepth. Tile 0 is quantized here; tile t+1 is quantized at the start of tile
+    // t, whose closing barrier publishes it, and its slot is refilled with tile
+    // t+1+QuantDepth, so the loads run QuantDepth tiles ahead.
+    [[maybe_unused]] QuantLoad quant_ld[QuantDepth];
+    [[maybe_unused]] int quant_tiles = 0;
+    [[maybe_unused]] float quant_scale = 0.0f;
+    [[maybe_unused]] int quant_row0 = 0;
+    [[maybe_unused]] int quant_tile = 0;
+    [[maybe_unused]] int quant_slot = 0;  // (quant_tile + 1) % QuantDepth
+    [[maybe_unused]] uint8_t* quant_sB = nullptr;
+    if constexpr (QuantB) {
+      quant_sB = recast_ptr<uint8_t>(shared_tensors.smem_B.begin());
+      quant_scale = *params.ptr_quant_scale;
+      quant_row0 = int(get<1>(blk_coord)) * QuantTileN;
+      int const remaining = params.quant_head_tiles - k_tile_start;
+      quant_tiles = remaining <= 0 ? 0 : (remaining < k_tile_count ? remaining : k_tile_count);
+      if (quant_tiles > 0) {
+        quant_prefetch_l2(params, quant_row0, int(get<0>(blk_coord)), k_tile_start, quant_tiles,
+                          thread_idx);
+        quant_issue(quant_ld[0], params, quant_row0, k_tile_start, thread_idx);
+        quant_store(quant_ld[0], params, quant_row0, quant_scale,
+                    quant_sB + read_stage * QuantStageBytes, sSFB(_, _, read_stage), thread_idx);
+        if (quant_tiles == 1) {
+          // The work unit's last consumer B write: later TMA writes (LoRA steps, the hybrid's
+          // XQ tiles) reuse these buffers. Fence only here, with no X loads in flight; a
+          // proxy fence behind pending loads waits for them.
+          cutlass::arch::fence_view_async_shared();
+        }
+        for_each(make_int_sequence<QuantDepth>{}, [&](auto s) {
+          constexpr int tile = decltype(s)::value + 1;
+          if (quant_tiles > tile) {
+            quant_issue(quant_ld[tile % QuantDepth], params, quant_row0, k_tile_start + tile,
+                        thread_idx);
+          }
+        });
+      }
+      quant_slot = 1 % QuantDepth;
+      cutlass::arch::NamedBarrier::sync(thr_size(tiled_mma),
+                                        cutlass::arch::ReservedNamedBarriers::Sm120MainloopBarrier);
+    }
+
     pipeline.consumer_wait(smem_pipe_read);
 
     copy_kblock(_0{});
-    CUTLASS_PRAGMA_NO_UNROLL
-    for (; k_tile_count > 1; --k_tile_count) {
-      for_each(make_int_sequence<K_BLOCK_MAX>{}, [&](auto k_block) {
-        auto k_block_next = ((k_block + 1) == K_BLOCK_MAX) ? 0 : (k_block + 1);
+    if constexpr (QuantB) {
+      // One K tile whose register slot is fixed at compile time.
+      auto quant_tile_step = [&](auto slot) {
+        for_each(make_int_sequence<K_BLOCK_MAX>{}, [&](auto k_block) {
+          auto k_block_next = ((k_block + 1) == K_BLOCK_MAX) ? 0 : (k_block + 1);
 
-        if (k_block == K_BLOCK_MAX - 1) {
-          cutlass::arch::NamedBarrier::sync(
-              thr_size(tiled_mma), cutlass::arch::ReservedNamedBarriers::Sm120MainloopBarrier);
-          pipeline.consumer_release(smem_pipe_read);
-          ++smem_pipe_read;
-          read_stage = smem_pipe_read.index();
-          tCsA_stage = tCsA(_, _, _, read_stage);
-          tCsB_stage = tCsB(_, _, _, read_stage);
-          tCsSFA_stage = tCsSFA(_, _, _, read_stage);
-          tCsSFB_stage = tCsSFB(_, _, _, read_stage);
-          pipeline.consumer_wait(smem_pipe_read);
-        }
+          if constexpr (decltype(k_block)::value == 0) {
+            if (quant_tile + 1 < quant_tiles) {
+              int const next_stage = read_stage + 1 == DispatchPolicy::Stages ? 0 : read_stage + 1;
+              quant_store(quant_ld[decltype(slot)::value], params, quant_row0, quant_scale,
+                          quant_sB + next_stage * QuantStageBytes, sSFB(_, _, next_stage),
+                          thread_idx);
+              if (quant_tile + 1 + QuantDepth < quant_tiles) {
+                quant_issue(quant_ld[decltype(slot)::value], params, quant_row0,
+                            k_tile_start + quant_tile + 1 + QuantDepth, thread_idx);
+              }
+              if (quant_tile + 2 == quant_tiles) {
+                cutlass::arch::fence_view_async_shared();  // last B write; see the prologue
+              }
+            }
+            ++quant_tile;
+            quant_slot = quant_slot + 1 == QuantDepth ? 0 : quant_slot + 1;
+          }
 
-        copy_kblock(k_block_next);
-        gemm_kblock(k_block);
-      });
-    }  // k_tile_count
+          if (k_block == K_BLOCK_MAX - 1) {
+            cutlass::arch::NamedBarrier::sync(
+                thr_size(tiled_mma), cutlass::arch::ReservedNamedBarriers::Sm120MainloopBarrier);
+            pipeline.consumer_release(smem_pipe_read);
+            ++smem_pipe_read;
+            read_stage = smem_pipe_read.index();
+            tCsA_stage = tCsA(_, _, _, read_stage);
+            tCsB_stage = tCsB(_, _, _, read_stage);
+            tCsSFA_stage = tCsSFA(_, _, _, read_stage);
+            tCsSFB_stage = tCsSFB(_, _, _, read_stage);
+            pipeline.consumer_wait(smem_pipe_read);
+          }
+
+          copy_kblock(k_block_next);
+          gemm_kblock(k_block);
+        });
+      };
+      CUTLASS_PRAGMA_NO_UNROLL
+      for (; k_tile_count > 1; --k_tile_count) {
+        int const slot_now = quant_slot;
+        for_each(make_int_sequence<QuantDepth>{}, [&](auto slot) {
+          if (slot_now == decltype(slot)::value) {
+            quant_tile_step(slot);
+          }
+        });
+      }
+    } else {
+      CUTLASS_PRAGMA_NO_UNROLL
+      for (; k_tile_count > 1; --k_tile_count) {
+        for_each(make_int_sequence<K_BLOCK_MAX>{}, [&](auto k_block) {
+          auto k_block_next = ((k_block + 1) == K_BLOCK_MAX) ? 0 : (k_block + 1);
+
+          if (k_block == K_BLOCK_MAX - 1) {
+            cutlass::arch::NamedBarrier::sync(
+                thr_size(tiled_mma), cutlass::arch::ReservedNamedBarriers::Sm120MainloopBarrier);
+            pipeline.consumer_release(smem_pipe_read);
+            ++smem_pipe_read;
+            read_stage = smem_pipe_read.index();
+            tCsA_stage = tCsA(_, _, _, read_stage);
+            tCsB_stage = tCsB(_, _, _, read_stage);
+            tCsSFA_stage = tCsSFA(_, _, _, read_stage);
+            tCsSFB_stage = tCsSFB(_, _, _, read_stage);
+            pipeline.consumer_wait(smem_pipe_read);
+          }
+
+          copy_kblock(k_block_next);
+          gemm_kblock(k_block);
+        });
+      }  // k_tile_count
+    }
 
     for_each(make_int_sequence<K_BLOCK_MAX>{}, [&](auto k_block) {
       auto k_block_next = ((k_block + 1) == K_BLOCK_MAX) ? 0 : (k_block + 1);
@@ -2519,7 +2853,10 @@ class GemmUniversalLoRaSm120 {
 
       // Mainloop Producer Warp
       else if (producer_warp_role == ProducerWarpRole::Mainloop) {
-        if (params.mainloop.quantize_barrier.counter != nullptr) {
+        if constexpr (CollectiveMainloop::QuantB) {
+          // The consumers quantize X themselves; only the LoRA step reads a prefix
+          // output, and load() waits for the prefix grid there.
+        } else if (params.mainloop.quantize_barrier.counter != nullptr) {
           // Acquire the quantize CTAs' stores before the generic-to-async proxy
           // fence. Launch completion alone does not make XQ/SF visible. load()
           // still waits for the prefix grid before reading LoRA-down through TMA.
@@ -2570,7 +2907,7 @@ class GemmUniversalLoRaSm120 {
             collective_mainloop.load(
                 params.mainloop, mainloop_pipeline, mainloop_pipe_producer_state, load_inputs,
                 blk_coord, k_tile_iter, work_k_tile_count, lane_idx, block_rank_in_cluster,
-                shared_storage.tensors.mainloop, do_lora);
+                shared_storage.tensors.mainloop, do_lora, work_k_tile_start);
             // Update starting pipeline state for the next tile (+1 for the LoRA stage).
             mainloop_pipe_producer_state.advance(work_k_tile_count +
                                                  (do_lora ? CollectiveMainloop::LoRaChunks : 0));
@@ -2664,7 +3001,8 @@ class GemmUniversalLoRaSm120 {
         if (valid_work) {
           collective_mainloop.mma(mainloop_pipeline, mainloop_pipe_consumer_state, accumulators,
                                   work_k_tile_count, mma_thread_idx,
-                                  shared_storage.tensors.mainloop, params.mainloop, blk_coord);
+                                  shared_storage.tensors.mainloop, params.mainloop, blk_coord,
+                                  TileScheduler::get_work_k_tile_start(work_tile_info));
 
           collective_mainloop.mma_tail(mainloop_pipeline, mainloop_pipe_consumer_state,
                                        work_k_tile_count);

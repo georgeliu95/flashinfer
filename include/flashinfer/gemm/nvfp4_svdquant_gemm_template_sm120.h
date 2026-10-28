@@ -101,11 +101,14 @@ using FusionOperationPerRow =
     cutlass::epilogue::fusion::LinCombPerRowBias<OutElementType, float, OutElementType, ElementC,
                                                  float>;
 
-template <class MmaTileShape_, bool SwapAB_, class TileSchedulerTag_>
+template <class MmaTileShape_, bool SwapAB_, class TileSchedulerTag_, bool QuantB_ = false>
 struct SvdquantGemmConfigSm120 {
   using MmaTileShape = MmaTileShape_;
   static constexpr bool SwapAB = SwapAB_;
   using TileSchedulerTag = TileSchedulerTag_;
+  // QuantB: the consumers quantize the swapped activation operand themselves.
+  static constexpr bool QuantB = QuantB_;
+  static_assert(!QuantB || SwapAB, "QuantB quantizes the swapped activation operand");
 
   // 64-row tiles run the driver's single-consumer-warpgroup contract. Keep the admitted
   // family closed: the proven 64x128 non-swap rows plus production row80.
@@ -254,7 +257,7 @@ struct SvdquantGemmConfigSm120 {
       typename CollectiveMainloopBase::GmemTiledCopyPairB,
       typename CollectiveMainloopBase::SmemLayoutAtomsB,
       typename CollectiveMainloopBase::SmemCopyAtomsB, typename CollectiveMainloopBase::TransformB,
-      LoRaPathSm120, IsProductionRow80, CompileInlineDown, LoRaRank>;
+      LoRaPathSm120, IsProductionRow80, CompileInlineDown, LoRaRank, QuantB>;
   using CollectiveMainloop = CollectiveMainloopT<true>;
   using CollectiveMainloopNoInlineDown = CollectiveMainloopT<false>;
 
@@ -393,6 +396,18 @@ using Tactic256x128x128SwapStaticConfig =
 // tile preserves enough parallelism for M1935,N5376.
 using Tactic256x64x128SwapStaticConfig =
     SvdquantGemmConfigSm120<Shape<_256, _64, _128>, true, cutlass::gemm::StaticPersistentScheduler>;
+
+// QuantB siblings of the small-M swap tiles: the consumers quantize bf16 activations
+// themselves (see CollectiveMmaLoRaSm120::QuantB). They have no tactic rows;
+// nvfp4_svdquant_linear_quant_b_sm120 launches them.
+using Tactic128x32x128SwapQuantBConfig =
+    SvdquantGemmConfigSm120<Shape<_128, _32, _128>, true, PersistentTag, true>;
+using Tactic128x32x256SwapQuantBConfig =
+    SvdquantGemmConfigSm120<Shape<_128, _32, _256>, true, PersistentTag, true>;
+using Tactic128x64x128SwapQuantBConfig =
+    SvdquantGemmConfigSm120<Shape<_128, _64, _128>, true, PersistentTag, true>;
+using Tactic128x64x256SwapQuantBConfig =
+    SvdquantGemmConfigSm120<Shape<_128, _64, _256>, true, PersistentTag, true>;
 
 inline constexpr int kNvfp4SvdquantGemmSm120NumLegacyKernels = 16;
 inline constexpr int kNvfp4SvdquantGemmSm120NumKernels = 31;
@@ -843,6 +858,113 @@ void run_tactic_impl(RuntimeTacticSm120 const& rt, void* out, void const* A, voi
     throw std::runtime_error("nvfp4_svdquant_gemm (sm120): run failed");
 }
 
+// QuantB kernels run the scheduler defaults; the kernel id is not consulted.
+inline constexpr RuntimeTacticSm120 kQuantBRuntimeTacticSm120{0, 1, RasterOrderSm120::kHeuristic,
+                                                              1};
+
+/**
+ * @brief Offset of the hybrid's chunk-group counters in a QuantB launch's scratch: past the
+ * inline-down block and the GEMM's own workspace, 16-byte aligned.
+ */
+template <class Config>
+size_t quant_b_counters_offset(int m, int n, int k) {
+  static_assert(Config::QuantB && Config::SwapAB);
+  if (!runtime_tactic_feasible<Config>(kQuantBRuntimeTacticSm120, m, n, k))
+    throw std::invalid_argument("nvfp4_svdquant_gemm (sm120): QuantB tile infeasible");
+  using Gemm = typename Config::GemmNoInlineDown;
+  typename Gemm::Arguments args{};
+  args.mode = cutlass::gemm::GemmUniversalMode::kGemm;
+  args.problem_shape = cute::make_shape(n, m, k, 1);
+  apply_runtime_scheduler_args<Config>(kQuantBRuntimeTacticSm120, args.scheduler);
+  Gemm gemm;
+  size_t const end = kInlineDownWorkspaceBytes + gemm.get_workspace_size(args);
+  return (end + 15) / 16 * 16;
+}
+
+/**
+ * @brief Launch a QuantB GEMM whose consumers quantize bf16 x [m, k] with pqs and the global
+ * scale for K tiles below head_tiles; later K tiles load xq / x_sf, which the prefix writes and
+ * counts per chunk group in chunk_groups, through TMA. down [m, rank] comes from the prefix
+ * grid, which the GEMM waits for only before its LoRA step; weight / weight_sf are the packed
+ * NVFP4 [n, k] operand and its scales.
+ */
+template <class Config>
+void run_quant_b(void* out, void const* x, void const* pqs, float const* global_scale,
+                 void const* xq, void const* x_sf, uint32_t* chunk_groups, int head_tiles,
+                 void const* weight, void const* weight_sf, float const* alpha, void const* down,
+                 void const* L1, void const* bias, int m, int n, int k, int lora_rank, char* ws,
+                 size_t wsBytes, cudaStream_t stream, bool enable_pdl) {
+  static_assert(Config::QuantB && Config::SwapAB);
+  RuntimeTacticSm120 const& rt = kQuantBRuntimeTacticSm120;
+  if (!runtime_tactic_feasible<Config>(rt, m, n, k))
+    throw std::invalid_argument("nvfp4_svdquant_gemm (sm120): QuantB tile infeasible");
+  if (lora_rank != Config::LoRaRank)
+    throw std::invalid_argument("nvfp4_svdquant_gemm (sm120): QuantB LoRA rank mismatch");
+  using Gemm = typename Config::GemmNoInlineDown;
+  using Sm1xxBlkScaledConfig = typename Config::CollectiveMainloop::Sm1xxBlkScaledConfig;
+  typename Gemm::Arguments args{};
+  args.mode = cutlass::gemm::GemmUniversalMode::kGemm;
+  int64_t const r = lora_rank;
+  args.problem_shape = cute::make_shape(n, m, k, 1);
+  args.mainloop.ptr_A = static_cast<ElementType const*>(weight);
+  args.mainloop.ptr_SFA = static_cast<SFType const*>(weight_sf);
+  constexpr int cta_k = cute::size<2>(typename Config::MmaTileShape{});
+  bool const hybrid = head_tiles < k / cta_k;
+  if (xq == nullptr || x_sf == nullptr || (hybrid && chunk_groups == nullptr))
+    throw std::invalid_argument(
+        "nvfp4_svdquant_gemm (sm120): QuantB needs xq and x_sf, and a hybrid its chunk-group "
+        "counters");
+  // Pure QuantB never issues the B/SFB loads; the descriptors still describe xq / x_sf.
+  args.mainloop.ptr_B = static_cast<ElementType const*>(xq);
+  args.mainloop.ptr_SFB = static_cast<SFType const*>(x_sf);
+  args.mainloop.ptr_D = static_cast<cutlass::bfloat16_t const*>(L1);
+  args.mainloop.dD = cute::make_stride(r, cute::_1{}, int64_t(n) * r);
+  args.mainloop.ptr_L1 = static_cast<cutlass::bfloat16_t const*>(down);
+  args.mainloop.dL1 = cute::make_stride(r, cute::_1{}, int64_t(m) * r);
+  args.mainloop.dA = cute::make_int_tuple_from<typename Gemm::GemmKernel::StrideA>(k, 0);
+  args.mainloop.dB = cute::make_int_tuple_from<typename Gemm::GemmKernel::StrideB>(k, 0);
+  auto const sf_shape = cute::make_shape(int64_t(n), int64_t(m), int64_t(k), int64_t(1));
+  args.mainloop.layout_SFA =
+      narrow_sf_layout(Sm1xxBlkScaledConfig::tile_atom_to_shape_SFA(sf_shape));
+  args.mainloop.layout_SFB =
+      narrow_sf_layout(Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(sf_shape));
+  args.mainloop.lora_rank = lora_rank;
+  args.mainloop.ptr_quant_x = static_cast<cutlass::bfloat16_t const*>(x);
+  args.mainloop.ptr_quant_pqs = static_cast<cutlass::bfloat16_t const*>(pqs);
+  args.mainloop.ptr_quant_scale = global_scale;
+  args.mainloop.quant_rows = m;
+  args.mainloop.quant_m_tiles = (n + cute::size<0>(typename Config::MmaTileShape{}) - 1) /
+                                cute::size<0>(typename Config::MmaTileShape{});
+  args.mainloop.quant_head_tiles = head_tiles;
+  args.mainloop.quant_chunk_groups = chunk_groups;
+
+  args.epilogue.ptr_C = nullptr;
+  args.epilogue.ptr_D = static_cast<OutElementType*>(out);
+  args.epilogue.dC = cute::make_int_tuple_from<typename Gemm::GemmKernel::StrideC>(n, 0);
+  args.epilogue.dD = args.epilogue.dC;
+  args.epilogue.thread.alpha = 1.0f;
+  args.epilogue.thread.beta = 0.0f;
+  args.epilogue.thread.alpha_ptr = alpha;
+  args.epilogue.thread.beta_ptr = nullptr;
+  args.epilogue.thread.bias_ptr = static_cast<OutElementType const*>(bias);
+  apply_runtime_scheduler_args<Config>(rt, args.scheduler);
+
+  Gemm gemm;
+  size_t const gemmWorkspaceBytes = gemm.get_workspace_size(args);
+  if (wsBytes < kInlineDownWorkspaceBytes + gemmWorkspaceBytes)
+    throw std::invalid_argument("nvfp4_svdquant_gemm (sm120): insufficient workspace");
+  char* const gemmWorkspace = ws + kInlineDownWorkspaceBytes;
+  auto st = gemm.can_implement(args);
+  if (st != cutlass::Status::kSuccess)
+    throw std::runtime_error("nvfp4_svdquant_gemm (sm120): QuantB can_implement failed");
+  st = gemm.initialize(args, gemmWorkspace, stream);
+  if (st != cutlass::Status::kSuccess)
+    throw std::runtime_error("nvfp4_svdquant_gemm (sm120): QuantB initialize failed");
+  st = gemm.run(stream, nullptr, enable_pdl);
+  if (st != cutlass::Status::kSuccess)
+    throw std::runtime_error("nvfp4_svdquant_gemm (sm120): QuantB run failed");
+}
+
 template <class Config>
 void run_tactic(RuntimeTacticSm120 const& rt, void* out, void const* A, void const* B,
                 void const* sfa, void const* sfb, float const* alpha, void const* D, void const* L1,
@@ -936,6 +1058,22 @@ SVDQ_SM120_NO_INLINE_DOWN_CONFIG_LIST(SVDQ_SM120_DECLARE_NO_INLINE_DOWN)
       int n, int k, int lora_rank, char* ws, size_t wsBytes, cudaStream_t stream,                  \
       bool enable_pdl);
 
+#define SVDQ_SM120_QUANT_B_RUN_SIGNATURE(Config)                                                   \
+  void run_quant_b<Config>(void* out, void const* x, void const* pqs, float const* global_scale,   \
+                           void const* xq, void const* x_sf, uint32_t* chunk_groups,               \
+                           int head_tiles, void const* weight, void const* weight_sf,              \
+                           float const* alpha, void const* down, void const* L1, void const* bias, \
+                           int m, int n, int k, int lora_rank, char* ws, size_t wsBytes,           \
+                           cudaStream_t stream, bool enable_pdl)
+#define SVDQ_SM120_QUANT_B_OFFSET_SIGNATURE(Config) \
+  size_t quant_b_counters_offset<Config>(int m, int n, int k)
+#define INSTANTIATE_NVFP4_SVDQUANT_GEMM_SM120_QUANT_B(Config) \
+  template SVDQ_SM120_QUANT_B_RUN_SIGNATURE(Config);          \
+  template SVDQ_SM120_QUANT_B_OFFSET_SIGNATURE(Config);
+#define EXTERN_NVFP4_SVDQUANT_GEMM_SM120_QUANT_B(Config)    \
+  extern template SVDQ_SM120_QUANT_B_RUN_SIGNATURE(Config); \
+  extern template SVDQ_SM120_QUANT_B_OFFSET_SIGNATURE(Config);
+
 // The per-shape static-scheduler configs alias their base configs under the global
 // static-scheduler build; their translation units must then define nothing (the
 // base config's TU already holds the one definition per specialization).
@@ -997,6 +1135,10 @@ EXTERN_NVFP4_SVDQUANT_GEMM_SM120_TACTIC(Tactic256x128x128SwapStaticConfig)
 EXTERN_NVFP4_SVDQUANT_GEMM_SM120_TACTIC(Tactic128x32x256SwapConfig)
 EXTERN_NVFP4_SVDQUANT_GEMM_SM120_TACTIC(Tactic64x32x256SwapStaticConfig)
 EXTERN_NVFP4_SVDQUANT_GEMM_SM120_TACTIC(Tactic256x64x128SwapStaticConfig)
+EXTERN_NVFP4_SVDQUANT_GEMM_SM120_QUANT_B(Tactic128x32x128SwapQuantBConfig)
+EXTERN_NVFP4_SVDQUANT_GEMM_SM120_QUANT_B(Tactic128x32x256SwapQuantBConfig)
+EXTERN_NVFP4_SVDQUANT_GEMM_SM120_QUANT_B(Tactic128x64x128SwapQuantBConfig)
+EXTERN_NVFP4_SVDQUANT_GEMM_SM120_QUANT_B(Tactic128x64x256SwapQuantBConfig)
 
 }  // namespace svdquant_sm120
 }  // namespace gemm

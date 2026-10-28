@@ -241,7 +241,7 @@ void nvfp4_quantize_smooth_lora_down_dyn_sm120_impl(
     TensorView x, TensorView pqs, TensorView global_scale, TensorView l2t_smoothed, TensorView xq,
     TensorView sf, TensorView down, int family, int tiling0, int tiling1, int tiling2,
     int address_policy, bool signal_launch,
-    flashinfer::gemm::SvdquantQuantizeBarrierSm120 quantize_barrier = {}) {
+    flashinfer::gemm::SvdquantQuantizeBarrierSm120 quantize_barrier = {}, bool down_only = false) {
   check_sm120_prefix_inputs(x, pqs, global_scale, l2t_smoothed, xq, sf, down);
   int const m = static_cast<int>(x.size(0));
   int const k = static_cast<int>(x.size(1));
@@ -251,9 +251,54 @@ void nvfp4_quantize_smooth_lora_down_dyn_sm120_impl(
       flashinfer::gemm::nvfp4_smooth_quantize_lora_down_family_sm120<kSm120PrefixRank>(
           x.data_ptr(), pqs.data_ptr(), static_cast<float const*>(global_scale.data_ptr()),
           xq.data_ptr(), sf.data_ptr(), l2t_smoothed.data_ptr(), down.data_ptr(), m, k, family,
-          tiling0, tiling1, tiling2, address_policy, stream, signal_launch, quantize_barrier);
+          tiling0, tiling1, tiling2, address_policy, stream, signal_launch, quantize_barrier,
+          down_only);
   TVM_FFI_ICHECK_EQ(status, cudaSuccess)
       << "nvfp4_quantize_smooth_lora_down_dyn_sm120 failed: " << cudaGetErrorString(status);
+}
+
+/**
+ * @brief Launch the rank-128 small-M prefix with quant_ctas persistent quantize CTAs that
+ * count finished K chunks per group in chunk_group_counts, plus the usual LoRA-down CTAs;
+ * every CTA signals the PDL launch at its start. The counters are zeroed on the stream only
+ * once the launch is known to be valid. The (block threads, down tile cols) pairs mirror
+ * SM120_QUANT_B_CHUNKED_TILINGS in svdquant_sm120_routes.py.
+ */
+void nvfp4_quantize_smooth_lora_down_chunked_sm120_impl(
+    TensorView x, TensorView pqs, TensorView global_scale, TensorView l2t_smoothed, TensorView xq,
+    TensorView sf, TensorView down, std::uint32_t* chunk_group_counts, int quant_ctas,
+    int block_threads, int down_tile_cols) {
+  check_sm120_prefix_inputs(x, pqs, global_scale, l2t_smoothed, xq, sf, down);
+  int const m = static_cast<int>(x.size(0));
+  int const k = static_cast<int>(x.size(1));
+  if (m == 0) return;
+  cudaStream_t stream = get_stream(x.device());
+  cudaError_t status = cudaErrorInvalidValue;
+  if constexpr (kSm120PrefixRank == 128) {
+    namespace small_m = flashinfer::gemm::smooth_quantize_lora_down_small_m_sm120_detail;
+    std::size_t const counter_bytes = (k / flashinfer::gemm::kSvdquantQuantChunkK +
+                                       flashinfer::gemm::kSvdquantQuantChunksPerGroup - 1) /
+                                      flashinfer::gemm::kSvdquantQuantChunksPerGroup *
+                                      sizeof(std::uint32_t);
+#define FI_SVDQ_CHUNKED_CASE(BT, DTC)                                                              \
+  if (block_threads == (BT) && down_tile_cols == (DTC)) {                                          \
+    status = cudaMemsetAsync(chunk_group_counts, 0, counter_bytes, stream);                        \
+    if (status == cudaSuccess) {                                                                   \
+      status =                                                                                     \
+          small_m::launch_small_m_dyn_kernel<BT, DTC, 4, false, true, 128, false, 1, false, true>( \
+              x.data_ptr(), pqs.data_ptr(), static_cast<float const*>(global_scale.data_ptr()),    \
+              xq.data_ptr(), sf.data_ptr(), l2t_smoothed.data_ptr(), down.data_ptr(), m, k,        \
+              stream, {}, chunk_group_counts, quant_ctas);                                         \
+    }                                                                                              \
+  }
+    FI_SVDQ_CHUNKED_CASE(1024, 8)
+    FI_SVDQ_CHUNKED_CASE(1024, 16)
+    FI_SVDQ_CHUNKED_CASE(768, 16)
+    FI_SVDQ_CHUNKED_CASE(768, 32)
+#undef FI_SVDQ_CHUNKED_CASE
+  }
+  TVM_FFI_ICHECK_EQ(status, cudaSuccess)
+      << "nvfp4_quantize_smooth_lora_down_chunked_sm120 failed: " << cudaGetErrorString(status);
 }
 
 // Keep the standalone FFI arity and its non-signaling launch unchanged.

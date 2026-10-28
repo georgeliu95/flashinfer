@@ -41,7 +41,10 @@ from flashinfer.gemm.svdquant_sm120_routes import (
 )
 from flashinfer.jit import core
 from flashinfer.jit.gemm import svdquant_sm120
-from flashinfer.jit.gemm.svdquant_sm120_configs import SVDQUANT_SM120_CONFIGS
+from flashinfer.jit.gemm.svdquant_sm120_configs import (
+    SVDQUANT_SM120_CONFIGS,
+    SVDQUANT_SM120_QUANT_B_CONFIGS,
+)
 from flashinfer.testing.svdq_model_shapes import (
     MODEL_SHAPE_CASES,
     MODEL_SHAPE_COUNT,
@@ -974,6 +977,8 @@ _SM120_ROUTE_V6_MKR = (73984, 14336, 32)
         (537, 5376, 32, 10),
         (17, 3072, 32, 10),
         (512, 3072, 64, 11),
+        (4096, 12288, 128, 17),
+        (64, 3072, 128, 18),
     ],
 )
 def test_sm120_linear_op_name_uses_current_route_abi(m, k, rank, route_version):
@@ -1886,7 +1891,8 @@ def test_rank128_offers_small_m_after_existing_producers(m: int, k: int) -> None
         assert [policy for _, _, policy in family_variants] == [0] * len(early) + [
             1
         ] * len(deferred)
-    assert routes.sm120_linear_route_abi_version(m, k, 128) == 17
+    expected_route = 18 if routes.sm120_quant_b_variants(m, k, 128) else 17
+    assert routes.sm120_linear_route_abi_version(m, k, 128) == expected_route
 
 
 # Workspace provisioning and cached tactic feasibility.
@@ -2537,7 +2543,7 @@ def test_invalid_rank_is_rejected_before_writing_sources(
 
 
 @pytest.mark.usefixtures("isolated_jit_sources")
-@pytest.mark.parametrize("rank", [32, 64])
+@pytest.mark.parametrize("rank", [32, 64, 128])
 def test_module_generates_every_tactic_translation_unit(rank: int) -> None:
     spec = svdquant_sm120.gen_gemm_sm120_module_cutlass_nvfp4_svdquant(lora_rank=rank)
 
@@ -2546,9 +2552,13 @@ def test_module_generates_every_tactic_translation_unit(rank: int) -> None:
         "nvfp4_svdquant_gemm_cutlass_sm120.cu",
         "nvfp4_smooth_quantize_sm100.cu",
     ]
-    assert len(spec.sources) == 33
+    # Only the rank-128 module adds the QuantB configs.
+    configs = SVDQUANT_SM120_CONFIGS + (
+        SVDQUANT_SM120_QUANT_B_CONFIGS if rank == 128 else ()
+    )
+    assert len(spec.sources) == (37 if rank == 128 else 33)
     assert all(source.is_file() for source in spec.sources)
-    for source, config in zip(spec.sources[2:], SVDQUANT_SM120_CONFIGS, strict=True):
+    for source, config in zip(spec.sources[2:], configs, strict=True):
         assert source.name == f"nvfp4_svdquant_gemm_cutlass_sm120_{config}.cu"
         assert f"({config})" in source.read_text(encoding="utf-8")
 
@@ -3947,3 +3957,225 @@ def test_auto_linear_allocates_scratch_only_for_execution(
         ((m, rank), torch.bfloat16),
     ):
         assert allocations.count(allocation) == 1, (allocation, allocations)
+
+
+# The QuantB linear route.
+
+_SMOOTH_QUANTIZE_BINDING_PATH: Final = (
+    _REPO_ROOT / "csrc" / "nvfp4_smooth_quantize_sm100.cu"
+)
+
+
+@pytest.mark.parametrize(
+    "m,k,rank",
+    [
+        (64, 3072, 32),  # ranks below the rank-128 prefix
+        (64, 3072, 64),
+        (257, 4096, 128),  # past SM120_QUANT_B_MAX_M
+        (0, 4096, 128),
+        (64, 4160, 128),  # K not a whole number of 128-wide chunks
+    ],
+)
+def test_quant_b_is_offered_only_for_rank128_small_m(m: int, k: int, rank: int) -> None:
+    assert routes.sm120_quant_b_variants(m, k, rank) == ()
+
+
+@pytest.mark.parametrize(
+    "m,k", [(1, 1024), (16, 4096), (17, 3072), (64, 12288), (200, 4096), (256, 11008)]
+)
+def test_quant_b_variants_are_launchable(m: int, k: int) -> None:
+    """Every candidate names a compiled kernel and a prefix the launchers accept."""
+    variants = routes.sm120_quant_b_variants(m, k, 128)
+    assert variants
+    assert len(set(variants)) == len(variants)
+    producers = {
+        (family, tiling)
+        for family, tiling, policy in routes.sm120_producer_variants(m, k, 128)
+        if policy == 0
+    }
+    for kernel, head, ctas, family, tiling in variants:
+        _, tile_k = routes.SM120_QUANT_B_KERNELS[kernel]
+        assert k % tile_k == 0
+        if head == routes.SM120_QUANT_B_ALL_TILES:
+            # Pure QuantB: any small-M LoRA-down producer of this shape.
+            assert ctas == 0
+            assert family in (
+                routes.SM120_FAMILY_SMALL_M,
+                routes.SM120_FAMILY_SMALL_M_SPLIT,
+            )
+            assert (family, tiling) in producers
+        else:
+            # Hybrid: a head inside K and the chunked family-1 prefix.
+            assert head in routes.SM120_QUANT_B_HEAD_TILES and head < k // tile_k
+            assert ctas in routes.SM120_QUANT_B_QUANT_CTAS
+            assert family == routes.SM120_FAMILY_SMALL_M
+            assert tiling[:2] in routes.SM120_QUANT_B_CHUNKED_TILINGS
+            assert routes.sm120_small_m_tiling_is_valid(m, k, *tiling, 128)
+
+
+def test_quant_b_pure_launches_keep_one_tiling_per_down_kernel() -> None:
+    """A family-1 tiling's third field only shapes quantize work a pure launch skips."""
+    variants = routes.sm120_quant_b_variants(64, 12288, 128)
+    pure_family1 = [
+        (kernel, tiling[:2])
+        for kernel, head, _, family, tiling in variants
+        if head == routes.SM120_QUANT_B_ALL_TILES
+        and family == routes.SM120_FAMILY_SMALL_M
+    ]
+    assert pure_family1
+    assert len(pure_family1) == len(set(pure_family1))
+
+
+def test_quant_b_decode_falls_back_to_the_first_launch() -> None:
+    variants = routes.sm120_quant_b_variants(16, 4096, 128)
+    assert routes.sm120_decode_quant_b_variant(16, 4096, 3, 128) == variants[3]
+    assert (
+        routes.sm120_decode_quant_b_variant(16, 4096, len(variants), 128) == variants[0]
+    )
+    assert routes.sm120_decode_quant_b_variant(16, 4096, -1, 128) == variants[0]
+    with pytest.raises(ValueError):
+        routes.sm120_decode_quant_b_variant(4096, 4096, 0, 128)
+
+
+@pytest.mark.parametrize(
+    "m,k,expected",
+    [
+        (16, 4096, 18),
+        (256, 12288, 18),
+        (257, 12288, 17),
+        (4096, 12288, 17),
+        (64, 4160, 17),
+    ],
+)
+def test_quant_b_moves_only_its_shapes_to_a_new_route_abi(
+    m: int, k: int, expected: int
+) -> None:
+    """Shapes without a QuantB candidate keep reaching their v17 winners."""
+    assert routes.sm120_linear_route_abi_version(m, k, 128) == expected
+
+
+def test_quant_b_chunked_tilings_mirror_the_launcher() -> None:
+    body = _SMOOTH_QUANTIZE_BINDING_PATH.read_text(encoding="utf-8")
+    found = tuple(
+        (int(threads), int(cols))
+        for threads, cols in re.findall(r"FI_SVDQ_CHUNKED_CASE\((\d+), (\d+)\)", body)
+    )
+    assert found == routes.SM120_QUANT_B_CHUNKED_TILINGS
+
+
+def test_quant_b_kernels_mirror_the_dispatch_and_the_config_list() -> None:
+    body = _BINDING_PATH.read_text(encoding="utf-8")
+    start = body.index("#define SVDQ_SM120_QUANT_B_DISPATCH")
+    cases = re.findall(
+        r"case (\d+): \{[\s\\]*using C = "
+        r"flashinfer::gemm::svdquant_sm120::Tactic128x(\d+)x(\d+)SwapQuantBConfig",
+        body[start:],
+    )
+    assert [int(case) for case, _, _ in cases] == list(
+        range(len(routes.SM120_QUANT_B_KERNELS))
+    )
+    assert tuple((int(rows), int(tile_k)) for _, rows, tile_k in cases) == (
+        routes.SM120_QUANT_B_KERNELS
+    )
+    assert list(SVDQUANT_SM120_QUANT_B_CONFIGS) == [
+        f"Tactic128x{rows}x{tile_k}SwapQuantBConfig"
+        for rows, tile_k in routes.SM120_QUANT_B_KERNELS
+    ]
+    assert not any("QuantB" in config for config in SVDQUANT_SM120_CONFIGS)
+
+
+def test_jinja_instantiates_quant_b_configs_through_their_own_entry_points() -> None:
+    import jinja2
+
+    template = jinja2.Template(_JINJA_PATH.read_text(encoding="utf-8"))
+    for config in SVDQUANT_SM120_CONFIGS + SVDQUANT_SM120_QUANT_B_CONFIGS:
+        rendered = template.render(config=config)
+        if "QuantB" in config:
+            assert (
+                f"INSTANTIATE_NVFP4_SVDQUANT_GEMM_SM120_QUANT_B({config})" in rendered
+            )
+            assert "_TACTIC(" not in rendered
+        else:
+            assert "QUANT_B" not in rendered
+
+
+def test_quant_b_runner_is_appended_after_the_existing_routes(monkeypatch) -> None:
+    """It is never the untuned fallback, and only small-M rank-128 shapes offer it."""
+    for name, value in (
+        ("_sm120_fused_linear_runner", "fused"),
+        ("_sm120_cutlass_linear_runner", "cutlass"),
+        ("_sm120_quant_b_linear_runner", "quant_b"),
+    ):
+        monkeypatch.setattr(
+            svdquant_sm120_cutlass,
+            name,
+            lambda enable_pdl, device, rank, value=value: value,
+        )
+    monkeypatch.setattr(
+        svdquant_sm120_cutlass, "_sm120_fused_linear_supported", lambda m, k, rank: True
+    )
+    runners = svdquant_sm120_cutlass._sm120_linear_runners
+    assert runners(False, "dev", 64, 4096, 12288, 128) == [
+        "fused",
+        "cutlass",
+        "quant_b",
+    ]
+    assert runners(False, "dev", 4096, 4096, 12288, 128) == ["fused", "cutlass"]
+    assert runners(False, "dev", 64, 4096, 3072, 64) == ["cutlass", "fused"]
+
+
+def test_quant_b_runner_sizes_and_launches_through_the_module(monkeypatch) -> None:
+    calls = []
+    module = SimpleNamespace(
+        nvfp4_svdquant_quant_b_workspace_size=lambda m, n, k, kernel: 1000 + kernel,
+        nvfp4_svdquant_linear_quant_b_sm120=lambda *args: calls.append(args),
+    )
+    monkeypatch.setattr(
+        svdquant_sm120_cutlass,
+        "get_nvfp4_svdquant_sm120_module",
+        lambda rank=32: module,
+    )
+    monkeypatch.setattr(svdquant_sm120_cutlass, "_cached_sm120_kmajor_l2t", lambda t: t)
+    runner = svdquant_sm120_cutlass._sm120_quant_b_linear_runner(
+        True, torch.device("cpu"), 128
+    )
+    m, n, k = 16, 256, 4096
+    inputs = [torch.empty(m, k), torch.empty(n, k // 2)] + [None] * 3
+    inputs += (
+        [torch.empty(k, 128)] + [None] * 7 + [torch.empty(1001, dtype=torch.uint8)]
+    )
+    variants = routes.sm120_quant_b_variants(m, k, 128)
+    assert runner.get_valid_tactics(inputs, None) == list(range(len(variants)))
+    by_kernel: dict[int, int] = {}
+    for index, variant in enumerate(variants):
+        by_kernel.setdefault(variant[0], index)
+    # The workspace query bounds each kernel; out-of-range tactics are refused.
+    assert runner.validate_tactic(inputs, by_kernel[1])
+    assert not runner.validate_tactic(inputs, by_kernel[2])
+    assert not runner.validate_tactic(inputs, len(variants))
+    for tactic in (by_kernel[3], len(variants) - 1):
+        runner.forward(inputs, tactic=tactic)
+        kernel, head, ctas, family, t0, t1, t2, enable_pdl = calls[-1][14:]
+        assert (kernel, head, ctas, family, (t0, t1, t2)) == variants[tactic]
+        assert enable_pdl is True
+
+
+def test_linear_workspace_covers_the_quant_b_runner(monkeypatch) -> None:
+    module = _fake_workspace_module()
+    module.nvfp4_svdquant_quant_b_workspace_size = lambda m, n, k, kernel: (
+        _LEGACY_WORKSPACE_BYTES + 4096 + kernel
+    )
+    _patch_workspace_module(monkeypatch, module)
+    _patch_budget(monkeypatch, _CARD_TOO_SMALL_FOR_SPLITK)
+    device = SimpleNamespace(index=0)
+    kernels = {variant[0] for variant in routes.sm120_quant_b_variants(64, 12288, 128)}
+    assert svdquant_sm120_cutlass._sm120_max_workspace_bytes(
+        device, 64, 4096, 12288, 128
+    ) == (_LEGACY_WORKSPACE_BYTES + 4096 + max(kernels))
+    # No QuantB candidate, no QuantB sizing.
+    assert (
+        svdquant_sm120_cutlass._sm120_max_workspace_bytes(
+            device, 4096, 4096, 12288, 128
+        )
+        == _LEGACY_WORKSPACE_BYTES
+    )

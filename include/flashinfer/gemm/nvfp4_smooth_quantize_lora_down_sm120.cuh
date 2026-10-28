@@ -310,14 +310,16 @@ __host__ __device__ __forceinline__ int small_m_quant_blocks(int m, int sf_cols)
  * Optional PDL signaling publishes quantize stores before the down CTAs finish.
  */
 template <int BlockThreads, int DownTileCols, int RowsPerQuantBlock, bool PackedL2T = false,
-          bool SignalLaunch = false, int Rank = 32, bool GateLaunchOnQuant = false, int KSplit = 1>
+          bool SignalLaunch = false, int Rank = 32, bool GateLaunchOnQuant = false, int KSplit = 1,
+          bool DownOnly = false, bool ChunkedQuant = false>
 __global__
 __launch_bounds__(BlockThreads) void nvfp4_smooth_quantize_lora_down_small_m_dyn_sm120_kernel(
     quant::Type const* __restrict__ x, quant::Type const* __restrict__ pre_quant_scale,
     float const* __restrict__ global_scale, std::uint64_t* __restrict__ xq,
     std::uint8_t* __restrict__ sf, quant::Type const* __restrict__ l2t_smoothed,
     quant::Type* __restrict__ down, int M, int K,
-    SvdquantQuantizeBarrierSm120 quantize_barrier = {}) {
+    SvdquantQuantizeBarrierSm120 quantize_barrier = {}, std::uint32_t* chunk_group_counts = nullptr,
+    int quant_ctas = 0) {
   constexpr int kRank = Rank;
   // Rank only sets how many DownTileCols-wide column tiles the down CTAs cover;
   // a CTA's fragments, shared accumulator and K split do not depend on it.
@@ -328,6 +330,15 @@ __launch_bounds__(BlockThreads) void nvfp4_smooth_quantize_lora_down_small_m_dyn
   static_assert(!GateLaunchOnQuant || (SignalLaunch && Rank == 128),
                 "quantize-gated launch signaling is built for rank 128 only");
   static_assert(KSplit == 1 || Rank == 128, "split-K down is built for rank 128 only");
+  // DownOnly serves a QuantB GEMM that quantizes X itself: this grid computes LoRA-down
+  // only and signals the GEMM launch at its start.
+  static_assert(!DownOnly || (SignalLaunch && !GateLaunchOnQuant && Rank == 128));
+  // ChunkedQuant runs quant_ctas persistent quantize CTAs over kSvdquantQuantChunkK-wide K
+  // chunks in K order and counts finished chunks per group of kSvdquantQuantChunksPerGroup
+  // in chunk_group_counts, so a QuantB GEMM can load XQ/SF group by group instead of after
+  // the whole quantize half.
+  static_assert(!ChunkedQuant ||
+                (SignalLaunch && !GateLaunchOnQuant && Rank == 128 && KSplit == 1 && !DownOnly));
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1200)
   if constexpr (SignalLaunch && !GateLaunchOnQuant) {
     // The PDL consumer can set up early, but waits for this grid before reading outputs.
@@ -338,10 +349,13 @@ __launch_bounds__(BlockThreads) void nvfp4_smooth_quantize_lora_down_small_m_dyn
   int const kPaddedM = (M + 127) / 128 * 128;
   // Split-K launches KSplit-CTA clusters; the quantize CTAs are rounded up so no
   // cluster straddles the quantize/down boundary (surplus quantize CTAs find no item).
-  int const kQuantBlocks =
-      (small_m_quant_blocks<BlockThreads, RowsPerQuantBlock, Rank>(M, K / quant::SF_VEC_SIZE) +
-       KSplit - 1) /
-      KSplit * KSplit;
+  int const kQuantBlocks = ChunkedQuant ? quant_ctas
+                           : DownOnly
+                               ? 0
+                               : (small_m_quant_blocks<BlockThreads, RowsPerQuantBlock, Rank>(
+                                      M, K / quant::SF_VEC_SIZE) +
+                                  KSplit - 1) /
+                                     KSplit * KSplit;
   if constexpr (GateLaunchOnQuant) {
     // The consumer GEMM acquires XQ/SF through the quantize barrier (or waits for
     // this whole grid when it has no barrier slot) and waits for the grid before
@@ -364,6 +378,41 @@ __launch_bounds__(BlockThreads) void nvfp4_smooth_quantize_lora_down_small_m_dyn
 
   int const block = static_cast<int>(blockIdx.x);
   if (block < kQuantBlocks) {
+    if constexpr (ChunkedQuant) {
+      constexpr int kChunkSfCols = kSvdquantQuantChunkK / quant::SF_VEC_SIZE;
+      int const chunks = K / kSvdquantQuantChunkK;
+      int const chunk_items = kPaddedM * kChunkSfCols;
+      float const scale = global_scale[0];
+      for (int chunk = block; chunk < chunks; chunk += kQuantBlocks) {
+        for (int item = threadIdx.x; item < chunk_items; item += BlockThreads) {
+          int const row = item / kChunkSfCols;
+          int const sf_col = chunk * kChunkSfCols + item % kChunkSfCols;
+          std::int64_t const sf_offset = quant::get_sf_out_offset_128x4(row, sf_col, kSfCols);
+          if (row < M) {
+            std::int64_t const vec = static_cast<std::int64_t>(row) * kSfCols + sf_col;
+            quant::Bf16x8 x_lo;
+            quant::Bf16x8 x_hi;
+            quant::Bf16x8 pqs_lo;
+            quant::Bf16x8 pqs_hi;
+            quant::loadBf16x8(x + vec * quant::FAST_ELTS_PER_THREAD, x_lo);
+            quant::loadBf16x8(x + vec * quant::FAST_ELTS_PER_THREAD + 8, x_hi);
+            quant::loadBf16x8(pre_quant_scale + sf_col * quant::FAST_ELTS_PER_THREAD, pqs_lo);
+            quant::loadBf16x8(pre_quant_scale + sf_col * quant::FAST_ELTS_PER_THREAD + 8, pqs_hi);
+            xq[vec] = quant::quantizeSmoothed16(x_lo, x_hi, pqs_lo, pqs_hi, scale, sf + sf_offset);
+          } else {
+            sf[sf_offset] = 0u;
+          }
+        }
+        __threadfence();
+        __syncthreads();
+        if (threadIdx.x == 0) {
+          cuda::atomic_ref<std::uint32_t, cuda::thread_scope_device> group(
+              chunk_group_counts[chunk / kSvdquantQuantChunksPerGroup]);
+          group.fetch_add(1u, cuda::memory_order_release);
+        }
+      }
+      return;
+    }
     for (std::int64_t line = static_cast<std::int64_t>(block) * BlockThreads + threadIdx.x;
          line < kL2PrefetchLines; line += static_cast<std::int64_t>(kQuantBlocks) * BlockThreads) {
       std::uint8_t const* prefetch_address =
@@ -629,12 +678,15 @@ __launch_bounds__(BlockThreads) void nvfp4_smooth_quantize_lora_down_small_m_dyn
  * serves every shape whose K divides the warp split.
  */
 template <int BlockThreads, int DownTileCols, int RowsPerQuantBlock, bool PackedL2T = false,
-          bool SignalLaunch = false, int Rank = 32, bool GateLaunchOnQuant = false, int KSplit = 1>
+          bool SignalLaunch = false, int Rank = 32, bool GateLaunchOnQuant = false, int KSplit = 1,
+          bool DownOnly = false, bool ChunkedQuant = false>
 inline cudaError_t launch_small_m_dyn_kernel(void const* x, void const* pre_quant_scale,
                                              float const* global_scale, void* xq, void* sf,
                                              void const* l2t_smoothed, void* down, int m, int k,
                                              cudaStream_t stream,
-                                             SvdquantQuantizeBarrierSm120 quantize_barrier = {}) {
+                                             SvdquantQuantizeBarrierSm120 quantize_barrier = {},
+                                             std::uint32_t* chunk_group_counts = nullptr,
+                                             int quant_ctas = 0) {
   constexpr int kRank = Rank;
   constexpr int kDownWarps = BlockThreads / 32;
   constexpr int kNFragments = DownTileCols / kMmaN;
@@ -660,11 +712,17 @@ inline cudaError_t launch_small_m_dyn_kernel(void const* x, void const* pre_quan
     int const quant_blocks =
         small_m_quant_blocks<BlockThreads, RowsPerQuantBlock, Rank>(m, k / quant::SF_VEC_SIZE);
     if (kRank <= 64 && quant_blocks * RowsPerQuantBlock > padded_m) return cudaErrorInvalidValue;
-    int const grid_blocks =
-        (quant_blocks + KSplit - 1) / KSplit * KSplit + ((m + 15) / 16) * kDownNTiles * KSplit;
+    if (ChunkedQuant &&
+        (k % kSvdquantQuantChunkK || quant_ctas <= 0 || chunk_group_counts == nullptr)) {
+      return cudaErrorInvalidValue;
+    }
+    int const grid_blocks = (ChunkedQuant ? quant_ctas
+                             : DownOnly   ? 0
+                                          : (quant_blocks + KSplit - 1) / KSplit * KSplit) +
+                            ((m + 15) / 16) * kDownNTiles * KSplit;
     auto* kernel = &nvfp4_smooth_quantize_lora_down_small_m_dyn_sm120_kernel<
         BlockThreads, DownTileCols, RowsPerQuantBlock, PackedL2T, SignalLaunch, Rank,
-        GateLaunchOnQuant, KSplit>;
+        GateLaunchOnQuant, KSplit, DownOnly, ChunkedQuant>;
     if constexpr (KSplit > 1) {
       // Keep the primary's ordinary stream dependency, including the preceding GEMM.
       cudaLaunchConfig_t config = {};
@@ -683,14 +741,15 @@ inline cudaError_t launch_small_m_dyn_kernel(void const* x, void const* pre_quan
                          static_cast<quant::Type const*>(pre_quant_scale), global_scale,
                          static_cast<std::uint64_t*>(xq), static_cast<std::uint8_t*>(sf),
                          static_cast<quant::Type const*>(l2t_smoothed),
-                         static_cast<quant::Type*>(down), m, k, quantize_barrier);
+                         static_cast<quant::Type*>(down), m, k, quantize_barrier,
+                         chunk_group_counts, quant_ctas);
     } else {
       // Keep the primary's ordinary stream dependency, including the preceding GEMM.
       kernel<<<grid_blocks, BlockThreads, 0, stream>>>(
           static_cast<quant::Type const*>(x), static_cast<quant::Type const*>(pre_quant_scale),
           global_scale, static_cast<std::uint64_t*>(xq), static_cast<std::uint8_t*>(sf),
           static_cast<quant::Type const*>(l2t_smoothed), static_cast<quant::Type*>(down), m, k,
-          quantize_barrier);
+          quantize_barrier, chunk_group_counts, quant_ctas);
     }
     return cudaGetLastError();
   }
@@ -1760,17 +1819,19 @@ inline cudaError_t nvfp4_smooth_quantize_lora_down_dyn_sm120(
  *            down layout * 1000 + stages * 100 + quantize warps;
  *            address_policy = grid mode)
  *   family 6 split-K rank-128 small-M (a, b, c = block threads, down tile cols, K splits)
- * Family 3 uses the separate cuBLASLt prefix entry.
+ * Family 3 uses the separate cuBLASLt prefix entry. down_only launches the LoRA-down CTAs
+ * of rank-128 family 1 or 6 alone, for a QuantB GEMM that quantizes X itself (see DownOnly).
  */
 template <int Rank = 32>
 inline cudaError_t nvfp4_smooth_quantize_lora_down_family_sm120(
     void const* x, void const* pre_quant_scale, float const* global_scale, void* xq, void* sf,
     void const* l2t_smoothed, void* down, int m, int k, int family, int a, int b, int c,
     int address_policy, cudaStream_t stream, bool signal_launch = false,
-    SvdquantQuantizeBarrierSm120 quantize_barrier = {}) {
+    SvdquantQuantizeBarrierSm120 quantize_barrier = {}, bool down_only = false) {
   namespace large_m = smooth_quantize_lora_down_large_m_sm120_detail;
   namespace small_m = smooth_quantize_lora_down_small_m_sm120_detail;
   using large_m::DynAddress;
+  if (down_only && (Rank != 128 || (family != 1 && family != 6))) return cudaErrorInvalidValue;
   if constexpr (Rank == 64) {
     if (family != 0 && family != 1) return cudaErrorInvalidValue;
   }
@@ -1785,19 +1846,23 @@ inline cudaError_t nvfp4_smooth_quantize_lora_down_family_sm120(
     if (family == 6) {
       // The small-M kernel with LoRA-down split over K across a KSplit-CTA cluster;
       // same launch signaling and address policies as family 1.
-#define FI_SVDQ_SPLIT_CASE(BT, DTC, KS)                                                    \
-  if (a == (BT) && b == (DTC) && c == (KS)) {                                              \
-    if (signal_launch && address_policy == 1) {                                            \
-      return small_m::launch_small_m_dyn_kernel<BT, DTC, 4, false, true, Rank, true, KS>(  \
-          x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, m, k, stream,      \
-          quantize_barrier);                                                               \
-    }                                                                                      \
-    if (signal_launch) {                                                                   \
-      return small_m::launch_small_m_dyn_kernel<BT, DTC, 4, false, true, Rank, false, KS>( \
-          x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, m, k, stream);     \
-    }                                                                                      \
-    return small_m::launch_small_m_dyn_kernel<BT, DTC, 4, false, false, Rank, false, KS>(  \
-        x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, m, k, stream);       \
+#define FI_SVDQ_SPLIT_CASE(BT, DTC, KS)                                                          \
+  if (a == (BT) && b == (DTC) && c == (KS)) {                                                    \
+    if (down_only) {                                                                             \
+      return small_m::launch_small_m_dyn_kernel<BT, DTC, 4, false, true, Rank, false, KS, true>( \
+          x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, m, k, stream);           \
+    }                                                                                            \
+    if (signal_launch && address_policy == 1) {                                                  \
+      return small_m::launch_small_m_dyn_kernel<BT, DTC, 4, false, true, Rank, true, KS>(        \
+          x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, m, k, stream,            \
+          quantize_barrier);                                                                     \
+    }                                                                                            \
+    if (signal_launch) {                                                                         \
+      return small_m::launch_small_m_dyn_kernel<BT, DTC, 4, false, true, Rank, false, KS>(       \
+          x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, m, k, stream);           \
+    }                                                                                            \
+    return small_m::launch_small_m_dyn_kernel<BT, DTC, 4, false, false, Rank, false, KS>(        \
+        x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, m, k, stream);             \
   }
       FI_SVDQ_SMALL_M_SPLIT_TILINGS(FI_SVDQ_SPLIT_CASE)
 #undef FI_SVDQ_SPLIT_CASE
@@ -1844,21 +1909,26 @@ inline cudaError_t nvfp4_smooth_quantize_lora_down_family_sm120(
     // while this prefix runs; the GEMM waits on the grid before reading outputs.
     // Address policy 1 instead lets the GEMM mainloop run under LoRA-down,
     // acquiring XQ/SF through the quantize barrier (see GateLaunchOnQuant).
-#define FI_SVDQ_SMALL_CASE(BT, DTC, RPQB)                                                  \
-  if (a == (BT) && b == (DTC) && c == (RPQB)) {                                            \
-    if constexpr (Rank == 128) {                                                           \
-      if (signal_launch && address_policy == 1) {                                          \
-        return small_m::launch_small_m_dyn_kernel<BT, DTC, RPQB, false, true, Rank, true>( \
-            x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, m, k, stream,    \
-            quantize_barrier);                                                             \
-      }                                                                                    \
-      if (signal_launch) {                                                                 \
-        return small_m::launch_small_m_dyn_kernel<BT, DTC, RPQB, false, true, Rank>(       \
-            x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, m, k, stream);   \
-      }                                                                                    \
-    }                                                                                      \
-    return small_m::launch_small_m_dyn_kernel<BT, DTC, RPQB, false, false, Rank>(          \
-        x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, m, k, stream);       \
+#define FI_SVDQ_SMALL_CASE(BT, DTC, RPQB)                                                         \
+  if (a == (BT) && b == (DTC) && c == (RPQB)) {                                                   \
+    if constexpr (Rank == 128) {                                                                  \
+      if (down_only) {                                                                            \
+        return small_m::launch_small_m_dyn_kernel<BT, DTC, RPQB, false, true, Rank, false, 1,     \
+                                                  true>(x, pre_quant_scale, global_scale, xq, sf, \
+                                                        l2t_smoothed, down, m, k, stream);        \
+      }                                                                                           \
+      if (signal_launch && address_policy == 1) {                                                 \
+        return small_m::launch_small_m_dyn_kernel<BT, DTC, RPQB, false, true, Rank, true>(        \
+            x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, m, k, stream,           \
+            quantize_barrier);                                                                    \
+      }                                                                                           \
+      if (signal_launch) {                                                                        \
+        return small_m::launch_small_m_dyn_kernel<BT, DTC, RPQB, false, true, Rank>(              \
+            x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, m, k, stream);          \
+      }                                                                                           \
+    }                                                                                             \
+    return small_m::launch_small_m_dyn_kernel<BT, DTC, RPQB, false, false, Rank>(                 \
+        x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, m, k, stream);              \
   }
     FI_SVDQ_SMALL_M_TILINGS(FI_SVDQ_SMALL_CASE)
 #undef FI_SVDQ_SMALL_CASE

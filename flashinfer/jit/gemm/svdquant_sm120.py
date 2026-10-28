@@ -22,7 +22,10 @@ import jinja2
 from .. import env as jit_env
 from ..core import JitSpec, current_compilation_context, gen_jit_spec
 from ..utils import write_if_different
-from .svdquant_sm120_configs import SVDQUANT_SM120_CONFIGS
+from .svdquant_sm120_configs import (
+    SVDQUANT_SM120_CONFIGS,
+    SVDQUANT_SM120_QUANT_B_CONFIGS,
+)
 
 
 def gen_gemm_sm120_module_cutlass_nvfp4_svdquant(lora_rank: int = 32) -> JitSpec:
@@ -41,12 +44,16 @@ def gen_gemm_sm120_module_cutlass_nvfp4_svdquant(lora_rank: int = 32) -> JitSpec
         jit_env.FLASHINFER_CSRC_DIR / "nvfp4_svdquant_gemm_cutlass_sm120.cu",
         jit_env.FLASHINFER_CSRC_DIR / "nvfp4_smooth_quantize_sm100.cu",
     ]
+    # The QuantB launches serve rank 128 only; other ranks keep their sources.
+    configs = SVDQUANT_SM120_CONFIGS + (
+        SVDQUANT_SM120_QUANT_B_CONFIGS if lora_rank == 128 else ()
+    )
 
     with open(
         jit_env.FLASHINFER_CSRC_DIR / "nvfp4_svdquant_gemm_cutlass_sm120.jinja"
     ) as f:
         kernel_inst_templ = jinja2.Template(f.read())
-        for config in SVDQUANT_SM120_CONFIGS:
+        for config in configs:
             dest_path = gen_directory / f"nvfp4_svdquant_gemm_cutlass_sm120_{config}.cu"
             source_paths.append(dest_path)
             source = kernel_inst_templ.render(config=config)
