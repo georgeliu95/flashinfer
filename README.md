@@ -292,6 +292,6 @@ If you find FlashInfer helpful in your project or research, please consider citi
 
 The `h3-spark-unified` branch includes experimental BF16 operators for H3
 upscale and adapter inference: channels-last GroupNorm/pointwise fusion and
-Triton/CuTe temporal depthwise Conv3D. Import them through
+Triton/CuTe temporal depthwise Conv3D with exact-configuration autotuning. Import them through
 `flashinfer.diffusion_ops.h3_bridge`; see the [operator contract and runnable
 example](flashinfer/experimental/h3_bridge/README.md).

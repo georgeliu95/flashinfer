@@ -38,7 +38,10 @@ def _temporal(
     BIAS_FIRST: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    index = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    block_id = tl.program_id(0)
+    if N > 2147483647:
+        block_id = block_id.to(tl.int64)
+    index = block_id * BLOCK + tl.arange(0, BLOCK)
     valid = index < N
     channel = index % C
     spatial = index // C % (T * H * W)
@@ -73,26 +76,34 @@ def run(
     weight: torch.Tensor,
     bias: torch.Tensor | None,
     *,
-    bias_first: bool,
+    bias_first: bool = True,
+    block: int = 1024,
+    num_warps: int = 4,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Launch the validated contiguous or channels-last inference contract."""
     _, channels, frames, height, width = inputs.shape
-    output = torch.empty_like(inputs, memory_format=torch.channels_last_3d)
-    _temporal[(triton.cdiv(inputs.numel(), 1024),)](
-        inputs,
-        weight,
-        weight if bias is None else bias,
-        output,
-        inputs.numel(),
-        channels,
-        frames,
-        height,
-        width,
-        weight.shape[2],
-        inputs.is_contiguous(memory_format=torch.channels_last_3d),
-        bias is not None,
-        bias_first,
-        1024,
-        num_warps=4,
-    )
+    with torch.cuda.device(inputs.device):
+        output = (
+            torch.empty_like(inputs, memory_format=torch.channels_last_3d)
+            if out is None
+            else out
+        )
+        _temporal[(triton.cdiv(inputs.numel(), block),)](
+            inputs,
+            weight,
+            weight if bias is None else bias,
+            output,
+            inputs.numel(),
+            channels,
+            frames,
+            height,
+            width,
+            weight.shape[2],
+            inputs.is_contiguous(memory_format=torch.channels_last_3d),
+            bias is not None,
+            bias_first,
+            block,
+            num_warps=num_warps,
+        )
     return output

@@ -28,13 +28,26 @@ from __future__ import annotations
 from collections.abc import Callable
 import json
 import importlib.util
+import os
 import random
+import time
+from pathlib import Path
 import statistics
 from typing import TypedDict
 
 import torch
 
+from flashinfer import autotune
 from flashinfer.diffusion_ops import h3_bridge
+from flashinfer.experimental.h3_bridge._tuning import TacticSelection, selected_tactic
+
+
+class BenchmarkError(RuntimeError):
+    """A benchmark failed to exercise the required tuned path."""
+
+    def __init__(self, detail: str) -> None:
+        super().__init__(detail)
+        self.detail = detail
 
 
 class Measurement(TypedDict):
@@ -46,6 +59,8 @@ class Measurement(TypedDict):
     taps: int | None
     groups: int | None
     eps: float | None
+    selection: TacticSelection | None
+    tuning_seconds: float | None
 
 
 def measure(calls: dict[str, Callable[[], torch.Tensor]]) -> dict[str, float]:
@@ -78,6 +93,8 @@ def report(
     taps: int | None = None,
     groups: int | None = None,
     eps: float | None = None,
+    selection: TacticSelection | None = None,
+    tuning_seconds: float | None = None,
 ) -> None:
     record: Measurement = {
         "operator": operator,
@@ -88,11 +105,13 @@ def report(
         "taps": taps,
         "groups": groups,
         "eps": eps,
+        "selection": selection,
+        "tuning_seconds": tuning_seconds,
     }
     print(json.dumps(record), flush=True)
 
 
-def benchmark_depthwise(shape: tuple[int, ...], taps: int) -> None:
+def benchmark_depthwise(shape: tuple[int, ...], taps: int, cache: str) -> None:
     x = torch.randn(shape, device="cuda", dtype=torch.bfloat16)
     x = x.contiguous(memory_format=torch.channels_last_3d)
     w = torch.randn((shape[1], 1, taps, 1, 1), device=x.device, dtype=x.dtype)
@@ -105,11 +124,12 @@ def benchmark_depthwise(shape: tuple[int, ...], taps: int) -> None:
         return h3_bridge.depthwise_temporal(x, w, bias)
 
     torch.testing.assert_close(auto(), triton(), atol=0, rtol=0)
-    calls: dict[str, Callable[[], torch.Tensor]] = {"triton": triton, "auto": auto}
+    calls: dict[str, Callable[[], torch.Tensor]] = {
+        "triton_default": triton,
+        "auto_tuned": auto,
+    }
     if (
         torch.cuda.get_device_capability() == (12, 1)
-        and shape[1] == 512
-        and taps == 5
         and importlib.util.find_spec("cutlass") is not None
     ):
 
@@ -117,8 +137,23 @@ def benchmark_depthwise(shape: tuple[int, ...], taps: int) -> None:
             return h3_bridge.depthwise_temporal(x, w, bias, backend="cute")
 
         torch.testing.assert_close(cute(), triton(), atol=0, rtol=0)
-        calls["cute"] = cute
-    report("temporal_depthwise", shape, measure(calls), taps=taps)
+        calls["cute_default"] = cute
+    begin = time.perf_counter()
+    with autotune(cache=cache):
+        tuned = auto()
+    tuning_seconds = time.perf_counter() - begin
+    torch.testing.assert_close(tuned, triton(), atol=0, rtol=0)
+    selection = selected_tactic(x, w, bias, bias_first=True, backend="auto")
+    if not selection["cache_hit"]:
+        raise BenchmarkError("benchmark did not produce a tuned DW selection")
+    report(
+        "temporal_depthwise",
+        shape,
+        measure(calls),
+        taps=taps,
+        selection=selection,
+        tuning_seconds=tuning_seconds,
+    )
 
 
 def benchmark_norm(shape: tuple[int, ...], groups: int, eps: float) -> None:
@@ -148,10 +183,15 @@ def benchmark_norm(shape: tuple[int, ...], groups: int, eps: float) -> None:
 def main() -> None:
     torch.set_num_threads(1)
     torch.manual_seed(1109)
+    cache_root = Path(os.environ.get("FLASHINFER_WORKSPACE_BASE", Path.home()))
+    cache = cache_root / ".cache" / "flashinfer" / "h3-bridge-tactics.json"
+    cache.parent.mkdir(parents=True, exist_ok=True)
     with torch.inference_mode():
         for frames in (20, 42):
-            benchmark_depthwise((1, 512, frames, 48, 84), 5)
-        benchmark_depthwise((1, 752, 17, 24, 42), 3)
+            for height, width in ((24, 42), (48, 84)):
+                benchmark_depthwise((1, 512, frames, height, width), 5, str(cache))
+        benchmark_depthwise((1, 752, 17, 24, 42), 3, str(cache))
+        benchmark_depthwise((2, 7, 7, 3, 5), 3, str(cache))
         benchmark_norm((1, 512, 42, 48, 84), 32, 1e-5)
         benchmark_norm((1, 752, 17, 24, 42), 16, 1e-6)
 

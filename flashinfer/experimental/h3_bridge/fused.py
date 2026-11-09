@@ -32,14 +32,12 @@ if TYPE_CHECKING:
 PARTIAL_BLOCK: Final = 4096
 
 
-@dataclass(frozen=True, slots=True)
 class BridgeFusionError(RuntimeError):
-    """An unsupported BF16 inference contract detected before kernel launch."""
+    """An inference contract error whose traceback remains context-manager safe."""
 
-    detail: str
-
-    def __str__(self) -> str:
-        return self.detail
+    def __init__(self, detail: str) -> None:
+        super().__init__(detail)
+        self.detail = detail
 
 
 @dataclass(frozen=True, slots=True)

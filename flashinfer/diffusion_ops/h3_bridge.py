@@ -115,10 +115,14 @@ def depthwise_temporal(
     dilation are one; output uses channels_last_3d storage. Bias-first starts
     accumulation at the bias; false adds bias after ascending-tap reduction.
 
-    Auto selects CuTe only for the qualified SM121 high-resolution shapes,
-    otherwise Triton. Explicit cute rejects unsupported inputs. Warm up each
-    specialization before CUDA graph capture. Calling this experimental API
-    is the opt-in; no experimental-auto environment flag is required.
+    Inside ``flashinfer.autotune()``, auto compares Triton block sizes and
+    CuTe time tiles/thread/vector configurations for the actual input. CuTe
+    supports arbitrary positive NCTHW shapes in channels-last on SM121,
+    including optional bias and both accumulation orders. Outside autotune,
+    auto reuses the cached winner or falls back to Triton. Explicit triton
+    and cute restrict tuning to that backend. Use ``autotune(cache=path)``
+    for persistence and warm each specialization before CUDA graph capture.
+    Calling this API is the opt-in; no experimental-auto flag is required.
     """
     from ..experimental.h3_bridge.depthwise import depthwise_temporal as run
 

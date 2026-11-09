@@ -102,3 +102,53 @@ def test_public_api_preserves_layout_through_bridge_operator_chain() -> None:
     # Then the public path retains channels-last and the reference operation domain.
     torch.testing.assert_close(result, expected, atol=0.125, rtol=0.03)
     assert result.is_contiguous(memory_format=torch.channels_last_3d)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize(
+    "taps,has_bias,bias_first", [(3, True, True), (5, False, True), (5, True, False)]
+)
+def test_public_cute_accepts_general_shape_and_bias_modes(
+    taps: int, has_bias: bool, bias_first: bool
+) -> None:
+    # Given a batched odd-channel shape outside the original two-shape route.
+    from flashinfer.diffusion_ops import h3_bridge as api
+
+    if torch.cuda.get_device_capability() != (12, 1):
+        pytest.skip("CuTe bridge is qualified on SM121")
+    pytest.importorskip("cutlass.cute")
+    torch.manual_seed(1110)
+    x = torch.randn((2, 7, 3, 4, 5), device="cuda", dtype=torch.bfloat16)
+    x = x.contiguous(memory_format=torch.channels_last_3d)
+    w = torch.randn((7, 1, taps, 1, 1), device="cuda", dtype=torch.bfloat16)
+    bias = torch.randn(7, device="cuda", dtype=torch.bfloat16) if has_bias else None
+    expected = api.depthwise_temporal(
+        x, w, bias, bias_first=bias_first, backend="triton"
+    )
+    # When the caller explicitly selects the generalized CuTe implementation.
+    actual = api.depthwise_temporal(x, w, bias, bias_first=bias_first, backend="cute")
+    # Then the shape and bias modes preserve the original FP32 FMA result.
+    assert torch.equal(actual, expected)
+
+
+@pytest.mark.parametrize(
+    "operation,error_type", [("depthwise_temporal", ValueError), ("silu", RuntimeError)]
+)
+def test_public_invalid_contract_preserves_error_type(
+    operation: str, error_type: type[Exception]
+) -> None:
+    # Given CPU operands rejected by the inference-only CUDA contract.
+    from flashinfer.diffusion_ops import h3_bridge as api
+
+    x = torch.zeros((1, 8, 3, 2, 2), dtype=torch.bfloat16)
+    w = torch.zeros((8, 1, 3, 1, 1), dtype=torch.bfloat16)
+    calls = {
+        "depthwise_temporal": lambda: api.depthwise_temporal(x, w, None),
+        "silu": lambda: api.silu(x),
+    }
+    from flashinfer import autotune
+
+    # When an autotune context propagates the public contract error.
+    # Then it retains the original exception type and traceback.
+    with pytest.raises(error_type), autotune():
+        calls[operation]()

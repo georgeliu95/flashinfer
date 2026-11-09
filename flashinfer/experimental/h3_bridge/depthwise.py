@@ -16,29 +16,17 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from enum import Enum
-from importlib import import_module
 from typing import Literal
 
 import torch
-from typing_extensions import assert_never
 
 
-@dataclass(frozen=True, slots=True)
 class DepthwiseContractError(ValueError):
-    """An operand or requested backend violates the inference contract."""
+    """An inference contract error whose traceback remains context-manager safe."""
 
-    detail: str
-
-    def __str__(self) -> str:
-        return self.detail
-
-
-class _Backend(str, Enum):
-    AUTO = "auto"
-    TRITON = "triton"
-    CUTE = "cute"
+    def __init__(self, detail: str) -> None:
+        super().__init__(detail)
+        self.detail = detail
 
 
 def _validate(
@@ -86,34 +74,6 @@ def _validate(
         raise DepthwiseContractError("bias_first must be a bool")
 
 
-def _cute_supported(
-    inputs: torch.Tensor,
-    weight: torch.Tensor,
-    bias: torch.Tensor | None,
-    bias_first: bool,
-) -> bool:
-    """Limit CuTe to the two shapes with measured benefit on GB10 SM121."""
-    return (
-        tuple(inputs.shape) in ((1, 512, 20, 48, 84), (1, 512, 42, 48, 84))
-        and weight.shape[2] == 5
-        and bias is not None
-        and bias_first
-        and inputs.is_contiguous(memory_format=torch.channels_last_3d)
-        and torch.cuda.get_device_capability(inputs.device) == (12, 1)
-    )
-
-
-def _cute_available() -> bool:
-    """Probe optional imports only; compilation failures are never caught here."""
-    try:
-        cute = import_module("cutlass.cute")
-        import_module("cuda.bindings.driver")
-        import_module("tvm_ffi")
-    except ImportError:
-        return False
-    return hasattr(cute.math, "fma")
-
-
 def depthwise_temporal(
     inputs: torch.Tensor,
     weight: torch.Tensor,
@@ -122,52 +82,20 @@ def depthwise_temporal(
     bias_first: bool = True,
     backend: Literal["auto", "triton", "cute"] = "auto",
 ) -> torch.Tensor:
-    """Apply same-padded temporal depthwise Conv3D with BF16 channels-last output.
+    """Apply temporal DW Conv3D using FlashInfer's per-configuration autotuner.
 
-    Stride and dilation are one, groups equal C, and taps are 3 or 5. FP32
-    accumulation visits taps in ascending order; ``bias_first=False`` adds
-    bias after the reduction. This inference-only API rejects gradients.
-
-    ``auto`` uses CuTe only for measured SM121 high-resolution K5 shapes
-    with bias-first and channels-last input; otherwise it selects Triton.
-    Explicit ``cute`` rejects unsupported contracts or unavailable optional
-    dependencies. Warm each specialization before CUDA graph capture.
+    Inputs are BF16 contiguous NCDHW or channels-last; K is 3 or 5, with
+    stride/dilation one and same padding. Output is channels-last. In an
+    ``autotune()`` context, auto compares legal Triton and CuTe tactics using
+    the actual shape and strides. Outside that context it reuses the winner
+    or falls back to Triton. Explicit backends tune only their own tactics.
+    CuTe accepts arbitrary positive NCTHW dimensions in channels-last on
+    SM121, with optional bias and either FP32 accumulation order.
     """
     _validate(inputs, weight, bias, bias_first)
-    try:
-        selected = _Backend(backend)
-    except ValueError as error:
-        raise DepthwiseContractError(
-            f"unknown depthwise backend: {backend!r}"
-        ) from error
-    use_cute = False
-    match selected:
-        case _Backend.TRITON:
-            pass
-        case _Backend.AUTO:
-            use_cute = (
-                _cute_supported(inputs, weight, bias, bias_first) and _cute_available()
-            )
-        case _Backend.CUTE:
-            if not _cute_supported(inputs, weight, bias, bias_first):
-                raise DepthwiseContractError(
-                    "CuTe requires SM121, [1,512,20|42,48,84] channels-last input, "
-                    "K5, bias and bias_first=True"
-                )
-            if not _cute_available():
-                raise ImportError(
-                    "CuTe depthwise requires CUTLASS DSL with cute.math.fma, "
-                    "CUDA Python and TVM FFI"
-                )
-            use_cute = True
-        case unreachable:
-            assert_never(unreachable)
+    if backend not in ("auto", "triton", "cute"):
+        raise DepthwiseContractError(f"unknown depthwise backend: {backend!r}")
+    from ._tuning import run
+
     with torch.cuda.device(inputs.device):
-        if use_cute:
-            from ._depthwise_cute import run
-
-            assert bias is not None
-            return run(inputs, weight, bias)
-        from ._depthwise_triton import run
-
-        return run(inputs, weight, bias, bias_first=bias_first)
+        return run(inputs, weight, bias, bias_first=bias_first, backend=backend)

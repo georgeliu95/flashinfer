@@ -187,32 +187,24 @@ def test_invalid_contract_is_rejected(device: torch.device, reason: str) -> None
         depthwise_temporal(x, w, b, backend=backend)
 
 
-@pytest.mark.parametrize(
-    "channels_last,has_bias,bias_first",
-    [(False, True, True), (True, False, True), (True, True, False)],
-)
-def test_explicit_cute_rejects_unmeasured_contract(
-    device: torch.device, channels_last: bool, has_bias: bool, bias_first: bool
-) -> None:
+def test_explicit_cute_rejects_ncdhw_layout(device: torch.device) -> None:
     from flashinfer.experimental.h3_bridge.depthwise import depthwise_temporal
 
-    # Given an unmeasured CuTe contract.
-    x, w, b = _operands(device, (1, 512, 20, 48, 84), 5, channels_last)
-    # When CuTe is explicitly requested, then reject the unsupported contract.
+    # Given legal temporal DW operands with ordinary contiguous NCDHW storage.
+    x, w, b = _operands(device, (2, 7, 3, 2, 2), 3, channels_last=False)
+    # When CuTe is explicitly requested, then reject its unsupported layout.
     with pytest.raises(ValueError, match="CuTe"):
-        depthwise_temporal(
-            x, w, b if has_bias else None, bias_first=bias_first, backend="cute"
-        )
+        depthwise_temporal(x, w, b, backend="cute")
 
 
 def test_auto_falls_back_only_for_missing_dependency(
     device: torch.device, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from flashinfer.experimental.h3_bridge import depthwise
+    from flashinfer.experimental.h3_bridge import _support, depthwise
 
     # Given a supported shape but an unavailable optional CuTe dependency.
     x, w, b = _operands(device, (1, 512, 20, 48, 84), 5)
-    monkeypatch.setattr(depthwise, "_cute_available", lambda: False)
+    monkeypatch.setattr(_support, "_cute_available", lambda: False)
     # When auto selects its backend, then it still produces the Triton result.
     assert torch.equal(
         depthwise.depthwise_temporal(x, w, b),
@@ -223,12 +215,12 @@ def test_auto_falls_back_only_for_missing_dependency(
             depthwise.depthwise_temporal(x, w, b, backend="cute")
 
 
-def test_auto_does_not_hide_cute_compile_errors(
+def test_explicit_cute_does_not_hide_compile_errors(
     device: torch.device, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     if importlib.util.find_spec("cutlass") is None:
         pytest.skip("CUTLASS DSL is unavailable")
-    from flashinfer.experimental.h3_bridge import _depthwise_cute, depthwise
+    from flashinfer.experimental.h3_bridge import _depthwise_cute, _support, depthwise
 
     if torch.cuda.get_device_capability(device) != (12, 1):
         pytest.skip("CuTe dispatch is SM121 only")
@@ -236,14 +228,16 @@ def test_auto_does_not_hide_cute_compile_errors(
     x, w, b = _operands(device, (1, 512, 20, 48, 84), 5)
     failure = RuntimeError("sentinel compilation failure")
 
-    def fail(*args: torch.Tensor) -> torch.Tensor:
+    def fail(
+        *args: torch.Tensor, **kwargs: torch.Tensor | int | bool | None
+    ) -> torch.Tensor:
         raise failure
 
-    monkeypatch.setattr(depthwise, "_cute_available", lambda: True)
+    monkeypatch.setattr(_support, "_cute_available", lambda: True)
     monkeypatch.setattr(_depthwise_cute, "run", fail)
-    # When auto dispatches CuTe, then the original failure remains visible.
+    # When explicit CuTe executes, then the original failure remains visible.
     with pytest.raises(RuntimeError, match="sentinel compilation failure"):
-        depthwise.depthwise_temporal(x, w, b)
+        depthwise.depthwise_temporal(x, w, b, backend="cute")
 
 
 def test_bias_order_preserves_cancellation_boundary(device: torch.device) -> None:
@@ -263,18 +257,18 @@ def test_bias_order_preserves_cancellation_boundary(device: torch.device) -> Non
     assert last[0, 0, 1, 0, 0].item() == 2**-6
 
 
-def test_auto_unmeasured_shape_does_not_import_cute(
+def test_auto_ncdhw_does_not_import_cute(
     device: torch.device, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from flashinfer.experimental.h3_bridge import depthwise
+    from flashinfer.experimental.h3_bridge import _support, depthwise
 
-    # Given a legal shape outside the measured CuTe region.
-    x, w, b = _operands(device, (1, 8, 3, 2, 2), 5)
+    # Given a legal shape with a layout outside the CuTe contract.
+    x, w, b = _operands(device, (2, 7, 3, 2, 2), 5, channels_last=False)
 
     def unexpected_import() -> bool:
-        pytest.fail("unmeasured shape attempted a CuTe dependency import")
+        pytest.fail("NCDHW layout attempted a CuTe dependency import")
 
-    monkeypatch.setattr(depthwise, "_cute_available", unexpected_import)
+    monkeypatch.setattr(_support, "_cute_available", unexpected_import)
     # When auto selects a backend, then Triton works without probing CuTe.
     assert torch.equal(
         depthwise.depthwise_temporal(x, w, b),

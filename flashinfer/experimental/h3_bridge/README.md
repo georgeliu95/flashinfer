@@ -7,6 +7,7 @@ Spark. The public API and both backends are experimental.
 
 ```python
 import torch
+from flashinfer import autotune
 from flashinfer.diffusion_ops import h3_bridge
 
 # Logical tensor order is N,C,T,H,W; storage order is N,T,H,W,C.
@@ -14,6 +15,11 @@ x = torch.randn(1, 512, 20, 48, 84, device="cuda", dtype=torch.bfloat16)
 x = x.contiguous(memory_format=torch.channels_last_3d)
 w = torch.randn(512, 1, 5, 1, 1, device="cuda", dtype=torch.bfloat16)
 b = torch.randn(512, device="cuda", dtype=torch.bfloat16)
+# Warm up and tune outside CUDA graph capture; persist the selected tactic.
+with autotune(cache="h3-dw-tactics.json"):
+    y = h3_bridge.depthwise_temporal(x, w, b)
+
+# Subsequent calls reuse the winner without profiling.
 y = h3_bridge.depthwise_temporal(x, w, b)
 ```
 
@@ -47,22 +53,49 @@ channels-last output. GroupNorm/DW parameters must be contiguous channel
 vectors/filters. No model parameters, normalization domain, temporal chunks,
 overlap blending, or interpolation rules are changed by these operators.
 
-## DW dispatch and dependencies
+## DW shape coverage and autotuning
 
-`backend="triton"` selects the general implementation. `backend="cute"`
-requires the qualified CuTe specialization; unsupported inputs fail explicitly.
-`backend="auto"` uses CuTe only for GB10 (SM121), BF16 channels-last inputs
-`[1,512,20,48,84]` or `[1,512,42,48,84]`, a contiguous `[512,1,5,1,1]` filter,
-and bias-first accumulation with a contiguous 512-channel bias. Other supported
-inputs use Triton. An unavailable optional CuTe dependency also leaves auto on
-Triton; kernel compilation or execution failures are surfaced.
+There is no two-shape whitelist. The CuTe kernel supports arbitrary positive
+`N,C,T,H,W` in channels-last BF16 storage, `K=3` or `5`, optional bias, and
+both bias accumulation orders on SM121. Odd channel counts use scalar vectors;
+vectorized tactics are admitted only when their width divides the channel
+count. Temporal zero padding stays within each batch item. The
+Triton path also accepts ordinary contiguous NCTHW storage.
+
+Use FlashInfer's existing `autotune()` context to search before serving:
+
+- `backend="auto"` compares Triton block/warp configurations and eligible
+  CuTe time-tile/thread/vector configurations. Candidates are compiled and
+  checked against the Triton FP32-FMA reference before timed profiling.
+- `backend="triton"` and `backend="cute"` search only their named backend.
+  Explicit CuTe requires SM121, channels-last storage, and its dependencies.
+- Outside `autotune()`, the API reads the selected tactic from cache without
+  profiling. An unseen `auto` or `triton` configuration uses Triton; explicit
+  `cute` uses its generic default configuration. Thus `auto` alone does not
+  mean that a timing search occurs during the first ordinary inference call.
+- Tuning uses exact static shapes and real tensor layouts. Cache identity
+  distinguishes shapes, dtypes, strides, alignment classes, GPU identity,
+  bias presence/order, requested backend and implementation/dependency state.
+  A winner for one configuration is not reused as a shape bucket for another.
+- `autotune(cache="...")` saves selections using the existing FlashInfer
+  cache. In a new process, load with `autotune(False, cache="...")`, warm the
+  selected specialization, then capture or serve. Compilation artifacts and
+  autotune selections are separate caches.
+
+Tuning uses CUDA graphs with repeated, warm-cache inputs. This preserves the
+actual tensor strides and pointer alignment throughout profiling. Compilation
+and reference checks are outside the measured interval. Tune on representative
+workloads and verify application latency separately; this is not a cold-memory
+bandwidth measurement. Do not start a new tuning search during an outer CUDA
+graph capture; warm cache hits are supported. Inputs and weights are read-only,
+outputs are separately allocated, and kernels use the current stream with fresh
+pointers on each call.
 
 The general kernels require Triton. The qualified Spark environment uses Torch
-2.14.1+cu132, Triton 3.8 and `nvidia-cutlass-dsl` 4.8.1. Install dependencies in
-the application environment; this feature does not replace global packages.
-Warm up each specialization before CUDA graph capture. Compilation is cached;
-input, weight, bias, output pointers and the current stream are refreshed at
-execution. No torch.compile/fullgraph integration is promised.
+2.14.1+cu132, Triton 3.8 and `nvidia-cutlass-dsl` 4.8.1. Missing optional CuTe
+dependencies leave auto with Triton candidates. Compilation and correctness
+failures during candidate preparation are surfaced. No torch.compile/fullgraph
+integration is promised.
 
 ## Validation and application integration
 
@@ -71,13 +104,17 @@ From the FlashInfer checkout, run:
 ```bash
 pytest tests/experimental/test_h3_bridge_api.py \
        tests/experimental/test_h3_bridge_depthwise.py \
-       tests/experimental/test_h3_bridge_fused.py
+       tests/experimental/test_h3_bridge_fused.py \
+       tests/experimental/test_h3_bridge_depthwise_generic.py \
+       tests/experimental/test_h3_bridge_autotune.py \
+       tests/experimental/test_h3_bridge_autotune_cache.py
 python benchmarks/experimental/bench_h3_bridge.py
 ```
 
-The benchmark reports separate operator times and checks the outputs. It does
-not estimate a full video-generation speedup. Application code should replace
-its corresponding bridge operators with this API while retaining its model
+The benchmark reports separate operator times, selected DW tactics and first-call
+tuning time, and checks the outputs. It does not estimate a full video-generation
+speedup. Application code should replace its corresponding bridge operators
+with this API while retaining its model
 forward structure, CL Conv3D weights, original temporal chunking and final
 output conversion. Keep dense Conv3D on its existing cuDNN path.
 
