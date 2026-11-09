@@ -29,6 +29,8 @@ __all__ = [
     "add",
     "silu",
     "depthwise_temporal",
+    "add_bias_residual",
+    "bias_silu_multiply",
 ]
 
 
@@ -127,3 +129,34 @@ def depthwise_temporal(
     from ..experimental.h3_bridge.depthwise import depthwise_temporal as run
 
     return run(inputs, weight, bias, bias_first=bias_first, backend=backend)
+
+
+@flashinfer_experimental_api
+def add_bias_residual(conv_no_bias: Tensor, bias: Tensor, residual: Tensor) -> Tensor:
+    """Add channel bias then residual, preserving both BF16 rounding boundaries.
+
+    Computes bf16(bf16(conv_no_bias + bias) + residual). Activations must be
+    positive NCTHW in contiguous channels_last_3d storage with identical shapes.
+    Bias is a contiguous one-dimensional channel vector. All operands are
+    same-device inference CUDA BF16 tensors; output uses channels_last_3d.
+    The convolution output must already have rounded to BF16 before this call.
+    """
+    from ..experimental.h3_bridge.bias_epilogue import add_bias_residual as run
+
+    return run(conv_no_bias, bias, residual)
+
+
+@flashinfer_experimental_api
+def bias_silu_multiply(conv_no_bias: Tensor, bias: Tensor) -> Tensor:
+    """Bias a split-channel projection, then multiply value by rounded SiLU(gate).
+
+    Input is positive [N,2D,T,H,W] in contiguous channels_last_3d storage; bias
+    is a contiguous [2D] vector. Both are same-device inference CUDA BF16.
+    Bias addition rounds to BF16, the first D channels become value, and the
+    second D channels become gate. SiLU rounds to BF16 before multiplication.
+    Output is [N,D,T,H,W] in channels_last_3d. Convolution must already have
+    rounded to BF16; this is not an FP32-accumulator convolution epilogue.
+    """
+    from ..experimental.h3_bridge.bias_epilogue import bias_silu_multiply as run
+
+    return run(conv_no_bias, bias)

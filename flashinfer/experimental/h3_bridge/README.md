@@ -40,6 +40,17 @@ routing, and importing their public module does not load the H3 backends.
 - `silu_multiply(value, gate)`: multiply by BF16-rounded `silu(gate)`;
   accepts strided channel chunks produced by the adapter's split projection.
 - `add(left, right)` and `silu(x)`: produce channels-last BF16 output.
+- `add_bias_residual(conv_no_bias, bias, residual)`: compute
+  `bf16(bf16(conv_no_bias + bias) + residual)` in one pass. Convolution and
+  residual inputs must have equal positive NCTHW shapes in contiguous
+  channels-last storage; bias is a contiguous `[C]` vector.
+- `bias_silu_multiply(conv_no_bias, bias)`: add `[2D]` channel bias to a
+  channels-last `[N,2D,T,H,W]` projection, rounding to BF16, then split its
+  channels into value/gate halves. Round `silu(gate)` to BF16 before multiplying
+  by value, returning channels-last `[N,D,T,H,W]`. Odd D and multiple batches
+  are supported. Both bias consumers require an already BF16-rounded
+  convolution output, preserve storage offsets, and use the current stream;
+  they are not replacements for an FP32-accumulator convolution epilogue.
 - `depthwise_temporal(x, weight, bias, *, bias_first=True, backend="auto")`:
   temporal 3- or 5-tap cross-correlation, spatial kernel `1x1`, stride/dilation
   one, same zero padding, one filter per channel. FP32 FMA visits ascending
@@ -107,7 +118,10 @@ pytest tests/experimental/test_h3_bridge_api.py \
        tests/experimental/test_h3_bridge_fused.py \
        tests/experimental/test_h3_bridge_depthwise_generic.py \
        tests/experimental/test_h3_bridge_autotune.py \
-       tests/experimental/test_h3_bridge_autotune_cache.py
+       tests/experimental/test_h3_bridge_autotune_cache.py \
+       tests/experimental/test_h3_bridge_bias_epilogue.py \
+       tests/experimental/test_h3_bridge_bias_epilogue_api.py \
+       tests/experimental/test_h3_bridge_bias_epilogue_containment.py
 python benchmarks/experimental/bench_h3_bridge.py
 ```
 
@@ -116,7 +130,34 @@ tuning time, and checks the outputs. It does not estimate a full video-generatio
 speedup. Application code should replace its corresponding bridge operators
 with this API while retaining its model
 forward structure, CL Conv3D weights, original temporal chunking and final
-output conversion. Keep dense Conv3D on its existing cuDNN path.
+output conversion. Keep dense Conv3D on its existing cuDNN path. To use a
+bias consumer, compute that convolution with `bias=None`, then pass its original
+bias vector to `add_bias_residual` or `bias_silu_multiply`; qualify the full
+application output because convolution algorithm selection can depend on the
+surrounding integration. Warm both epilogue specializations before graph capture.
+
+
+The separate bias-consumer benchmark compares complete Conv3D + bias + consumer
+paths with the bias-free convolution + fused consumer. With this checkout
+installed in a CUDA environment containing Torch, Triton and Typer, run:
+
+```bash
+# Default: adapter_expand only, random BF16 channels-last operands.
+python benchmarks/experimental/bench_h3_bridge_bias_epilogue.py
+python benchmarks/experimental/bench_h3_bridge_bias_epilogue.py --case up_high42 --repeats 40
+python benchmarks/experimental/bench_h3_bridge_bias_epilogue.py --all --repeats 40
+# Optional captured operands: CASE.pt with BF16 input, weight and bias tensors.
+python benchmarks/experimental/bench_h3_bridge_bias_epilogue.py --all --operands-dir /path/to/operands
+```
+
+Cases are `up_high42`, `up_high20`, `up_low42`, `up_low20`, `adapter_expand`
+and `adapter_project`. Residuals are synthetic even with captured operands.
+The script checks convolution-bias rounding and final outputs bitwise, warms
+both paths, then shuffles their order within paired CUDA-event rounds. It prints
+one JSON report with hardware/software details, shapes, median/min/IQR latency
+and the ratio of baseline to fused median. It does not write result files.
+These are warm-input operator timings, not an end-to-end bridge speedup; a
+runtime whose convolution bias changes the rounding fails the correctness check.
 
 Owner: `georgeliu95`. This feature is maintained on the `h3-spark-unified`
 application branch. Before upstream admission, open the experimental tracking
